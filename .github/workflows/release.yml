@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish, for example v0.2.2. Required when dispatching from a branch."
+        required: false
+        type: string
   push:
     tags:
       - "v*"
@@ -18,6 +23,50 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+      - name: Validate release tag
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag || '' }}
+        run: |
+          set -euo pipefail
+          release_tag="$RELEASE_TAG_INPUT"
+          if [[ -z "$release_tag" ]]; then
+            if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+              echo "release workflow must run from a tag, or workflow_dispatch must provide release_tag" >&2
+              exit 2
+            fi
+            release_tag="$GITHUB_REF_NAME"
+          fi
+
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "release tag must be a v-prefixed SemVer tag, got: $release_tag" >&2
+            exit 2
+          fi
+
+          git fetch --force --tags origin "refs/tags/$release_tag:refs/tags/$release_tag"
+          tag_sha="$(git rev-list -n 1 "$release_tag")"
+          head_sha="$(git rev-parse HEAD)"
+          if [[ "$tag_sha" != "$head_sha" ]]; then
+            echo "checked-out HEAD ($head_sha) does not match $release_tag ($tag_sha)" >&2
+            exit 2
+          fi
+
+          cargo_version="$(awk -F ' = ' '/^version =/ {gsub("\"", "", $2); print $2; exit}' Cargo.toml)"
+          release_version="${release_tag#v}"
+          if [[ "$release_version" != "$cargo_version" ]]; then
+            echo "tag version ($release_version) does not match Cargo.toml workspace version ($cargo_version)" >&2
+            exit 2
+          fi
+
+          dmg_filename="NetDiag Twin-$release_version.dmg"
+          {
+            printf 'RELEASE_TAG=%s\n' "$release_tag"
+            printf 'RELEASE_VERSION=%s\n' "$release_version"
+            printf 'RELEASE_DMG_FILENAME=%s\n' "$dmg_filename"
+            printf 'RELEASE_DMG_PATH=target/release/%s\n' "$dmg_filename"
+          } >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -32,6 +81,7 @@ jobs:
           test -n "${{ secrets.NETDIAG_NOTARY_KEY_P8_BASE64 }}" || (echo "missing NETDIAG_NOTARY_KEY_P8_BASE64" && exit 2)
           test -n "${{ secrets.NETDIAG_NOTARY_KEY_ID }}" || (echo "missing NETDIAG_NOTARY_KEY_ID" && exit 2)
           test -n "${{ secrets.NETDIAG_NOTARY_ISSUER }}" || (echo "missing NETDIAG_NOTARY_ISSUER" && exit 2)
+          test -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" || (echo "missing HOMEBREW_TAP_TOKEN" && exit 2)
       - name: Test
         run: cargo test --workspace
       - name: Prepare signing keychain
@@ -81,10 +131,123 @@ jobs:
           NETDIAG_NOTARY_PROFILE: ${{ secrets.NETDIAG_NOTARY_PROFILE }}
           NETDIAG_NOTARIZE: "1"
         run: scripts/package_macos_app.sh release
+      - name: Validate notarized DMG
+        run: |
+          set -euo pipefail
+          dmg_path="$RELEASE_DMG_PATH"
+          test -f "$dmg_path" || (echo "missing DMG: $dmg_path" >&2 && exit 2)
+
+          hdiutil verify "$dmg_path"
+          codesign --verify --verbose=2 "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+
+          mount_dir="$RUNNER_TEMP/netdiag-dmg"
+          rm -rf "$mount_dir"
+          mkdir -p "$mount_dir"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse -readonly
+          app_path="$mount_dir/NetDiag Twin.app"
+          if [[ ! -d "$app_path" ]]; then
+            app_path="$(find "$mount_dir" -maxdepth 2 -type d -name 'NetDiag Twin.app' -print -quit)"
+          fi
+          test -n "$app_path" || (echo "mounted DMG does not contain NetDiag Twin.app" >&2 && exit 2)
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
       - name: Generate appcast
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-        run: scripts/generate_appcast.sh target/release
+        run: |
+          set -euo pipefail
+          appcast_tool="target/sparkle-2.7.1/bin/generate_appcast"
+          test -x "$appcast_tool" || (echo "missing Sparkle generate_appcast tool at $appcast_tool" >&2 && exit 2)
+
+          rm -f target/release/appcast.xml
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$appcast_tool" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/" \
+            target/release
+      - name: Validate Sparkle appcast
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+          import urllib.parse
+          import xml.etree.ElementTree as ET
+
+          appcast_path = "target/release/appcast.xml"
+          dmg_path = os.environ["RELEASE_DMG_PATH"]
+          version = os.environ["RELEASE_VERSION"]
+          tag = os.environ["RELEASE_TAG"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          expected_filename = os.environ["RELEASE_DMG_FILENAME"]
+          expected_prefix = f"https://github.com/{repo}/releases/download/{tag}/"
+
+          def fail(message: str) -> None:
+              print(message, file=sys.stderr)
+              sys.exit(2)
+
+          if not os.path.isfile(appcast_path) or os.path.getsize(appcast_path) == 0:
+              fail(f"missing or empty appcast: {appcast_path}")
+          if not os.path.isfile(dmg_path):
+              fail(f"missing DMG for appcast validation: {dmg_path}")
+
+          try:
+              root = ET.parse(appcast_path).getroot()
+          except ET.ParseError as exc:
+              fail(f"appcast XML is not well-formed: {exc}")
+
+          def attr(element: ET.Element, local_name: str) -> str:
+              for key, value in element.attrib.items():
+                  if key == local_name or key.endswith("}" + local_name):
+                      return value
+              return ""
+
+          def child_text(element: ET.Element, local_name: str) -> str:
+              for child in element:
+                  if child.tag == local_name or child.tag.endswith("}" + local_name):
+                      return (child.text or "").strip()
+              return ""
+
+          dmg_size = os.path.getsize(dmg_path)
+          matching_item = None
+          for item in root.findall("./channel/item"):
+              enclosure = item.find("enclosure")
+              if enclosure is None:
+                  continue
+              url = enclosure.attrib.get("url", "")
+              filename = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path))
+              short_version = attr(enclosure, "shortVersionString") or attr(item, "shortVersionString")
+              if filename == expected_filename and short_version == version:
+                  matching_item = (item, enclosure, url)
+                  break
+
+          if matching_item is None:
+              fail(f"appcast has no item for {expected_filename} with shortVersionString {version}")
+
+          item, enclosure, url = matching_item
+          if not url.startswith(expected_prefix):
+              fail(f"appcast enclosure URL must start with {expected_prefix}, got: {url}")
+          if not attr(enclosure, "edSignature"):
+              fail("appcast enclosure is missing sparkle:edSignature")
+          if not attr(enclosure, "length").isdigit():
+              fail("appcast enclosure length is missing or non-numeric")
+          if int(attr(enclosure, "length")) != dmg_size:
+              fail("appcast enclosure length does not match DMG size")
+          minimum_system_version = (
+              attr(item, "minimumSystemVersion")
+              or attr(enclosure, "minimumSystemVersion")
+              or child_text(item, "minimumSystemVersion")
+          )
+          if not minimum_system_version:
+              fail("appcast item is missing sparkle:minimumSystemVersion")
+          PY
       - name: Prepare Pages artifact
         run: |
           set -euo pipefail
@@ -94,9 +257,70 @@ jobs:
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          fail_on_unmatched_files: true
           files: |
             target/release/NetDiag Twin-*.dmg
             target/release/appcast.xml
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: billlza/homebrew-netdiag-twin
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: target/homebrew-tap
+      - name: Publish Homebrew cask
+        env:
+          TAP_DIR: target/homebrew-tap
+        run: |
+          set -euo pipefail
+          dmg_sha256="$(shasum -a 256 "$RELEASE_DMG_PATH" | awk '{print $1}')"
+          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/NetDiag%20Twin-${RELEASE_VERSION}.dmg"
+          tap_dir_abs="$(cd "$TAP_DIR" && pwd)"
+          cask_file="$tap_dir_abs/Casks/netdiag-twin.rb"
+          tap_branch="$(git -C "$tap_dir_abs" rev-parse --abbrev-ref HEAD)"
+          if [[ "$tap_branch" == "HEAD" ]]; then
+            tap_branch="$(git -C "$tap_dir_abs" remote show origin | awk '/HEAD branch/ {print $NF}')"
+            git -C "$tap_dir_abs" checkout "$tap_branch"
+          fi
+
+          mkdir -p "$(dirname "$cask_file")"
+          cat > "$cask_file" <<RUBY
+          cask "netdiag-twin" do
+            version "$RELEASE_VERSION"
+            sha256 "$dmg_sha256"
+
+            url "$asset_url",
+                verified: "github.com/${GITHUB_REPOSITORY}/"
+            name "NetDiag Twin"
+            desc "Network diagnostics workstation"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+
+            depends_on macos: ">= :ventura"
+
+            app "NetDiag Twin.app"
+          end
+          RUBY
+
+          ruby -c "$cask_file"
+
+          git -C "$tap_dir_abs" config user.name "github-actions[bot]"
+          git -C "$tap_dir_abs" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$tap_dir_abs" add Casks/netdiag-twin.rb
+          if git -C "$tap_dir_abs" diff --cached --quiet; then
+            tap_changed=0
+            echo "Homebrew tap already up to date"
+          else
+            tap_changed=1
+            git -C "$tap_dir_abs" commit -m "Update NetDiag Twin to ${RELEASE_TAG}"
+          fi
+
+          brew untap billlza/netdiag-twin >/dev/null 2>&1 || true
+          brew tap --custom-remote billlza/netdiag-twin "$tap_dir_abs"
+          brew audit --cask --strict --tap billlza/netdiag-twin netdiag-twin
+
+          if [[ "$tap_changed" == "1" ]]; then
+            git -C "$tap_dir_abs" push origin "HEAD:$tap_branch"
+          fi
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

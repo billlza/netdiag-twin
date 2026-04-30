@@ -28,6 +28,10 @@ docs/
 
 ## Quick Start
 
+Start with [docs/getting-started.md](docs/getting-started.md) for the canonical
+trace schema, live adapter contracts, artifact layout, HIL review flow, and
+common ingestion errors.
+
 ```bash
 cargo run -p netdiag-app
 ```

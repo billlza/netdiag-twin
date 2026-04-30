@@ -1,12 +1,15 @@
 use crate::settings::{
-    ApiConfig, LocalProbeSettings, PrometheusExpositionSettings, PrometheusQuerySettings,
+    ApiConfig, LocalProbeSettings, NativePcapSettings, OtlpGrpcSettings,
+    PrometheusExpositionSettings, PrometheusQuerySettings, SystemCountersSettings,
     WebsiteProbeSettings,
 };
 use anyhow::{Result, bail};
 use chrono::{Duration, TimeZone, Utc};
 use netdiag_core::connectors::{
-    HttpJsonConfig, PrometheusExpositionConfig, PrometheusQueryRangeConfig, load_http_json,
-    load_prometheus_exposition, load_prometheus_query_range,
+    HttpJsonConfig, NativePcapConfig, NativePcapSource, OtlpGrpcReceiverConfig,
+    PrometheusExpositionConfig, PrometheusQueryRangeConfig, SystemCountersConfig, load_http_json,
+    load_native_pcap, load_otlp_grpc_receiver, load_prometheus_exposition,
+    load_prometheus_query_range, load_system_counters,
 };
 use netdiag_core::ingest::{build_ingest_result, ingest_trace};
 use netdiag_core::models::{IngestResult, IngestWarning, TraceRecord};
@@ -25,6 +28,9 @@ pub enum SourceMode {
     WebsiteProbe(WebsiteProbeSettings),
     PrometheusQueryRange(PrometheusQuerySettings, Option<String>),
     PrometheusExposition(PrometheusExpositionSettings, Option<String>),
+    OtlpGrpcReceiver(OtlpGrpcSettings),
+    NativePcap(NativePcapSettings),
+    SystemCounters(SystemCountersSettings),
 }
 
 impl SourceMode {
@@ -55,6 +61,18 @@ impl SourceMode {
             SourceMode::PrometheusExposition(settings, token) => PrometheusExpositionTraceSource {
                 settings: settings.clone(),
                 bearer_token: token.clone(),
+            }
+            .load(),
+            SourceMode::OtlpGrpcReceiver(settings) => OtlpGrpcReceiverTraceSource {
+                settings: settings.clone(),
+            }
+            .load(),
+            SourceMode::NativePcap(settings) => NativePcapTraceSource {
+                settings: settings.clone(),
+            }
+            .load(),
+            SourceMode::SystemCounters(settings) => SystemCountersTraceSource {
+                settings: settings.clone(),
             }
             .load(),
         }
@@ -292,6 +310,108 @@ impl TraceSource for PrometheusExpositionTraceSource {
             },
             flow_summary: FlowSummary {
                 protocol: Some("Prometheus".to_string()),
+                flows: Some(loaded.ingest.records.len()),
+                total_bytes,
+                top_talkers: Vec::new(),
+            },
+            ingest: loaded.ingest,
+        })
+    }
+}
+
+struct OtlpGrpcReceiverTraceSource {
+    settings: OtlpGrpcSettings,
+}
+
+impl TraceSource for OtlpGrpcReceiverTraceSource {
+    fn load(&self) -> Result<SourceSnapshot> {
+        let loaded = load_otlp_grpc_receiver(&OtlpGrpcReceiverConfig {
+            bind_addr: self.settings.bind_addr.clone(),
+            timeout: std::time::Duration::from_secs(self.settings.timeout_secs.max(1)),
+            metrics: self.settings.mapping.clone(),
+            sample: "otlp_grpc".to_string(),
+        })?;
+        let total_bytes = estimate_bytes_from_records(&loaded.ingest.records);
+        Ok(SourceSnapshot {
+            descriptor: SourceDescriptor {
+                name: loaded.sample,
+                kind: "OTLP gRPC".to_string(),
+                captured_label: format!("Received  •  {}", Utc::now().format("%H:%M")),
+                data_source_label: self.settings.bind_addr.clone(),
+            },
+            flow_summary: FlowSummary {
+                protocol: Some("OTLP".to_string()),
+                flows: Some(loaded.ingest.records.len()),
+                total_bytes,
+                top_talkers: Vec::new(),
+            },
+            ingest: loaded.ingest,
+        })
+    }
+}
+
+struct NativePcapTraceSource {
+    settings: NativePcapSettings,
+}
+
+impl TraceSource for NativePcapTraceSource {
+    fn load(&self) -> Result<SourceSnapshot> {
+        let source = native_pcap_source(&self.settings.source);
+        let loaded = load_native_pcap(&NativePcapConfig {
+            source,
+            timeout: std::time::Duration::from_secs(self.settings.timeout_secs.max(1)),
+            packet_limit: self.settings.packet_limit.max(1),
+            sample: "native_pcap".to_string(),
+        })?;
+        let payload = loaded.payload.unwrap_or(Value::Null);
+        let mut flow_summary = parse_api_flow_summary(&payload, Some("PCAP".to_string()));
+        if flow_summary.total_bytes.is_none() {
+            flow_summary.total_bytes = estimate_bytes_from_records(&loaded.ingest.records);
+        }
+        Ok(SourceSnapshot {
+            descriptor: SourceDescriptor {
+                name: loaded.sample,
+                kind: "Native pcap".to_string(),
+                captured_label: format!("Captured  •  {}", Utc::now().format("%H:%M")),
+                data_source_label: self.settings.source.clone(),
+            },
+            flow_summary,
+            ingest: loaded.ingest,
+        })
+    }
+}
+
+struct SystemCountersTraceSource {
+    settings: SystemCountersSettings,
+}
+
+impl TraceSource for SystemCountersTraceSource {
+    fn load(&self) -> Result<SourceSnapshot> {
+        let interface = self.settings.interface.trim().to_string();
+        let loaded = load_system_counters(&SystemCountersConfig {
+            interface: (!interface.is_empty() && interface != "all").then_some(interface.clone()),
+            interval: std::time::Duration::from_secs(self.settings.interval_secs.clamp(1, 10)),
+            sample: "system_counters".to_string(),
+        })?;
+        let total_bytes = loaded
+            .payload
+            .as_ref()
+            .and_then(|value| value.get("bytes"))
+            .and_then(Value::as_u64)
+            .or_else(|| estimate_bytes_from_records(&loaded.ingest.records));
+        Ok(SourceSnapshot {
+            descriptor: SourceDescriptor {
+                name: loaded.sample,
+                kind: "System counters".to_string(),
+                captured_label: format!("Sampled  •  {}", Utc::now().format("%H:%M")),
+                data_source_label: if interface.is_empty() {
+                    "all interfaces".to_string()
+                } else {
+                    interface
+                },
+            },
+            flow_summary: FlowSummary {
+                protocol: Some("Interface".to_string()),
                 flows: Some(loaded.ingest.records.len()),
                 total_bytes,
                 top_talkers: Vec::new(),
@@ -652,6 +772,23 @@ fn probe_fallback_warnings(source: &str) -> Vec<IngestWarning> {
         fallback: "0.0".to_string(),
     })
     .collect()
+}
+
+fn native_pcap_source(raw: &str) -> NativePcapSource {
+    let trimmed = raw.trim();
+    if let Some(interface) = trimmed.strip_prefix("iface:") {
+        return NativePcapSource::Interface(interface.trim().to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_file() {
+        NativePcapSource::File(path)
+    } else {
+        NativePcapSource::Interface(if trimmed.is_empty() {
+            "lo0".to_string()
+        } else {
+            trimmed.to_string()
+        })
+    }
 }
 
 fn simulated_flow_summary(total_bytes: u64) -> FlowSummary {

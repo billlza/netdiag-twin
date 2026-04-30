@@ -177,15 +177,21 @@ pub enum ConnectorKind {
     HttpJson,
     PrometheusQueryRange,
     PrometheusExposition,
+    OtlpGrpcReceiver,
+    NativePcap,
+    SystemCounters,
 }
 
 impl ConnectorKind {
-    pub const ALL: [ConnectorKind; 5] = [
+    pub const ALL: [ConnectorKind; 8] = [
         ConnectorKind::LocalProbe,
         ConnectorKind::WebsiteProbe,
         ConnectorKind::HttpJson,
         ConnectorKind::PrometheusQueryRange,
         ConnectorKind::PrometheusExposition,
+        ConnectorKind::OtlpGrpcReceiver,
+        ConnectorKind::NativePcap,
+        ConnectorKind::SystemCounters,
     ];
 }
 
@@ -239,6 +245,12 @@ pub struct DataConnectorsSettings {
     pub prometheus_query: PrometheusQuerySettings,
     #[serde(default)]
     pub prometheus_exposition: PrometheusExpositionSettings,
+    #[serde(default)]
+    pub otlp_grpc: OtlpGrpcSettings,
+    #[serde(default)]
+    pub native_pcap: NativePcapSettings,
+    #[serde(default)]
+    pub system_counters: SystemCountersSettings,
 }
 
 impl Default for DataConnectorsSettings {
@@ -251,6 +263,9 @@ impl Default for DataConnectorsSettings {
             website_probe: WebsiteProbeSettings::default(),
             prometheus_query: PrometheusQuerySettings::default(),
             prometheus_exposition: PrometheusExpositionSettings::default(),
+            otlp_grpc: OtlpGrpcSettings::default(),
+            native_pcap: NativePcapSettings::default(),
+            system_counters: SystemCountersSettings::default(),
         }
     }
 }
@@ -301,6 +316,9 @@ pub struct SourceProfile {
     pub http_json: ApiSettings,
     pub prometheus_query: PrometheusQuerySettings,
     pub prometheus_exposition: PrometheusExpositionSettings,
+    pub otlp_grpc: OtlpGrpcSettings,
+    pub native_pcap: NativePcapSettings,
+    pub system_counters: SystemCountersSettings,
 }
 
 impl Default for SourceProfile {
@@ -314,6 +332,9 @@ impl Default for SourceProfile {
             http_json: ApiSettings::default(),
             prometheus_query: PrometheusQuerySettings::default(),
             prometheus_exposition: PrometheusExpositionSettings::default(),
+            otlp_grpc: OtlpGrpcSettings::default(),
+            native_pcap: NativePcapSettings::default(),
+            system_counters: SystemCountersSettings::default(),
         }
     }
 }
@@ -350,6 +371,58 @@ impl Default for PrometheusExpositionSettings {
         Self {
             endpoint: "http://127.0.0.1:9100/metrics".to_string(),
             mapping: default_prometheus_mapping(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OtlpGrpcSettings {
+    pub bind_addr: String,
+    pub timeout_secs: u64,
+    pub mapping: BTreeMapString,
+}
+
+impl Default for OtlpGrpcSettings {
+    fn default() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:4317".to_string(),
+            timeout_secs: 20,
+            mapping: default_prometheus_mapping(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NativePcapSettings {
+    pub source: String,
+    pub packet_limit: usize,
+    pub timeout_secs: u64,
+}
+
+impl Default for NativePcapSettings {
+    fn default() -> Self {
+        Self {
+            source: "lo0".to_string(),
+            packet_limit: 256,
+            timeout_secs: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SystemCountersSettings {
+    pub interface: String,
+    pub interval_secs: u64,
+}
+
+impl Default for SystemCountersSettings {
+    fn default() -> Self {
+        Self {
+            interface: "all".to_string(),
+            interval_secs: 1,
         }
     }
 }
@@ -636,6 +709,24 @@ fn default_source_profiles() -> Vec<SourceProfile> {
             id: "prometheus_metrics".to_string(),
             name: "Prometheus /metrics".to_string(),
             kind: ConnectorKind::PrometheusExposition,
+            ..SourceProfile::default()
+        },
+        SourceProfile {
+            id: "otlp_grpc".to_string(),
+            name: "OTLP gRPC receiver".to_string(),
+            kind: ConnectorKind::OtlpGrpcReceiver,
+            ..SourceProfile::default()
+        },
+        SourceProfile {
+            id: "native_pcap".to_string(),
+            name: "Native pcap".to_string(),
+            kind: ConnectorKind::NativePcap,
+            ..SourceProfile::default()
+        },
+        SourceProfile {
+            id: "system_counters".to_string(),
+            name: "System counters".to_string(),
+            kind: ConnectorKind::SystemCounters,
             ..SourceProfile::default()
         },
     ]

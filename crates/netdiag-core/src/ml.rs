@@ -1,6 +1,12 @@
 use crate::error::{IoContext, NetdiagError, Result};
-use crate::models::{FaultLabel, FeatureImportance, MlResult, Prediction, TelemetryWindow};
-use crate::telemetry::{extract_features_from_windows, mean};
+use crate::models::{
+    FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, MlResult, ModelManifest,
+    Prediction, Recommendation, TelemetryWindow, TraceRecord,
+};
+use crate::report::Report;
+use crate::storage::{read_json, save_json_atomic};
+use crate::telemetry::{extract_features_from_windows, mean, summarize_telemetry};
+use chrono::Utc;
 use linfa::Dataset;
 use linfa::prelude::Fit;
 use linfa_logistic::{MultiFittedLogisticRegression, MultiLogisticRegression};
@@ -9,10 +15,13 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+pub const MODEL_FILE_NAME: &str = "rust_logistic_model.json";
+pub const MODEL_MANIFEST_FILE_NAME: &str = "model_manifest.json";
 
 pub const FEATURES: [&str; 11] = [
     "latency_mean",
@@ -44,6 +53,47 @@ pub struct RustMlModel {
     pub stds: Vec<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackTrainingRow {
+    pub label: FaultLabel,
+    pub final_label: FaultLabel,
+    pub run_id: String,
+    pub source: String,
+    pub features: BTreeMap<String, f64>,
+    pub rule_labels: Vec<String>,
+    pub ml_top: String,
+    pub ml_top_prob: f64,
+    pub recommendation_id: String,
+    pub feedback_state: HilState,
+    pub feedback_notes: String,
+    pub reviewer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedbackExportSummary {
+    pub output: String,
+    pub rows: usize,
+    pub skipped_runs: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrainingJsonlRow {
+    #[serde(default)]
+    label: Option<FaultLabel>,
+    #[serde(default)]
+    final_label: Option<FaultLabel>,
+    #[serde(default)]
+    records: Vec<TraceRecord>,
+    #[serde(default)]
+    features: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone)]
+struct FeatureTrainingRow {
+    label: FaultLabel,
+    features: Vec<f64>,
+}
+
 pub fn infer(
     windows: &[TelemetryWindow],
     run_id: &str,
@@ -51,25 +101,38 @@ pub fn infer(
 ) -> Result<MlResult> {
     let model_dir = artifact_root.as_ref().join("model");
     let model = load_or_train_model(&model_dir)?;
+    let model_manifest = read_json(model_dir.join(MODEL_MANIFEST_FILE_NAME))
+        .ok()
+        .and_then(|value| serde_json::from_value::<ModelManifest>(value).ok());
     let raw_features = extract_features_from_windows(windows);
     let scaled = scale_row(&raw_features, &model.means, &model.stds);
     let x = Array2::from_shape_vec((1, FEATURES.len()), scaled.clone())
         .map_err(|err| NetdiagError::Ml(err.to_string()))?;
     let probabilities = model.model.predict_probabilities(&x);
-    let calibrated = calibrate_probabilities(probabilities.row(0).to_vec(), &raw_features);
+    let classes = model.model.classes().to_vec();
+    let calibrated =
+        calibrate_probabilities(probabilities.row(0).to_vec(), &classes, &raw_features);
     let mut ranking: Vec<Prediction> = calibrated
         .iter()
         .enumerate()
         .map(|(idx, prob)| Prediction {
-            label: FaultLabel::from_index(idx),
+            label: classes
+                .get(idx)
+                .copied()
+                .map(FaultLabel::from_index)
+                .unwrap_or(FaultLabel::Normal),
             prob: *prob,
         })
         .collect();
     ranking.sort_by(|left, right| right.prob.total_cmp(&left.prob));
 
-    let top_index = ranking
+    let top_class_position = ranking
         .first()
-        .map(|prediction| prediction.label.index())
+        .and_then(|prediction| {
+            classes
+                .iter()
+                .position(|class| *class == prediction.label.index())
+        })
         .unwrap_or(0);
     let params = model.model.params();
     let mut top_features: Vec<FeatureImportance> = FEATURES
@@ -77,7 +140,12 @@ pub fn infer(
         .enumerate()
         .map(|(idx, name)| FeatureImportance {
             name: (*name).to_string(),
-            importance: (scaled[idx] * params[[idx, top_index]]).abs(),
+            importance: (scaled[idx]
+                * params
+                    .get((idx, top_class_position))
+                    .copied()
+                    .unwrap_or(0.0))
+            .abs(),
         })
         .collect();
     top_features.sort_by(|left, right| right.importance.total_cmp(&left.importance));
@@ -94,25 +162,117 @@ pub fn infer(
         top_predictions: ranking.into_iter().take(5).collect(),
         top_features: top_features.into_iter().take(5).collect(),
         features,
+        model_manifest,
     })
 }
 
 pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
-    let model_path = model_dir.join("rust_logistic_model.json");
+    let model_path = model_dir.join(MODEL_FILE_NAME);
+    let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
     if model_path.exists()
         && let Ok(file) = File::open(&model_path)
     {
         let reader = BufReader::new(file);
         if let Ok(model) = serde_json::from_reader::<_, RustMlModel>(reader) {
+            if !manifest_path.exists() {
+                let manifest = build_model_manifest("cached_existing_model", 0, false, &model);
+                save_json_atomic(&manifest_path, &manifest)?;
+            }
             return Ok(model);
         }
     }
 
     std::fs::create_dir_all(model_dir).with_path(model_dir)?;
     let model = train_default_model()?;
-    let file = File::create(&model_path).with_path(&model_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), &model)?;
+    let manifest = build_model_manifest("synthetic_fallback", BASELINES.len() * 130, true, &model);
+    write_model_bundle(model_dir, &model, &manifest)?;
     Ok(model)
+}
+
+pub fn train_model_from_jsonl(
+    dataset_path: impl AsRef<Path>,
+    model_dir: impl AsRef<Path>,
+) -> Result<ModelManifest> {
+    let dataset_path = dataset_path.as_ref();
+    let model_dir = model_dir.as_ref();
+    let rows = read_training_jsonl(dataset_path)?;
+    let model = train_model_from_feature_rows(&rows)?;
+    let manifest = build_model_manifest(
+        format!("jsonl:{}", dataset_path.display()),
+        rows.len(),
+        false,
+        &model,
+    );
+    write_model_bundle(model_dir, &model, &manifest)?;
+    Ok(manifest)
+}
+
+pub fn export_feedback_training_dataset(
+    artifact_root: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+) -> Result<FeedbackExportSummary> {
+    let artifact_root = artifact_root.as_ref();
+    let output_path = output_path.as_ref();
+    let runs_root = artifact_root.join("runs");
+    let mut rows = Vec::new();
+    let mut skipped_runs = 0usize;
+
+    for entry in std::fs::read_dir(&runs_root).with_path(&runs_root)? {
+        let entry = entry.with_path(&runs_root)?;
+        let run_dir = entry.path();
+        if !run_dir.is_dir()
+            || run_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+
+        let report_path = run_dir.join("report.json");
+        let ml_path = run_dir.join("ml_result.json");
+        let feedback_path = run_dir.join("hil_feedback.json");
+        if !report_path.exists() || !ml_path.exists() || !feedback_path.exists() {
+            skipped_runs += 1;
+            continue;
+        }
+
+        let report: Report = serde_json::from_value(read_json(&report_path)?)?;
+        let ml: MlResult = serde_json::from_value(read_json(&ml_path)?)?;
+        let feedback: BTreeMap<String, HilFeedbackRecord> =
+            serde_json::from_value(read_json(&feedback_path)?)?;
+        feature_map_to_vec(&ml.features)?;
+
+        let Some((recommendation, feedback_record)) =
+            accepted_feedback_label(&report.recommendations, &feedback)
+        else {
+            skipped_runs += 1;
+            continue;
+        };
+        let final_label = recommendation.diagnosis_symptom;
+
+        rows.push(FeedbackTrainingRow {
+            label: final_label,
+            final_label,
+            run_id: report.run_id,
+            source: "hil_accepted".to_string(),
+            features: ml.features,
+            rule_labels: report.rule_vs_ml.rule_labels,
+            ml_top: report.rule_vs_ml.ml_top,
+            ml_top_prob: report.rule_vs_ml.ml_top_prob,
+            recommendation_id: recommendation.recommendation_id,
+            feedback_state: feedback_record.review.state,
+            feedback_notes: feedback_record.review.notes,
+            reviewer: feedback_record.review.reviewer,
+        });
+    }
+
+    write_jsonl_atomic(output_path, &rows)?;
+    Ok(FeedbackExportSummary {
+        output: output_path.display().to_string(),
+        rows: rows.len(),
+        skipped_runs,
+    })
 }
 
 fn train_default_model() -> Result<RustMlModel> {
@@ -137,6 +297,52 @@ fn train_default_model() -> Result<RustMlModel> {
         }
     }
 
+    fit_model(&rows, &targets)
+}
+
+fn train_model_from_feature_rows(rows: &[FeatureTrainingRow]) -> Result<RustMlModel> {
+    let features = rows
+        .iter()
+        .map(|row| row.features.clone())
+        .collect::<Vec<_>>();
+    let targets = rows.iter().map(|row| row.label.index()).collect::<Vec<_>>();
+    fit_model(&features, &targets)
+}
+
+fn fit_model(rows: &[Vec<f64>], targets: &[usize]) -> Result<RustMlModel> {
+    if rows.is_empty() {
+        return Err(NetdiagError::Ml(
+            "training dataset must contain at least one row".to_string(),
+        ));
+    }
+    if rows.len() != targets.len() {
+        return Err(NetdiagError::Ml(
+            "training features and labels have different lengths".to_string(),
+        ));
+    }
+    let distinct_labels = targets.iter().copied().collect::<BTreeSet<_>>();
+    if distinct_labels.len() < 2 {
+        return Err(NetdiagError::Ml(
+            "training dataset must contain at least two labels".to_string(),
+        ));
+    }
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row.len() != FEATURES.len() {
+            return Err(NetdiagError::Ml(format!(
+                "training row {} has {} features, expected {}",
+                row_idx + 1,
+                row.len(),
+                FEATURES.len()
+            )));
+        }
+        if row.iter().any(|value| !value.is_finite()) {
+            return Err(NetdiagError::Ml(format!(
+                "training row {} contains non-finite features",
+                row_idx + 1
+            )));
+        }
+    }
+
     let means = (0..FEATURES.len())
         .map(|idx| mean(rows.iter().map(|row| row[idx])))
         .collect::<Vec<_>>();
@@ -154,7 +360,7 @@ fn train_default_model() -> Result<RustMlModel> {
         .collect::<Vec<_>>();
     let x = Array2::from_shape_vec((rows.len(), FEATURES.len()), scaled_rows)
         .map_err(|err| NetdiagError::Ml(err.to_string()))?;
-    let y = Array1::from(targets);
+    let y = Array1::from(targets.to_vec());
     let dataset = Dataset::new(x, y);
     let model = MultiLogisticRegression::default()
         .alpha(0.1)
@@ -164,6 +370,174 @@ fn train_default_model() -> Result<RustMlModel> {
     Ok(RustMlModel { model, means, stds })
 }
 
+fn read_training_jsonl(path: &Path) -> Result<Vec<FeatureTrainingRow>> {
+    let file = File::open(path).with_path(path)?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line.with_path(path)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: TrainingJsonlRow = serde_json::from_str(trimmed).map_err(|err| {
+            NetdiagError::Ml(format!(
+                "training dataset {} has invalid JSON on line {}: {err}",
+                path.display(),
+                idx + 1
+            ))
+        })?;
+        let label = parsed.label.or(parsed.final_label).ok_or_else(|| {
+            NetdiagError::Ml(format!(
+                "training dataset {} line {} is missing label",
+                path.display(),
+                idx + 1
+            ))
+        })?;
+        let features = if parsed.records.is_empty() {
+            if parsed.features.is_empty() {
+                return Err(NetdiagError::Ml(format!(
+                    "training dataset {} line {} must include records or features",
+                    path.display(),
+                    idx + 1
+                )));
+            }
+            feature_map_to_vec(&parsed.features)?
+        } else {
+            let summary = summarize_telemetry(&parsed.records, 5)?;
+            extract_features_from_windows(&summary.windows)
+        };
+        if features.iter().any(|value| !value.is_finite()) {
+            return Err(NetdiagError::Ml(format!(
+                "training dataset {} line {} contains non-finite features",
+                path.display(),
+                idx + 1
+            )));
+        }
+        rows.push(FeatureTrainingRow { label, features });
+    }
+
+    if rows.is_empty() {
+        return Err(NetdiagError::Ml(format!(
+            "training dataset {} contains no rows",
+            path.display()
+        )));
+    }
+    Ok(rows)
+}
+
+fn feature_map_to_vec(features: &BTreeMap<String, f64>) -> Result<Vec<f64>> {
+    FEATURES
+        .iter()
+        .map(|name| {
+            let value = features.get(*name).copied().ok_or_else(|| {
+                NetdiagError::Ml(format!("training feature map is missing {name}"))
+            })?;
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(NetdiagError::Ml(format!(
+                    "training feature {name} is not finite"
+                )))
+            }
+        })
+        .collect()
+}
+
+fn write_model_bundle(
+    model_dir: &Path,
+    model: &RustMlModel,
+    manifest: &ModelManifest,
+) -> Result<()> {
+    std::fs::create_dir_all(model_dir).with_path(model_dir)?;
+    save_json_atomic(model_dir.join(MODEL_FILE_NAME), model)?;
+    save_json_atomic(model_dir.join(MODEL_MANIFEST_FILE_NAME), manifest)?;
+    Ok(())
+}
+
+fn build_model_manifest(
+    training_source: impl Into<String>,
+    training_examples: usize,
+    synthetic_fallback: bool,
+    model: &RustMlModel,
+) -> ModelManifest {
+    ModelManifest {
+        schema_version: "netdiag-model-manifest/v1".to_string(),
+        model_name: "netdiag_fault_classifier".to_string(),
+        model_kind: "linfa_multinomial_logistic_regression".to_string(),
+        created_at: Utc::now(),
+        training_source: training_source.into(),
+        model_file: MODEL_FILE_NAME.to_string(),
+        feature_names: FEATURES.iter().map(|name| (*name).to_string()).collect(),
+        labels: model
+            .model
+            .classes()
+            .iter()
+            .map(|class| FaultLabel::from_index(*class).as_str().to_string())
+            .collect(),
+        training_examples,
+        feature_count: FEATURES.len(),
+        synthetic_fallback,
+    }
+}
+
+fn accepted_feedback_label(
+    recommendations: &[Recommendation],
+    feedback: &BTreeMap<String, HilFeedbackRecord>,
+) -> Option<(Recommendation, HilFeedbackRecord)> {
+    let mut selected = None;
+    for record in feedback.values() {
+        if record.review.state != HilState::Accepted {
+            continue;
+        }
+        let Some(recommendation) = recommendations
+            .iter()
+            .find(|item| item.recommendation_id == record.recommendation_id)
+        else {
+            continue;
+        };
+        if selected
+            .as_ref()
+            .is_none_or(|(best, _): &(Recommendation, HilFeedbackRecord)| {
+                recommendation.confidence > best.confidence
+            })
+        {
+            selected = Some((recommendation.clone(), record.clone()));
+        }
+    }
+    selected
+}
+
+fn write_jsonl_atomic<T: Serialize>(path: &Path, rows: &[T]) -> Result<PathBuf> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_path(parent)?;
+    }
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("jsonl")
+    ));
+    let write_result = (|| -> Result<()> {
+        let file = File::create(&tmp_path).with_path(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in rows {
+            serde_json::to_writer(&mut writer, row)?;
+            writer.write_all(b"\n").with_path(&tmp_path)?;
+        }
+        writer.flush().with_path(&tmp_path)?;
+        writer.get_ref().sync_all().with_path(&tmp_path)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    std::fs::rename(&tmp_path, path).with_path(path)?;
+    Ok(path.to_path_buf())
+}
+
 fn scale_row(row: &[f64], means: &[f64], stds: &[f64]) -> Vec<f64> {
     row.iter()
         .enumerate()
@@ -171,35 +545,35 @@ fn scale_row(row: &[f64], means: &[f64], stds: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-fn calibrate_probabilities(mut probs: Vec<f64>, features: &[f64]) -> Vec<f64> {
-    let latency_mean = features[0];
-    let loss_rate = features[3];
-    let retrans_rate = features[4];
-    let throughput = features[7];
-    let dns_events = features[8];
-    let tls_events = features[9];
-    let quic_ratio = features[10];
+fn calibrate_probabilities(mut probs: Vec<f64>, classes: &[usize], features: &[f64]) -> Vec<f64> {
+    let latency_mean = features.first().copied().unwrap_or(0.0);
+    let loss_rate = features.get(3).copied().unwrap_or(0.0);
+    let retrans_rate = features.get(4).copied().unwrap_or(0.0);
+    let throughput = features.get(7).copied().unwrap_or(0.0);
+    let dns_events = features.get(8).copied().unwrap_or(0.0);
+    let tls_events = features.get(9).copied().unwrap_or(0.0);
+    let quic_ratio = features.get(10).copied().unwrap_or(0.0);
 
     if dns_events > 0.0 {
-        probs[FaultLabel::DnsFailure.index()] *= 8.0;
+        scale_probability(&mut probs, classes, FaultLabel::DnsFailure, 8.0);
     } else {
-        probs[FaultLabel::DnsFailure.index()] *= 0.05;
+        scale_probability(&mut probs, classes, FaultLabel::DnsFailure, 0.05);
     }
     if tls_events > 0.0 {
-        probs[FaultLabel::TlsFailure.index()] *= 8.0;
+        scale_probability(&mut probs, classes, FaultLabel::TlsFailure, 8.0);
     } else {
-        probs[FaultLabel::TlsFailure.index()] *= 0.05;
+        scale_probability(&mut probs, classes, FaultLabel::TlsFailure, 0.05);
     }
     if quic_ratio > 0.25 {
-        probs[FaultLabel::UdpQuicBlocked.index()] *= 6.0;
+        scale_probability(&mut probs, classes, FaultLabel::UdpQuicBlocked, 6.0);
     } else {
-        probs[FaultLabel::UdpQuicBlocked.index()] *= 0.25;
+        scale_probability(&mut probs, classes, FaultLabel::UdpQuicBlocked, 0.25);
     }
     if loss_rate > 1.0 && dns_events <= 0.0 && tls_events <= 0.0 && quic_ratio <= 0.25 {
-        probs[FaultLabel::RandomLoss.index()] *= 4.0;
+        scale_probability(&mut probs, classes, FaultLabel::RandomLoss, 4.0);
     }
     if latency_mean > 120.0 && retrans_rate > 1.5 && throughput < 35.0 {
-        probs[FaultLabel::Congestion.index()] *= 4.0;
+        scale_probability(&mut probs, classes, FaultLabel::Congestion, 4.0);
     }
 
     let total: f64 = probs.iter().sum();
@@ -211,7 +585,17 @@ fn calibrate_probabilities(mut probs: Vec<f64>, features: &[f64]) -> Vec<f64> {
     probs
 }
 
+fn scale_probability(probs: &mut [f64], classes: &[usize], label: FaultLabel, factor: f64) {
+    if let Some(index) = classes
+        .iter()
+        .position(|class| *class == label.index())
+        .filter(|index| *index < probs.len())
+    {
+        probs[index] *= factor;
+    }
+}
+
 #[allow(dead_code)]
 fn model_path(root: &Path) -> PathBuf {
-    root.join("model").join("rust_logistic_model.json")
+    root.join("model").join(MODEL_FILE_NAME)
 }

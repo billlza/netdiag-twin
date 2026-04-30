@@ -694,6 +694,8 @@ enum Text {
     WhatIfResult,
     MlTopPredictions,
     FeatureContribution,
+    ModelStatus,
+    SyntheticFallback,
     RuleBased,
     MlAssisted,
     AddApi,
@@ -779,6 +781,9 @@ enum Text {
     ConnectorHttpJson,
     ConnectorPrometheusQuery,
     ConnectorPrometheusMetrics,
+    ConnectorOtlpGrpc,
+    ConnectorNativePcap,
+    ConnectorSystemCounters,
     SourceProfile,
     ProfileName,
     PrometheusBaseUrl,
@@ -787,6 +792,12 @@ enum Text {
     PrometheusStep,
     ProbeSamples,
     ProbeTargets,
+    OtlpBindAddr,
+    CaptureSource,
+    PacketLimit,
+    CaptureTimeout,
+    SystemInterface,
+    SamplingInterval,
     HttpJsonConnectorHint,
     ImportTopology,
     ExportTopology,
@@ -1234,7 +1245,11 @@ impl NetDiagApp {
             ConnectorKind::PrometheusExposition => {
                 !profile.prometheus_exposition.endpoint.trim().is_empty()
             }
-            ConnectorKind::LocalProbe | ConnectorKind::WebsiteProbe => true,
+            ConnectorKind::OtlpGrpcReceiver => !profile.otlp_grpc.bind_addr.trim().is_empty(),
+            ConnectorKind::NativePcap => !profile.native_pcap.source.trim().is_empty(),
+            ConnectorKind::SystemCounters
+            | ConnectorKind::LocalProbe
+            | ConnectorKind::WebsiteProbe => true,
         }
     }
 
@@ -1560,6 +1575,18 @@ impl NetDiagApp {
             );
             ui.add_space(16.0);
             section_title(ui, tr(self.language, Text::MlTopPredictions));
+            if let Some(manifest) = &result.ml_result.model_manifest {
+                let status = if manifest.synthetic_fallback {
+                    tr(self.language, Text::SyntheticFallback).to_string()
+                } else {
+                    manifest.training_source.clone()
+                };
+                bullet(
+                    ui,
+                    &format!("{}: {}", tr(self.language, Text::ModelStatus), status),
+                    ORANGE,
+                );
+            }
             for prediction in &result.ml_result.top_predictions {
                 bullet(
                     ui,
@@ -2244,6 +2271,71 @@ impl NetDiagApp {
                                     &mut profile.prometheus_exposition.endpoint,
                                 )
                                 .desired_width(420.0),
+                            )
+                            .changed();
+                    });
+                }
+                ConnectorKind::OtlpGrpcReceiver => {
+                    ui.horizontal(|ui| {
+                        setting_caption(ui, tr(self.language, Text::OtlpBindAddr));
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut profile.otlp_grpc.bind_addr)
+                                    .desired_width(260.0),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        setting_caption(ui, tr(self.language, Text::RequestTimeout));
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut profile.otlp_grpc.timeout_secs)
+                                    .range(1..=120),
+                            )
+                            .changed();
+                    });
+                }
+                ConnectorKind::NativePcap => {
+                    ui.horizontal(|ui| {
+                        setting_caption(ui, tr(self.language, Text::CaptureSource));
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut profile.native_pcap.source)
+                                    .desired_width(260.0),
+                            )
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        setting_caption(ui, tr(self.language, Text::PacketLimit));
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut profile.native_pcap.packet_limit)
+                                    .range(1..=10_000),
+                            )
+                            .changed();
+                        setting_caption(ui, tr(self.language, Text::CaptureTimeout));
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut profile.native_pcap.timeout_secs)
+                                    .range(1..=120),
+                            )
+                            .changed();
+                    });
+                }
+                ConnectorKind::SystemCounters => {
+                    ui.horizontal(|ui| {
+                        setting_caption(ui, tr(self.language, Text::SystemInterface));
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut profile.system_counters.interface)
+                                    .desired_width(220.0),
+                            )
+                            .changed();
+                        setting_caption(ui, tr(self.language, Text::SamplingInterval));
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut profile.system_counters.interval_secs)
+                                    .range(1..=10),
                             )
                             .changed();
                     });
@@ -3409,6 +3501,21 @@ fn connector_source_mode_from_profile(
                 .unwrap_or_else(|| settings.data_connectors.prometheus_exposition.clone()),
             secrets.get_live_api_token()?,
         )),
+        ConnectorKind::OtlpGrpcReceiver => Ok(SourceMode::OtlpGrpcReceiver(
+            profile
+                .map(|profile| profile.otlp_grpc.clone())
+                .unwrap_or_else(|| settings.data_connectors.otlp_grpc.clone()),
+        )),
+        ConnectorKind::NativePcap => Ok(SourceMode::NativePcap(
+            profile
+                .map(|profile| profile.native_pcap.clone())
+                .unwrap_or_else(|| settings.data_connectors.native_pcap.clone()),
+        )),
+        ConnectorKind::SystemCounters => Ok(SourceMode::SystemCounters(
+            profile
+                .map(|profile| profile.system_counters.clone())
+                .unwrap_or_else(|| settings.data_connectors.system_counters.clone()),
+        )),
     }
 }
 
@@ -3454,6 +3561,8 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::WhatIfResult) => "What-if 结果",
         (Language::Zh, Text::MlTopPredictions) => "ML Top 预测",
         (Language::Zh, Text::FeatureContribution) => "特征贡献",
+        (Language::Zh, Text::ModelStatus) => "模型状态",
+        (Language::Zh, Text::SyntheticFallback) => "synthetic fallback，仅适合原型和回归验证",
         (Language::Zh, Text::RuleBased) => "规则诊断",
         (Language::Zh, Text::MlAssisted) => "ML 辅助",
         (Language::Zh, Text::AddApi) => "添加 API",
@@ -3541,6 +3650,9 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::ConnectorHttpJson) => "HTTP/JSON 实验平台",
         (Language::Zh, Text::ConnectorPrometheusQuery) => "Prometheus query_range",
         (Language::Zh, Text::ConnectorPrometheusMetrics) => "Prometheus /metrics",
+        (Language::Zh, Text::ConnectorOtlpGrpc) => "OTLP gRPC 接收器",
+        (Language::Zh, Text::ConnectorNativePcap) => "Rust 原生抓包",
+        (Language::Zh, Text::ConnectorSystemCounters) => "系统接口计数器",
         (Language::Zh, Text::SourceProfile) => "采集 Profile",
         (Language::Zh, Text::ProfileName) => "Profile 名称",
         (Language::Zh, Text::PrometheusBaseUrl) => "Prometheus URL",
@@ -3549,6 +3661,12 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::PrometheusStep) => "步长秒数",
         (Language::Zh, Text::ProbeSamples) => "探测次数",
         (Language::Zh, Text::ProbeTargets) => "探测目标",
+        (Language::Zh, Text::OtlpBindAddr) => "OTLP 监听地址",
+        (Language::Zh, Text::CaptureSource) => "抓包来源",
+        (Language::Zh, Text::PacketLimit) => "包数上限",
+        (Language::Zh, Text::CaptureTimeout) => "抓包超时",
+        (Language::Zh, Text::SystemInterface) => "接口",
+        (Language::Zh, Text::SamplingInterval) => "采样间隔",
         (Language::Zh, Text::HttpJsonConnectorHint) => {
             "HTTP/JSON 使用下方真实 API URL 和 Keychain Token"
         }
@@ -3605,6 +3723,10 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::WhatIfResult) => "What-if Result",
         (Language::En, Text::MlTopPredictions) => "ML Top Predictions",
         (Language::En, Text::FeatureContribution) => "Feature Contribution",
+        (Language::En, Text::ModelStatus) => "Model Status",
+        (Language::En, Text::SyntheticFallback) => {
+            "synthetic fallback; suitable for prototype and regression validation"
+        }
         (Language::En, Text::RuleBased) => "Rule-based",
         (Language::En, Text::MlAssisted) => "ML-assisted",
         (Language::En, Text::AddApi) => "Add API",
@@ -3694,6 +3816,9 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::ConnectorHttpJson) => "HTTP/JSON Lab Adapter",
         (Language::En, Text::ConnectorPrometheusQuery) => "Prometheus query_range",
         (Language::En, Text::ConnectorPrometheusMetrics) => "Prometheus /metrics",
+        (Language::En, Text::ConnectorOtlpGrpc) => "OTLP gRPC Receiver",
+        (Language::En, Text::ConnectorNativePcap) => "Rust Native Capture",
+        (Language::En, Text::ConnectorSystemCounters) => "System Counters",
         (Language::En, Text::SourceProfile) => "Source Profile",
         (Language::En, Text::ProfileName) => "Profile Name",
         (Language::En, Text::PrometheusBaseUrl) => "Prometheus URL",
@@ -3702,6 +3827,12 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::PrometheusStep) => "Step Seconds",
         (Language::En, Text::ProbeSamples) => "Probe Samples",
         (Language::En, Text::ProbeTargets) => "Probe Targets",
+        (Language::En, Text::OtlpBindAddr) => "OTLP Bind Address",
+        (Language::En, Text::CaptureSource) => "Capture Source",
+        (Language::En, Text::PacketLimit) => "Packet Limit",
+        (Language::En, Text::CaptureTimeout) => "Capture Timeout",
+        (Language::En, Text::SystemInterface) => "Interface",
+        (Language::En, Text::SamplingInterval) => "Sampling Interval",
         (Language::En, Text::HttpJsonConnectorHint) => {
             "HTTP/JSON uses the Live API URL and Keychain token below"
         }
@@ -3745,6 +3876,9 @@ fn connector_kind_label(connector: ConnectorKind, lang: Language) -> &'static st
         ConnectorKind::HttpJson => tr(lang, Text::ConnectorHttpJson),
         ConnectorKind::PrometheusQueryRange => tr(lang, Text::ConnectorPrometheusQuery),
         ConnectorKind::PrometheusExposition => tr(lang, Text::ConnectorPrometheusMetrics),
+        ConnectorKind::OtlpGrpcReceiver => tr(lang, Text::ConnectorOtlpGrpc),
+        ConnectorKind::NativePcap => tr(lang, Text::ConnectorNativePcap),
+        ConnectorKind::SystemCounters => tr(lang, Text::ConnectorSystemCounters),
     }
 }
 
@@ -4414,12 +4548,8 @@ fn summary_card(
 ) {
     let margin_x = 14.0;
     let margin_y = 12.0;
-    let inner_size = Vec2::new(
-        (size.x - margin_x * 2.0).max(1.0),
-        (size.y - margin_y * 2.0).max(1.0),
-    );
     let icon_size = if size.x < 150.0 { 38.0 } else { 42.0 };
-    let text_width = (inner_size.x - icon_size - 10.0).max(42.0);
+    let text_width = (size.x - margin_x * 2.0 - icon_size - 12.0).max(42.0);
     let value_limit = if text_width < 72.0 { 11 } else { 18 };
     let caption_limit = if text_width < 72.0 { 14 } else { 22 };
 
@@ -4434,43 +4564,66 @@ fn summary_card(
     );
 
     let content_rect = outer.shrink2(Vec2::new(margin_x, margin_y));
-    ui.scope_builder(
-        UiBuilder::new()
-            .max_rect(content_rect)
-            .layout(Layout::left_to_right(Align::Center)),
-        |ui| {
-            ui.set_clip_rect(content_rect);
-            ui.set_min_size(inner_size);
-            ui.set_max_width(inner_size.x);
-            ui.set_max_height(inner_size.y);
-            icon_box_sized(ui, icon, BLUE, icon_size);
-            ui.add_space(4.0);
-            ui.vertical(|ui| {
-                ui.set_width(text_width);
-                ui.label(
-                    RichText::new(compact_text(label, caption_limit))
-                        .size(12.0)
-                        .color(MUTED),
-                )
-                .on_hover_text(label);
-                ui.label(
-                    RichText::new(compact_text(value, value_limit))
-                        .size(if value.len() > 12 { 16.0 } else { 19.0 })
-                        .strong()
-                        .color(Color32::BLACK),
-                )
-                .on_hover_text(value);
-                if !caption.is_empty() {
-                    ui.label(
-                        RichText::new(compact_text(caption, caption_limit))
-                            .size(11.0)
-                            .color(MUTED),
-                    )
-                    .on_hover_text(caption);
-                }
-            });
-        },
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(
+            content_rect.left() + icon_size * 0.5,
+            content_rect.center().y,
+        ),
+        Vec2::splat(icon_size),
     );
+    icon_box_at(ui, icon_rect, icon, BLUE);
+
+    let rows = summary_card_text_rows(content_rect.center().y, !caption.is_empty());
+    let text_x = icon_rect.right() + 12.0;
+    let value_size = if value.len() > 12 { 16.0 } else { 19.0 };
+    ui.painter().text(
+        Pos2::new(text_x, rows.label_y),
+        Align2::LEFT_CENTER,
+        compact_text(label, caption_limit),
+        FontId::proportional(12.0),
+        MUTED,
+    );
+    ui.painter().text(
+        Pos2::new(text_x, rows.value_y),
+        Align2::LEFT_CENTER,
+        compact_text(value, value_limit),
+        FontId::proportional(value_size),
+        Color32::BLACK,
+    );
+    if let Some(caption_y) = rows.caption_y
+        && !caption.is_empty()
+    {
+        ui.painter().text(
+            Pos2::new(text_x, caption_y),
+            Align2::LEFT_CENTER,
+            compact_text(caption, caption_limit),
+            FontId::proportional(11.0),
+            MUTED,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SummaryTextRows {
+    label_y: f32,
+    value_y: f32,
+    caption_y: Option<f32>,
+}
+
+fn summary_card_text_rows(center_y: f32, has_caption: bool) -> SummaryTextRows {
+    if has_caption {
+        SummaryTextRows {
+            label_y: center_y - 26.0,
+            value_y: center_y,
+            caption_y: Some(center_y + 26.0),
+        }
+    } else {
+        SummaryTextRows {
+            label_y: center_y - 22.0,
+            value_y: center_y,
+            caption_y: None,
+        }
+    }
 }
 
 fn compact_text(text: &str, max_chars: usize) -> String {
@@ -4508,8 +4661,8 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-fn icon_box_sized(ui: &mut egui::Ui, icon: &str, color: Color32, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+fn icon_box_at(ui: &mut egui::Ui, rect: Rect, icon: &str, color: Color32) {
+    let size = rect.width().min(rect.height());
     let radius = (size * 0.29).round() as u8;
     let icon_size = size * 0.44;
     ui.painter()
@@ -5146,5 +5299,23 @@ mod tests {
         let text = compact_text("sim.congestion.long.trace.name", 14);
         assert!(text.contains('…'));
         assert!(text.len() < "sim.congestion.long.trace.name".len());
+    }
+
+    #[test]
+    fn summary_card_rows_center_value_with_icon_when_no_caption() {
+        let rows = summary_card_text_rows(80.0, false);
+        assert_eq!(rows.caption_y, None);
+        assert_eq!(rows.label_y, 58.0);
+        assert_eq!(rows.value_y, 80.0);
+    }
+
+    #[test]
+    fn summary_card_rows_keep_trace_text_group_balanced() {
+        let rows = summary_card_text_rows(80.0, true);
+        assert_eq!(rows.label_y, 54.0);
+        assert_eq!(rows.value_y, 80.0);
+        assert_eq!(rows.caption_y, Some(106.0));
+        let group_center = (rows.label_y + rows.caption_y.unwrap()) / 2.0;
+        assert!((group_center - 80.0).abs() < 0.1);
     }
 }

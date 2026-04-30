@@ -4412,21 +4412,39 @@ fn summary_card(
     caption: &str,
     size: Vec2,
 ) {
+    let margin_x = 14.0;
+    let margin_y = 12.0;
+    let inner_size = Vec2::new(
+        (size.x - margin_x * 2.0).max(1.0),
+        (size.y - margin_y * 2.0).max(1.0),
+    );
+    let icon_size = if size.x < 150.0 { 38.0 } else { 42.0 };
+    let text_width = (inner_size.x - icon_size - 10.0).max(42.0);
+    let value_limit = if text_width < 72.0 { 11 } else { 18 };
+    let caption_limit = if text_width < 72.0 { 14 } else { 22 };
+
     egui::Frame::new()
         .fill(Color32::from_white_alpha(92))
         .corner_radius(14)
         .stroke(Stroke::new(1.0, Color32::from_white_alpha(150)))
-        .inner_margin(Margin::symmetric(18, 16))
+        .inner_margin(Margin::symmetric(margin_x as i8, margin_y as i8))
         .show(ui, |ui| {
-            ui.set_min_size(size);
+            ui.set_min_size(inner_size);
+            ui.set_max_width(inner_size.x);
+            ui.set_max_height(inner_size.y);
             ui.horizontal(|ui| {
-                icon_box(ui, icon, BLUE);
-                ui.add_space(2.0);
+                icon_box_sized(ui, icon, BLUE, icon_size);
+                ui.add_space(4.0);
                 ui.vertical(|ui| {
-                    ui.set_width((size.x - 92.0).max(64.0));
-                    ui.label(RichText::new(label).size(12.0).color(MUTED));
+                    ui.set_width(text_width);
                     ui.label(
-                        RichText::new(compact_text(value, 18))
+                        RichText::new(compact_text(label, caption_limit))
+                            .size(12.0)
+                            .color(MUTED),
+                    )
+                    .on_hover_text(label);
+                    ui.label(
+                        RichText::new(compact_text(value, value_limit))
                             .size(if value.len() > 12 { 16.0 } else { 19.0 })
                             .strong()
                             .color(Color32::BLACK),
@@ -4434,7 +4452,7 @@ fn summary_card(
                     .on_hover_text(value);
                     if !caption.is_empty() {
                         ui.label(
-                            RichText::new(compact_text(caption, 22))
+                            RichText::new(compact_text(caption, caption_limit))
                                 .size(11.0)
                                 .color(MUTED),
                         )
@@ -4480,13 +4498,15 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
     });
 }
 
-fn icon_box(ui: &mut egui::Ui, icon: &str, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+fn icon_box_sized(ui: &mut egui::Ui, icon: &str, color: Color32, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let radius = (size * 0.29).round() as u8;
+    let icon_size = size * 0.44;
     ui.painter()
-        .rect_filled(rect, 14, Color32::from_white_alpha(110));
+        .rect_filled(rect, radius, Color32::from_white_alpha(110));
     ui.painter().rect_stroke(
         rect,
-        14,
+        radius,
         Stroke::new(1.0, Color32::from_white_alpha(90)),
         egui::StrokeKind::Inside,
     );
@@ -4494,7 +4514,7 @@ fn icon_box(ui: &mut egui::Ui, icon: &str, color: Color32) {
         rect.center(),
         Align2::CENTER_CENTER,
         icon,
-        icon_font(21.0),
+        icon_font(icon_size),
         color,
     );
 }

@@ -18,9 +18,21 @@ SPARKLE_FEED_URL="${NETDIAG_SPARKLE_FEED_URL:-https://billlza.github.io/netdiag-
 SPARKLE_PUBLIC_KEY="${NETDIAG_SPARKLE_PUBLIC_KEY:-}"
 SIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 NOTARY_PROFILE="${NETDIAG_NOTARY_PROFILE:-${NOTARYTOOL_PROFILE:-}}"
+NOTARY_KEYCHAIN="${NETDIAG_NOTARY_KEYCHAIN:-}"
 NOTARIZE="${NETDIAG_NOTARIZE:-0}"
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+
+if [[ "$PROFILE" == "release" ]]; then
+  if [[ -z "$SPARKLE_PUBLIC_KEY" || "$SPARKLE_PUBLIC_KEY" == PLACEHOLDER* ]]; then
+    echo "release packaging blocked: set NETDIAG_SPARKLE_PUBLIC_KEY to the real Sparkle EdDSA public key" >&2
+    exit 2
+  fi
+  if [[ ! "$SPARKLE_PUBLIC_KEY" =~ ^[A-Za-z0-9+/=_-]{32,}$ ]]; then
+    echo "release packaging blocked: NETDIAG_SPARKLE_PUBLIC_KEY does not look like an EdDSA public key" >&2
+    exit 2
+  fi
+fi
 
 if [[ "$PROFILE" == "release" ]]; then
   cargo build --release -p netdiag-app
@@ -68,6 +80,15 @@ sign_path() {
     codesign --force --sign - "$path" >/dev/null
   else
     codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$path" >/dev/null
+  fi
+}
+
+sign_dmg() {
+  local path="$1"
+  if [[ "$SIGN_IDENTITY" == "-" ]]; then
+    codesign --force --sign - "$path" >/dev/null
+  else
+    codesign --force --timestamp --sign "$SIGN_IDENTITY" "$path" >/dev/null
   fi
 }
 
@@ -129,8 +150,9 @@ fi
 
 if [[ "$PROFILE" == "release" ]]; then
   DMG_PATH="$TARGET_DIR/$APP_NAME-$VERSION.dmg"
-  rm -f "$DMG_PATH"
+  rm -f "$TARGET_DIR/$APP_NAME-"*.dmg
   hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
+  sign_dmg "$DMG_PATH"
   hdiutil verify "$DMG_PATH" >/dev/null
 
   if [[ "$NOTARIZE" == "1" || -n "$NOTARY_PROFILE" ]]; then
@@ -142,7 +164,11 @@ if [[ "$PROFILE" == "release" ]]; then
       echo "notarization blocked: set NETDIAG_NOTARY_PROFILE or NOTARYTOOL_PROFILE" >&2
       exit 2
     fi
-    xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
+    notary_args=(xcrun notarytool submit "$DMG_PATH" --keychain-profile "$NOTARY_PROFILE" --wait)
+    if [[ -n "$NOTARY_KEYCHAIN" ]]; then
+      notary_args+=(--keychain "$NOTARY_KEYCHAIN")
+    fi
+    "${notary_args[@]}"
     xcrun stapler staple "$DMG_PATH"
     xcrun stapler validate "$DMG_PATH"
   elif [[ "$SIGN_IDENTITY" == "-" ]]; then

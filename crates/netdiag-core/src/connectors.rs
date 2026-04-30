@@ -1080,19 +1080,23 @@ fn diff_counters(
     interface: Option<&str>,
 ) -> Result<CounterDelta> {
     let mut delta = CounterDelta::default();
+    let mut matched = 0usize;
     for (name, after_value) in after {
         if interface.is_some_and(|wanted| wanted != "all" && wanted != name) {
             continue;
         }
+        matched += 1;
         let before_value = before.get(name).copied().unwrap_or_default();
         delta.bytes += after_value.bytes.saturating_sub(before_value.bytes);
         delta.packets += after_value.packets.saturating_sub(before_value.packets);
         delta.errors += after_value.errors.saturating_sub(before_value.errors);
     }
-    if delta.bytes == 0 && delta.packets == 0 && delta.errors == 0 {
-        return Err(NetdiagError::Connector(
-            "system counters did not change during sampling interval".to_string(),
-        ));
+    if matched == 0
+        && let Some(wanted) = interface.filter(|wanted| *wanted != "all")
+    {
+        return Err(NetdiagError::Connector(format!(
+            "system counter interface not found: {wanted}"
+        )));
     }
     Ok(delta)
 }
@@ -1276,6 +1280,44 @@ netdiag_throughput_mbps 99
         assert_eq!(delta.bytes, 1_200);
         assert_eq!(delta.packets, 15);
         assert_eq!(delta.errors, 1);
+    }
+
+    #[test]
+    fn netstat_counter_delta_allows_quiet_interfaces() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("after");
+
+        let delta = diff_counters(&before, &after, Some("en0")).expect("quiet delta");
+
+        assert_eq!(delta.bytes, 0);
+        assert_eq!(delta.packets, 0);
+        assert_eq!(delta.errors, 0);
+    }
+
+    #[test]
+    fn netstat_counter_delta_reports_unknown_interface() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n",
+        )
+        .expect("after");
+
+        let err = diff_counters(&before, &after, Some("utun404")).expect_err("unknown interface");
+
+        assert!(err.to_string().contains("interface not found: utun404"));
     }
 
     fn serve_once(

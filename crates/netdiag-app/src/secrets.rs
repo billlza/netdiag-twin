@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 #[cfg(any(test, not(target_os = "macos")))]
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "com.netdiag.twin";
 pub const LIVE_API_TOKEN_ACCOUNT: &str = "live_api_token";
@@ -30,7 +32,7 @@ impl SecretStore for KeychainSecretStore {
         match keychain_entry()?.get_password() {
             Ok(token) if token.trim().is_empty() => Ok(None),
             Ok(token) => Ok(Some(token)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(err) => Err(err),
         }
         .context("failed to read Live API token from macOS Keychain")
@@ -49,7 +51,7 @@ impl SecretStore for KeychainSecretStore {
         keychain_entry()?
             .delete_credential()
             .or_else(|err| {
-                if matches!(err, keyring::Error::NoEntry) {
+                if matches!(err, keyring_core::Error::NoEntry) {
                     Ok(())
                 } else {
                     Err(err)
@@ -60,9 +62,20 @@ impl SecretStore for KeychainSecretStore {
 }
 
 #[cfg(target_os = "macos")]
-fn keychain_entry() -> Result<keyring::Entry> {
-    keyring::Entry::new(DEFAULT_KEYCHAIN_SERVICE, LIVE_API_TOKEN_ACCOUNT)
+fn keychain_entry() -> Result<keyring_core::Entry> {
+    ensure_keychain_store()?;
+    keyring_core::Entry::new(DEFAULT_KEYCHAIN_SERVICE, LIVE_API_TOKEN_ACCOUNT)
         .context("failed to create macOS Keychain entry")
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_keychain_store() -> Result<()> {
+    static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    INIT.get_or_init(|| keyring::use_named_store("keychain").map_err(|err| err.to_string()))
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!(err.clone()))
+        .copied()
+        .context("failed to initialize macOS Keychain store")
 }
 
 #[cfg(any(test, not(target_os = "macos")))]

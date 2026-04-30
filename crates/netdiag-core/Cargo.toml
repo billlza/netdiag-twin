@@ -1,0 +1,27 @@
+[package]
+name = "netdiag-core"
+description = "Deterministic telemetry diagnosis core for NetDiag Twin"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+csv.workspace = true
+linfa.workspace = true
+linfa-logistic.workspace = true
+ndarray.workspace = true
+petgraph.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+float-cmp.workspace = true
+insta.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,7 @@
+{
+  "run_id": "template-normal",
+  "scenario": "normal",
+  "trace_file": "normal.csv",
+  "python": "3.14",
+  "notes": "Baseline stable network. Expected top symptom: normal."
+}

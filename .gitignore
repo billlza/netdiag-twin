@@ -1,0 +1,16 @@
+target/
+.DS_Store
+*.log
+*.tmp
+.env
+.env.*
+!.env.example
+artifacts/runs/
+artifacts/cache/
+artifacts/model/
+target/netdiag-cli-*.json
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+notarytool-credentials.json

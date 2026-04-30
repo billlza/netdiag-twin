@@ -1,0 +1,34 @@
+[package]
+name = "netdiag-app"
+description = "Native Rust desktop app for NetDiag Twin"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+eframe.workspace = true
+egui-remixicon = { version = "0.34.0", default-features = false }
+egui_extras.workspace = true
+netdiag-core = { path = "../netdiag-core" }
+reqwest.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+ttf-parser = "0.25.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+muda.workspace = true
+objc2 = "0.6.3"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication"] }
+objc2-foundation = "0.3.2"
+
+[package.metadata.bundle]
+name = "NetDiag Twin"
+identifier = "com.netdiag.twin"
+icon = ["assets/NetDiagTwin.icns"]

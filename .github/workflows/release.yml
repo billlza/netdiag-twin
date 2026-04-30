@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Validate secrets
+        run: |
+          test -n "${{ secrets.CODESIGN_IDENTITY }}" || (echo "missing CODESIGN_IDENTITY" && exit 2)
+          test -n "${{ secrets.NETDIAG_SPARKLE_PUBLIC_KEY }}" || (echo "missing NETDIAG_SPARKLE_PUBLIC_KEY" && exit 2)
+          test -n "${{ secrets.SPARKLE_PRIVATE_KEY }}" || (echo "missing SPARKLE_PRIVATE_KEY" && exit 2)
+          test -n "${{ secrets.NETDIAG_NOTARY_PROFILE }}" || (echo "missing NETDIAG_NOTARY_PROFILE" && exit 2)
+      - name: Test
+        run: cargo test --workspace
+      - name: Build DMG
+        env:
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          NETDIAG_SPARKLE_PUBLIC_KEY: ${{ secrets.NETDIAG_SPARKLE_PUBLIC_KEY }}
+          NETDIAG_NOTARY_PROFILE: ${{ secrets.NETDIAG_NOTARY_PROFILE }}
+          NETDIAG_NOTARIZE: "1"
+        run: scripts/package_macos_app.sh release
+      - name: Generate appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: scripts/generate_appcast.sh target/release
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/NetDiag Twin-*.dmg
+            target/release/appcast.xml
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/release
+      - name: Deploy appcast to Pages
+        uses: actions/deploy-pages@v4

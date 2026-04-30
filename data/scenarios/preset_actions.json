@@ -1,0 +1,16 @@
+{
+  "preset_actions": [
+    {
+      "id": "reroute_path_b",
+      "description": "Reroute to backup path B for congestion relief"
+    },
+    {
+      "id": "increase_queue",
+      "description": "Increase queue size on bottleneck link"
+    },
+    {
+      "id": "reduce_bandwidth",
+      "description": "Throttle bandwidth to check rollback/impact boundary"
+    }
+  ]
+}

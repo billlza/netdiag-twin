@@ -4423,44 +4423,54 @@ fn summary_card(
     let value_limit = if text_width < 72.0 { 11 } else { 18 };
     let caption_limit = if text_width < 72.0 { 14 } else { 22 };
 
-    egui::Frame::new()
-        .fill(Color32::from_white_alpha(92))
-        .corner_radius(14)
-        .stroke(Stroke::new(1.0, Color32::from_white_alpha(150)))
-        .inner_margin(Margin::symmetric(margin_x as i8, margin_y as i8))
-        .show(ui, |ui| {
+    let outer = Rect::from_min_size(ui.max_rect().min, size).shrink(0.75);
+    ui.painter()
+        .rect_filled(outer, 14, Color32::from_white_alpha(92));
+    ui.painter().rect_stroke(
+        outer,
+        14,
+        Stroke::new(1.0, Color32::from_white_alpha(150)),
+        egui::StrokeKind::Inside,
+    );
+
+    let content_rect = outer.shrink2(Vec2::new(margin_x, margin_y));
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(content_rect)
+            .layout(Layout::left_to_right(Align::Center)),
+        |ui| {
+            ui.set_clip_rect(content_rect);
             ui.set_min_size(inner_size);
             ui.set_max_width(inner_size.x);
             ui.set_max_height(inner_size.y);
-            ui.horizontal(|ui| {
-                icon_box_sized(ui, icon, BLUE, icon_size);
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.set_width(text_width);
+            icon_box_sized(ui, icon, BLUE, icon_size);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.set_width(text_width);
+                ui.label(
+                    RichText::new(compact_text(label, caption_limit))
+                        .size(12.0)
+                        .color(MUTED),
+                )
+                .on_hover_text(label);
+                ui.label(
+                    RichText::new(compact_text(value, value_limit))
+                        .size(if value.len() > 12 { 16.0 } else { 19.0 })
+                        .strong()
+                        .color(Color32::BLACK),
+                )
+                .on_hover_text(value);
+                if !caption.is_empty() {
                     ui.label(
-                        RichText::new(compact_text(label, caption_limit))
-                            .size(12.0)
+                        RichText::new(compact_text(caption, caption_limit))
+                            .size(11.0)
                             .color(MUTED),
                     )
-                    .on_hover_text(label);
-                    ui.label(
-                        RichText::new(compact_text(value, value_limit))
-                            .size(if value.len() > 12 { 16.0 } else { 19.0 })
-                            .strong()
-                            .color(Color32::BLACK),
-                    )
-                    .on_hover_text(value);
-                    if !caption.is_empty() {
-                        ui.label(
-                            RichText::new(compact_text(caption, caption_limit))
-                                .size(11.0)
-                                .color(MUTED),
-                        )
-                        .on_hover_text(caption);
-                    }
-                });
+                    .on_hover_text(caption);
+                }
             });
-        });
+        },
+    );
 }
 
 fn compact_text(text: &str, max_chars: usize) -> String {

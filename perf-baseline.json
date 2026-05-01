@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-01T03:07:43.750649Z",
+  "threshold_percent": 15.0,
+  "scenarios": {
+    "artifact_write_large_10k": {
+      "max_millis": 250.0,
+      "rows": 10000,
+      "iterations": 1
+    },
+    "ingest_six_samples": {
+      "max_millis": 25.0,
+      "rows": 480,
+      "iterations": 6
+    },
+    "ml_cached_infer_20": {
+      "max_millis": 50.0,
+      "rows": 10000,
+      "iterations": 20
+    },
+    "ml_cold_model_train": {
+      "max_millis": 1000.0,
+      "rows": 0,
+      "iterations": 1
+    },
+    "pipeline_six_samples_cached_model": {
+      "max_millis": 2500.0,
+      "rows": 480,
+      "iterations": 6
+    },
+    "rules_synthetic_100k": {
+      "max_millis": 25.0,
+      "rows": 100000,
+      "iterations": 1
+    },
+    "telemetry_synthetic_100k": {
+      "max_millis": 500.0,
+      "rows": 100000,
+      "iterations": 1
+    },
+    "whatif_synthetic_100": {
+      "max_millis": 25.0,
+      "rows": 10000,
+      "iterations": 100
+    }
+  }
+}

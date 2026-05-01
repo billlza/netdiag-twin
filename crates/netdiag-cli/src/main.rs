@@ -8,6 +8,10 @@ use netdiag_core::connectors::{
 };
 use netdiag_core::ml::{export_feedback_training_dataset, train_model_from_jsonl};
 use netdiag_core::models::{HilState, TelemetrySummary};
+use netdiag_core::perf_budget::{
+    build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
+    run_perf_measurements, save_perf_budget,
+};
 use netdiag_core::storage::{read_json, review_recommendation, run_dir, save_json};
 use netdiag_core::twin::run_simulated_whatif;
 use netdiag_core::{Result as CoreResult, diagnose_file};
@@ -95,6 +99,20 @@ enum Command {
         diagnose: bool,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+    },
+    PerfBudget {
+        #[arg(long, default_value = "perf-baseline.json")]
+        baseline: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value = "target/perf-artifacts")]
+        artifacts: PathBuf,
+        #[arg(long, default_value_t = 15.0)]
+        threshold_percent: f64,
+        #[arg(long, default_value_t = false)]
+        update_baseline: bool,
+        #[arg(long, default_value_t = 3.0)]
+        baseline_scale: f64,
     },
 }
 
@@ -257,6 +275,52 @@ fn run(args: Args) -> anyhow::Result<()> {
                         "provenance": loaded.provenance,
                     }))?
                 );
+            }
+        }
+        Command::PerfBudget {
+            baseline,
+            output,
+            artifacts,
+            threshold_percent,
+            update_baseline,
+            baseline_scale,
+        } => {
+            let measurements = run_perf_measurements(&artifacts)
+                .with_context(|| format!("performance run failed in {}", artifacts.display()))?;
+            if update_baseline {
+                let budget = build_perf_budget(&measurements, threshold_percent, baseline_scale);
+                save_perf_budget(&baseline, &budget).with_context(|| {
+                    format!(
+                        "failed to write performance baseline {}",
+                        baseline.display()
+                    )
+                })?;
+                let report = compare_perf_budget(measurements, &budget, threshold_percent);
+                ensure_budget_has_measurements(&report)?;
+                if let Some(output) = output {
+                    save_json(&output, &report).with_context(|| {
+                        format!("failed to write performance report {}", output.display())
+                    })?;
+                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let budget = load_perf_budget(&baseline).with_context(|| {
+                    format!("failed to read performance baseline {}", baseline.display())
+                })?;
+                let report = compare_perf_budget(measurements, &budget, threshold_percent);
+                ensure_budget_has_measurements(&report)?;
+                if let Some(output) = output {
+                    save_json(&output, &report).with_context(|| {
+                        format!("failed to write performance report {}", output.display())
+                    })?;
+                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.passed {
+                    anyhow::bail!(
+                        "performance budget failed for {} scenario(s)",
+                        report.failures.len()
+                    );
+                }
             }
         }
     }

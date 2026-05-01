@@ -1222,6 +1222,68 @@ netdiag_throughput_mbps 99
     }
 
     #[test]
+    fn prometheus_exposition_missing_optional_events_emit_warnings() {
+        let body = r#"
+netdiag_latency_ms 42
+netdiag_jitter_ms 3
+netdiag_packet_loss_rate 0.2
+netdiag_retransmission_rate 0.4
+netdiag_throughput_mbps 99
+"#;
+        let (url, handle) = serve_once(200, body.to_string(), None);
+        let loaded = load_prometheus_exposition(&PrometheusExpositionConfig {
+            endpoint: url,
+            bearer_token: None,
+            timeout: Duration::from_secs(2),
+            metrics: BTreeMap::new(),
+            sample: "prom_text".to_string(),
+        })
+        .expect("prom exposition with optional fallbacks");
+        handle.join().expect("server thread");
+
+        assert_eq!(loaded.ingest.records.len(), 1);
+        for column in EVENT_METRICS {
+            assert!(
+                loaded
+                    .ingest
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.column == column),
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_metrics_parse_required_matrix_and_warn_for_optional_events() {
+        let timestamp = 1_777_000_000_000_000_000;
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![otlp::metrics::v1::ResourceMetrics {
+                scope_metrics: vec![otlp::metrics::v1::ScopeMetrics {
+                    metrics: vec![
+                        otlp_metric("netdiag_latency_ms", 41.0, timestamp),
+                        otlp_metric("netdiag_jitter_ms", 2.0, timestamp),
+                        otlp_metric("netdiag_packet_loss_rate", 0.1, timestamp),
+                        otlp_metric("netdiag_retransmission_rate", 0.3, timestamp),
+                        otlp_metric("netdiag_throughput_mbps", 88.0, timestamp),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let (values, timestamp_ms) =
+            parse_otlp_metrics_request(&request, &default_prometheus_mapping())
+                .expect("otlp values");
+        let warnings = fallback_warnings_for_missing_events(&values, "OTLP metric is missing");
+
+        assert_eq!(values["latency_ms"], 41.0);
+        assert_eq!(timestamp_ms, (timestamp / 1_000_000) as i64);
+        assert_eq!(warnings.len(), EVENT_METRICS.len());
+    }
+
+    #[test]
     fn native_pcap_stats_keep_observed_values_and_warn_on_missing_fields() {
         let mut stats = PacketStats {
             packet_count: 4,
@@ -1320,6 +1382,39 @@ netdiag_throughput_mbps 99
         assert!(err.to_string().contains("interface not found: utun404"));
     }
 
+    #[test]
+    fn netstat_counter_delta_aggregates_all_interfaces() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n\
+             en1 1500 <Link#5> bb 4 0 400 6 1 600 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n\
+             en1 1500 <Link#5> bb 8 1 900 9 1 900 0\n",
+        )
+        .expect("after");
+
+        let delta = diff_counters(&before, &after, Some("all")).expect("all interfaces");
+
+        assert_eq!(delta.bytes, 2_000);
+        assert_eq!(delta.packets, 22);
+        assert_eq!(delta.errors, 2);
+    }
+
+    #[test]
+    fn netstat_parser_rejects_malformed_counter_values() {
+        let err = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa nope 1 1000 20 2 2000 0\n",
+        )
+        .expect_err("bad counter");
+
+        assert!(err.to_string().contains("invalid netstat counter"));
+    }
+
     fn serve_once(
         status: u16,
         body: String,
@@ -1357,5 +1452,19 @@ netdiag_throughput_mbps 99
             }
         });
         (format!("http://{addr}"), handle)
+    }
+
+    fn otlp_metric(name: &str, value: f64, timestamp: u64) -> Metric {
+        Metric {
+            name: name.to_string(),
+            data: Some(metric::Data::Gauge(otlp::metrics::v1::Gauge {
+                data_points: vec![otlp::metrics::v1::NumberDataPoint {
+                    time_unix_nano: timestamp,
+                    value: Some(number_data_point::Value::AsDouble(value)),
+                    ..Default::default()
+                }],
+            })),
+            ..Default::default()
+        }
     }
 }

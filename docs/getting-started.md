@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.2.2 platform contract: how telemetry becomes
+This guide describes the stable v0.2.3 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -159,7 +159,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.2.2 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.2.3 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -180,7 +180,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.2.2 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.2.3 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.

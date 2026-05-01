@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to publish, for example v0.2.2. Required when dispatching from a branch."
+        description: "Release tag to publish, for example v0.2.3. Required when dispatching from a branch."
         required: false
         type: string
   push:
@@ -82,8 +82,25 @@ jobs:
           test -n "${{ secrets.NETDIAG_NOTARY_KEY_ID }}" || (echo "missing NETDIAG_NOTARY_KEY_ID" && exit 2)
           test -n "${{ secrets.NETDIAG_NOTARY_ISSUER }}" || (echo "missing NETDIAG_NOTARY_ISSUER" && exit 2)
           test -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" || (echo "missing HOMEBREW_TAP_TOKEN" && exit 2)
-      - name: Test
-        run: cargo test --workspace
+      - name: Preflight zero-warning gates
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          RUSTFLAGS="-D warnings" cargo test --workspace
+          RUSTFLAGS="-D warnings" cargo build --release -p netdiag-app
+      - name: Script static checks
+        run: |
+          set -euo pipefail
+          bash -n scripts/*.sh
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck scripts/*.sh
+          else
+            echo "shellcheck not installed; bash -n completed"
+          fi
+      - name: Performance budget
+        run: scripts/check_perf_budget.sh
       - name: Prepare signing keychain
         env:
           CODESIGN_P12_BASE64: ${{ secrets.NETDIAG_CODESIGN_P12_BASE64 }}

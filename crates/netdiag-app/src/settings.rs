@@ -125,7 +125,7 @@ impl AppSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum LanguageSetting {
     #[default]
@@ -168,7 +168,7 @@ impl Default for ApiSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorKind {
     LocalProbe,
@@ -808,6 +808,26 @@ mod tests {
         assert_eq!(settings.startup.default_tab, StartupTab::Overview);
         assert!(settings.startup.auto_run_diagnosis);
         assert!(default_settings_path().ends_with("NetDiag Twin/settings.json"));
+    }
+
+    #[test]
+    fn default_profiles_cover_every_connector_kind_once() {
+        let profiles = default_source_profiles();
+        let mut kinds = profiles
+            .iter()
+            .map(|profile| profile.kind)
+            .collect::<Vec<_>>();
+        kinds.sort();
+
+        let mut expected = ConnectorKind::ALL.to_vec();
+        expected.sort();
+
+        assert_eq!(kinds, expected);
+        assert_eq!(profiles.len(), ConnectorKind::ALL.len());
+        for profile in profiles {
+            assert!(!profile.id.trim().is_empty());
+            assert!(!profile.name.trim().is_empty());
+        }
     }
 
     #[test]

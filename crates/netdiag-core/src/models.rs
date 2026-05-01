@@ -165,6 +165,21 @@ pub struct IngestResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudget {
+    pub schema_version: u32,
+    pub generated_at: DateTime<Utc>,
+    pub threshold_percent: f64,
+    pub scenarios: BTreeMap<String, PerfBudgetEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudgetEntry {
+    pub max_millis: f64,
+    pub rows: usize,
+    pub iterations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionStats {
     pub p50: f64,
     pub p95: f64,

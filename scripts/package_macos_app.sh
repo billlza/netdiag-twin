@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${1:-debug}"
 APP_NAME="NetDiag Twin"
+DMG_BASENAME="NetDiag-Twin"
 BUNDLE_ID="com.netdiag.twin"
 EXECUTABLE="netdiag-app"
 ICON_SRC="$ROOT/crates/netdiag-app/assets/NetDiagTwin.icns"
@@ -150,8 +151,8 @@ if command -v codesign >/dev/null 2>&1; then
 fi
 
 if [[ "$PROFILE" == "release" ]]; then
-  DMG_PATH="$TARGET_DIR/$APP_NAME-$VERSION.dmg"
-  rm -f "$TARGET_DIR/$APP_NAME-"*.dmg
+  DMG_PATH="$TARGET_DIR/$DMG_BASENAME-$VERSION.dmg"
+  rm -f "$TARGET_DIR/$DMG_BASENAME-"*.dmg
   hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
   sign_dmg "$DMG_PATH"
   hdiutil verify "$DMG_PATH" >/dev/null

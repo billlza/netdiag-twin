@@ -60,7 +60,7 @@ jobs:
             exit 2
           fi
 
-          dmg_filename="NetDiag Twin-$release_version.dmg"
+          dmg_filename="NetDiag-Twin-$release_version.dmg"
           {
             printf 'RELEASE_TAG=%s\n' "$release_tag"
             printf 'RELEASE_VERSION=%s\n' "$release_version"
@@ -281,7 +281,7 @@ jobs:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           fail_on_unmatched_files: true
           files: |
-            target/release/NetDiag Twin-*.dmg
+            target/release/NetDiag-Twin-*.dmg
             target/release/appcast.xml
       - name: Checkout Homebrew tap
         uses: actions/checkout@v4
@@ -295,7 +295,6 @@ jobs:
         run: |
           set -euo pipefail
           dmg_sha256="$(shasum -a 256 "$RELEASE_DMG_PATH" | awk '{print $1}')"
-          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/NetDiag%20Twin-${RELEASE_VERSION}.dmg"
           tap_dir_abs="$(cd "$TAP_DIR" && pwd)"
           cask_file="$tap_dir_abs/Casks/netdiag-twin.rb"
           tap_branch="$(git -C "$tap_dir_abs" rev-parse --abbrev-ref HEAD)"
@@ -310,8 +309,7 @@ jobs:
             version "$RELEASE_VERSION"
             sha256 "$dmg_sha256"
 
-            url "$asset_url",
-                verified: "github.com/${GITHUB_REPOSITORY}/"
+            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v#{version}/NetDiag-Twin-#{version}.dmg"
             name "NetDiag Twin"
             desc "Network diagnostics workstation"
             homepage "https://github.com/${GITHUB_REPOSITORY}"

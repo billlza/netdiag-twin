@@ -240,7 +240,11 @@ jobs:
                   continue
               url = enclosure.attrib.get("url", "")
               filename = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path))
-              short_version = attr(enclosure, "shortVersionString") or attr(item, "shortVersionString")
+              short_version = (
+                  attr(enclosure, "shortVersionString")
+                  or attr(item, "shortVersionString")
+                  or child_text(item, "shortVersionString")
+              )
               if filename == expected_filename and short_version == version:
                   matching_item = (item, enclosure, url)
                   break

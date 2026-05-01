@@ -2,11 +2,13 @@ use float_cmp::approx_eq;
 use netdiag_core::error::NetdiagError;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::ml::{
-    MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_or_train_model, train_model_from_jsonl,
+    MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, export_feedback_training_dataset,
+    load_or_train_model, train_model_from_jsonl,
 };
 use netdiag_core::models::{
-    FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState, ModelManifest, Recommendation,
-    RunIndexEntry, RunManifest, TwinPolicyActionKind,
+    FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState, MetricProvenance, MetricQuality,
+    ModelManifest, Recommendation, RecommendationKind, RunIndexEntry, RunManifest,
+    TwinPolicyActionKind,
 };
 use netdiag_core::pipeline::{PipelineResult, diagnose_file};
 use netdiag_core::report::Report;
@@ -66,7 +68,7 @@ fn whatif_reroute_preserves_expected_formula() {
     assert!(approx_eq!(
         f64,
         whatif.delta["latency_pct"],
-        -25.0,
+        -11.45,
         epsilon = 0.001
     ));
     assert!(whatif.proposed["qoe_risk"].as_str().is_some());
@@ -228,7 +230,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "normal",
                         "action": "No action required; continue monitoring.",
-                        "effect": "What-if expects throughput improve by 0.0% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 0.0% with latency -11.4% change.",
                         "risk": "low",
                         "confidence": 0.855,
                         "approval": true,
@@ -236,7 +238,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": null
                     }
                 ],
-                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 0.0 }
+                "what_if_delta": { "latency_pct": -11.45, "loss_pct": -32.61, "throughput_pct": 0.0 }
             }),
         ),
         (
@@ -254,7 +256,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "congestion",
                         "action": "Reroute traffic window + check queue limits and active queue management.",
-                        "effect": "What-if expects throughput improve by 43.3% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 21.6% with latency -11.4% change.",
                         "risk": "medium",
                         "confidence": 0.774,
                         "approval": true,
@@ -264,7 +266,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "random_loss",
                         "action": "Enable packet-loss mitigation profile and inspect underlay noise source.",
-                        "effect": "What-if expects throughput improve by 43.3% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 21.6% with latency -11.4% change.",
                         "risk": "medium",
                         "confidence": 0.729,
                         "approval": true,
@@ -272,7 +274,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": null
                     },
                     {
-                        "symptom": "normal",
+                        "symptom": "none",
                         "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
                         "effect": "Expected latency/throughput changes validated in simulation.",
                         "risk": "low",
@@ -282,7 +284,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": "reroute_path_b"
                     }
                 ],
-                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 43.3 }
+                "what_if_delta": { "latency_pct": -11.45, "loss_pct": -32.61, "throughput_pct": 21.65 }
             }),
         ),
         (
@@ -300,7 +302,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "random_loss",
                         "action": "Enable packet-loss mitigation profile and inspect underlay noise source.",
-                        "effect": "What-if expects throughput improve by 31.3% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 15.6% with latency -11.4% change.",
                         "risk": "medium",
                         "confidence": 0.729,
                         "approval": true,
@@ -308,7 +310,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": null
                     },
                     {
-                        "symptom": "normal",
+                        "symptom": "none",
                         "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
                         "effect": "Expected latency/throughput changes validated in simulation.",
                         "risk": "low",
@@ -318,7 +320,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": "reroute_path_b"
                     }
                 ],
-                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 31.27 }
+                "what_if_delta": { "latency_pct": -11.45, "loss_pct": -32.61, "throughput_pct": 15.63 }
             }),
         ),
         (
@@ -336,7 +338,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "dns_failure",
                         "action": "Check DNS resolver health and confirm certificate trust path.",
-                        "effect": "What-if expects throughput improve by 15.1% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 13.4% with latency -11.4% change.",
                         "risk": "high",
                         "confidence": 0.855,
                         "approval": true,
@@ -344,7 +346,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": null
                     },
                     {
-                        "symptom": "normal",
+                        "symptom": "none",
                         "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
                         "effect": "Expected latency/throughput changes validated in simulation.",
                         "risk": "low",
@@ -354,7 +356,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": "reroute_path_b"
                     }
                 ],
-                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 15.13 }
+                "what_if_delta": { "latency_pct": -11.45, "loss_pct": -32.61, "throughput_pct": 13.41 }
             }),
         ),
         (
@@ -372,7 +374,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "tls_failure",
                         "action": "Validate TLS versions/ciphers and retry handshake after cert rotation.",
-                        "effect": "What-if expects throughput improve by 29.0% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 14.5% with latency -11.4% change.",
                         "risk": "high",
                         "confidence": 0.873,
                         "approval": true,
@@ -380,7 +382,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": null
                     },
                     {
-                        "symptom": "normal",
+                        "symptom": "none",
                         "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
                         "effect": "Expected latency/throughput changes validated in simulation.",
                         "risk": "low",
@@ -390,7 +392,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": "reroute_path_b"
                     }
                 ],
-                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 28.97 }
+                "what_if_delta": { "latency_pct": -11.45, "loss_pct": -32.61, "throughput_pct": 14.49 }
             }),
         ),
         (
@@ -408,7 +410,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                     {
                         "symptom": "udp_quic_blocked",
                         "action": "Fall back to TCP transport or alternative relay while verifying UDP policy.",
-                        "effect": "What-if expects throughput improve by 32.5% with latency -25.0% change.",
+                        "effect": "What-if expects throughput improve by 16.3% with latency -11.4% change.",
                         "risk": "high",
                         "confidence": 0.675,
                         "approval": true,
@@ -416,7 +418,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": null
                     },
                     {
-                        "symptom": "normal",
+                        "symptom": "none",
                         "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
                         "effect": "Expected latency/throughput changes validated in simulation.",
                         "risk": "low",
@@ -426,7 +428,7 @@ fn stable_golden_summaries_cover_six_sample_contracts() {
                         "what_if": "reroute_path_b"
                     }
                 ],
-                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 32.54 }
+                "what_if_delta": { "latency_pct": -11.45, "loss_pct": -32.61, "throughput_pct": 16.27 }
             }),
         ),
     ];
@@ -465,6 +467,7 @@ fn hil_review_updates_feedback_recommendations_report_and_index() {
             HilState::Accepted,
             "approved in regression",
             "tester",
+            recommendation.diagnosis_symptom,
         )
         .expect("review recommendation");
     }
@@ -515,6 +518,92 @@ fn hil_review_updates_feedback_recommendations_report_and_index() {
 }
 
 #[test]
+fn feedback_export_ignores_whatif_actions_without_final_label() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = diagnose_file(
+        sample("congestion"),
+        temp.path(),
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("diagnose");
+    let whatif = result
+        .recommendations
+        .iter()
+        .find(|recommendation| recommendation.kind == RecommendationKind::WhatIfAction)
+        .expect("what-if recommendation");
+    assert!(whatif.diagnosis_symptom.is_none());
+
+    review_recommendation(
+        temp.path(),
+        &result.run_id,
+        &whatif.recommendation_id,
+        HilState::Accepted,
+        "accepted action but not a fault label",
+        "tester",
+        None,
+    )
+    .expect("review what-if");
+
+    let output = temp.path().join("feedback.jsonl");
+    let summary = export_feedback_training_dataset(temp.path(), &output).expect("feedback export");
+
+    assert_eq!(summary.rows, 0);
+    assert_eq!(summary.skipped_runs, 1);
+    assert_eq!(fs::read_to_string(output).expect("feedback file"), "");
+}
+
+#[test]
+fn rules_do_not_treat_fallback_metrics_as_measured_congestion_evidence() {
+    let records = vec![
+        netdiag_core::models::TraceRecord {
+            timestamp: chrono::Utc::now(),
+            latency_ms: 250.0,
+            jitter_ms: 20.0,
+            packet_loss_rate: 5.0,
+            retransmission_rate: 5.0,
+            timeout_events: 0.0,
+            retry_events: 0.0,
+            throughput_mbps: 1.0,
+            dns_failure_events: 0.0,
+            tls_failure_events: 0.0,
+            quic_blocked_ratio: 0.0,
+        },
+        netdiag_core::models::TraceRecord {
+            timestamp: chrono::Utc::now() + chrono::Duration::seconds(5),
+            latency_ms: 260.0,
+            jitter_ms: 22.0,
+            packet_loss_rate: 5.0,
+            retransmission_rate: 5.0,
+            timeout_events: 0.0,
+            retry_events: 0.0,
+            throughput_mbps: 1.0,
+            dns_failure_events: 0.0,
+            tls_failure_events: 0.0,
+            quic_blocked_ratio: 0.0,
+        },
+    ];
+    let mut summary = summarize_telemetry(&records, 5).expect("summary");
+    summary.metric_provenance = [
+        "latency_ms",
+        "jitter_ms",
+        "packet_loss_rate",
+        "retransmission_rate",
+    ]
+    .into_iter()
+    .map(|field| MetricProvenance {
+        field: field.to_string(),
+        quality: MetricQuality::Fallback,
+        source: "system_counters".to_string(),
+        reason: "not measured by connector".to_string(),
+    })
+    .collect();
+
+    let events = diagnose_rules(&summary, "quality-guard");
+
+    assert_eq!(events[0].evidence.symptom, FaultLabel::Normal);
+}
+
+#[test]
 fn hil_review_rejects_unknown_recommendation_id() {
     let temp = tempfile::tempdir().expect("tempdir");
     let result = diagnose_file(
@@ -531,6 +620,7 @@ fn hil_review_rejects_unknown_recommendation_id() {
         HilState::Rejected,
         "no such item",
         "tester",
+        None,
     )
     .expect_err("unknown id should fail");
     assert!(matches!(
@@ -554,6 +644,14 @@ fn recommendation_serde_accepts_pre_hil_artifacts() {
     let recommendations: Vec<Recommendation> =
         serde_json::from_str(old).expect("old recommendation schema");
     assert_eq!(recommendations[0].recommendation_id, "");
+    assert_eq!(
+        recommendations[0].kind,
+        RecommendationKind::DiagnosisMitigation
+    );
+    assert_eq!(
+        recommendations[0].diagnosis_symptom,
+        Some(FaultLabel::Normal)
+    );
     assert!(recommendations[0].review.is_none());
 }
 
@@ -681,7 +779,10 @@ fn stable_golden_summary(sample_name: &str, result: &PipelineResult) -> serde_js
         .iter()
         .map(|recommendation| {
             json!({
-                "symptom": recommendation.diagnosis_symptom.as_str(),
+                "symptom": recommendation
+                    .diagnosis_symptom
+                    .map(|label| label.as_str())
+                    .unwrap_or("none"),
                 "action": recommendation.recommended_action,
                 "effect": recommendation.expected_effect,
                 "risk": recommendation.risk_level,

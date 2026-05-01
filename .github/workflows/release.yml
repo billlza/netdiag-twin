@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to publish, for example v0.2.3. Required when dispatching from a branch."
+        description: "Release tag to publish, for example v0.2.4. Required when dispatching from a branch."
         required: false
         type: string
   push:

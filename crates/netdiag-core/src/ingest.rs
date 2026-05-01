@@ -1,5 +1,7 @@
 use crate::error::{IoContext, NetdiagError, Result};
-use crate::models::{IngestResult, IngestWarning, TraceRecord, TraceSchema};
+use crate::models::{
+    IngestResult, IngestWarning, MetricProvenance, MetricQuality, TraceRecord, TraceSchema,
+};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -118,7 +120,21 @@ pub fn build_ingest_result(
         records,
         schema,
         warnings: Vec::new(),
+        metric_provenance: measured_metric_provenance("ingest"),
     })
+}
+
+pub fn measured_metric_provenance(source: &str) -> Vec<MetricProvenance> {
+    CANONICAL_COLUMNS
+        .iter()
+        .filter(|column| **column != "timestamp")
+        .map(|column| MetricProvenance {
+            field: (*column).to_string(),
+            quality: MetricQuality::Measured,
+            source: source.to_string(),
+            reason: "provided by source payload".to_string(),
+        })
+        .collect()
 }
 
 fn load_csv(path: &Path) -> Result<RawTrace> {

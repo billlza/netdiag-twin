@@ -156,12 +156,47 @@ pub struct IngestWarning {
     pub fallback: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricQuality {
+    #[default]
+    Measured,
+    Estimated,
+    Fallback,
+    Missing,
+}
+
+impl MetricQuality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricQuality::Measured => "measured",
+            MetricQuality::Estimated => "estimated",
+            MetricQuality::Fallback => "fallback",
+            MetricQuality::Missing => "missing",
+        }
+    }
+
+    pub fn is_trustworthy(self) -> bool {
+        matches!(self, MetricQuality::Measured | MetricQuality::Estimated)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricProvenance {
+    pub field: String,
+    pub quality: MetricQuality,
+    pub source: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestResult {
     pub records: Vec<TraceRecord>,
     pub schema: TraceSchema,
     #[serde(default)]
     pub warnings: Vec<IngestWarning>,
+    #[serde(default)]
+    pub metric_provenance: Vec<MetricProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +294,8 @@ pub struct OverallTelemetry {
 pub struct TelemetrySummary {
     pub overall: OverallTelemetry,
     pub windows: Vec<TelemetryWindow>,
+    #[serde(default)]
+    pub metric_provenance: Vec<MetricProvenance>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +367,8 @@ pub struct MlResult {
     pub top_predictions: Vec<Prediction>,
     pub top_features: Vec<FeatureImportance>,
     pub features: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub feature_quality: BTreeMap<String, MetricQuality>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_manifest: Option<ModelManifest>,
 }
@@ -347,6 +386,16 @@ pub struct ModelManifest {
     pub training_examples: usize,
     pub feature_count: usize,
     pub synthetic_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<ModelEvaluation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEvaluation {
+    pub validation_examples: usize,
+    pub accuracy: f64,
+    pub macro_f1: f64,
+    pub confusion_matrix: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +407,8 @@ pub struct WhatIfResult {
     pub topology: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology_snapshot: Option<TopologyModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_topology_snapshot: Option<TopologyModel>,
     pub baseline: BTreeMap<String, serde_json::Value>,
     pub proposed: BTreeMap<String, serde_json::Value>,
     pub delta: BTreeMap<String, f64>,
@@ -440,16 +491,28 @@ pub struct TopologyLink {
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecommendationKind {
+    #[default]
+    DiagnosisMitigation,
+    WhatIfAction,
+    Monitoring,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recommendation {
     #[serde(default)]
     pub recommendation_id: String,
     pub run_id: String,
+    #[serde(default)]
+    pub kind: RecommendationKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub what_if_action_id: Option<String>,
-    pub diagnosis_symptom: FaultLabel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis_symptom: Option<FaultLabel>,
     pub recommended_action: String,
     pub expected_effect: String,
     pub risk_level: String,
@@ -466,15 +529,27 @@ pub struct HilReview {
     pub notes: String,
     pub reviewer: String,
     pub reviewed_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_label: Option<FaultLabel>,
 }
 
 impl HilReview {
     pub fn new(state: HilState, notes: impl Into<String>, reviewer: impl Into<String>) -> Self {
+        Self::with_final_label(state, notes, reviewer, None)
+    }
+
+    pub fn with_final_label(
+        state: HilState,
+        notes: impl Into<String>,
+        reviewer: impl Into<String>,
+        final_label: Option<FaultLabel>,
+    ) -> Self {
         Self {
             state,
             notes: notes.into(),
             reviewer: reviewer.into(),
             reviewed_at: Utc::now(),
+            final_label,
         }
     }
 }

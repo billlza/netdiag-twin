@@ -1,6 +1,6 @@
 use crate::models::{
-    DiagnosisEvent, EvidenceRecord, EvidenceRef, FaultLabel, HilState, MetricPoint, Severity,
-    TelemetrySummary, TelemetryWindow, TimeWindow,
+    DiagnosisEvent, EvidenceRecord, EvidenceRef, FaultLabel, HilState, MetricPoint, MetricQuality,
+    Severity, TelemetrySummary, TelemetryWindow, TimeWindow,
 };
 use crate::telemetry::quantile;
 use uuid::Uuid;
@@ -9,8 +9,9 @@ pub fn diagnose_rules(summary: &TelemetrySummary, run_id: &str) -> Vec<Diagnosis
     let mut events = Vec::new();
     let overall = &summary.overall;
 
-    if overall.dns_failure_events > 0.0
-        || overall.dns_failure_events > overall.samples as f64 * 0.01
+    if trustworthy(summary, "dns_failure_events")
+        && (overall.dns_failure_events > 0.0
+            || overall.dns_failure_events > overall.samples as f64 * 0.01)
     {
         let score = (overall.dns_failure_events / overall.samples.max(1) as f64 * 20.0).min(1.0);
         if let Some(window) = summary
@@ -30,8 +31,9 @@ pub fn diagnose_rules(summary: &TelemetrySummary, run_id: &str) -> Vec<Diagnosis
         }
     }
 
-    if overall.tls_failure_events > 0.0
-        || overall.tls_failure_events > overall.samples as f64 * 0.01
+    if trustworthy(summary, "tls_failure_events")
+        && (overall.tls_failure_events > 0.0
+            || overall.tls_failure_events > overall.samples as f64 * 0.01)
     {
         let score = (overall.tls_failure_events / overall.samples.max(1) as f64 * 25.0).min(1.0);
         if let Some(window) = summary
@@ -51,7 +53,7 @@ pub fn diagnose_rules(summary: &TelemetrySummary, run_id: &str) -> Vec<Diagnosis
         }
     }
 
-    if overall.quic_blocked_ratio > 0.25 {
+    if trustworthy(summary, "quic_blocked_ratio") && overall.quic_blocked_ratio > 0.25 {
         let score = overall.quic_blocked_ratio.min(1.0);
         if let Some(window) = summary
             .windows
@@ -70,36 +72,55 @@ pub fn diagnose_rules(summary: &TelemetrySummary, run_id: &str) -> Vec<Diagnosis
         }
     }
 
-    let throughput_means: Vec<f64> = summary
-        .windows
-        .iter()
-        .map(|window| window.throughput_mbps.mean)
-        .collect();
-    let throughput_floor = quantile(&throughput_means, 0.2);
-    for window in &summary.windows {
-        let loss = window.packet_loss_rate;
-        let rtt = window.latency_ms.mean;
-        let retrans = window.retransmission_rate;
-        let throughput = window.throughput_mbps.mean;
-        if throughput > 0.0
-            && (loss > 0.8 || retrans > 1.5)
-            && rtt > 120.0
-            && throughput <= throughput_floor
-        {
-            events.push(window_evidence(
-                run_id,
-                FaultLabel::Congestion,
-                window,
-                "RTT and retransmission increase while throughput drops below expected baseline windows.",
-                severity_for_ratio(((loss + retrans) / 3.0).min(1.0)),
-                0.86,
-                &["A sustained throughput recovery in neighboring windows would weaken the congestion inference."],
-            ));
-            break;
+    let latency_ok = trustworthy(summary, "latency_ms");
+    let throughput_ok = trustworthy(summary, "throughput_mbps");
+    let loss_ok = trustworthy(summary, "packet_loss_rate");
+    let retrans_ok = trustworthy(summary, "retransmission_rate");
+    if latency_ok && throughput_ok && (loss_ok || retrans_ok) {
+        let throughput_means: Vec<f64> = summary
+            .windows
+            .iter()
+            .map(|window| window.throughput_mbps.mean)
+            .collect();
+        let throughput_floor = quantile(&throughput_means, 0.2);
+        for window in &summary.windows {
+            let loss = if loss_ok {
+                window.packet_loss_rate
+            } else {
+                0.0
+            };
+            let rtt = window.latency_ms.mean;
+            let retrans = if retrans_ok {
+                window.retransmission_rate
+            } else {
+                0.0
+            };
+            let throughput = window.throughput_mbps.mean;
+            if throughput > 0.0
+                && (loss > 0.8 || retrans > 1.5)
+                && rtt > 120.0
+                && throughput <= throughput_floor
+            {
+                events.push(window_evidence(
+                    run_id,
+                    FaultLabel::Congestion,
+                    window,
+                    "RTT and retransmission increase while throughput drops below expected baseline windows.",
+                    severity_for_ratio(((loss + retrans) / 3.0).min(1.0)),
+                    0.86,
+                    &["A sustained throughput recovery in neighboring windows would weaken the congestion inference."],
+                ));
+                break;
+            }
         }
     }
 
-    if overall.packet_loss_rate > 0.5 && overall.latency.std > 10.0 {
+    if loss_ok
+        && latency_ok
+        && trustworthy(summary, "jitter_ms")
+        && overall.packet_loss_rate > 0.5
+        && overall.latency.std > 10.0
+    {
         for window in &summary.windows {
             if window.packet_loss_rate > 0.5 && window.jitter_ms.std > 8.0 {
                 events.push(window_evidence(
@@ -141,6 +162,19 @@ pub fn diagnose_rules(summary: &TelemetrySummary, run_id: &str) -> Vec<Diagnosis
         deduped.push(event);
     }
     deduped
+}
+
+fn trustworthy(summary: &TelemetrySummary, field: &str) -> bool {
+    quality(summary, field).is_trustworthy()
+}
+
+fn quality(summary: &TelemetrySummary, field: &str) -> MetricQuality {
+    summary
+        .metric_provenance
+        .iter()
+        .find(|item| item.field == field)
+        .map(|item| item.quality)
+        .unwrap_or(MetricQuality::Measured)
 }
 
 fn severity_for_ratio(ratio: f64) -> Severity {

@@ -9,6 +9,7 @@ use crate::telemetry::summarize_telemetry;
 use crate::twin::run_simulated_whatif;
 use chrono::{Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
@@ -27,6 +28,12 @@ const SAMPLE_NAMES: [&str; 6] = [
 pub struct PerfMeasurement {
     pub name: String,
     pub elapsed_millis: f64,
+    #[serde(default)]
+    pub min_millis: f64,
+    #[serde(default)]
+    pub max_millis: f64,
+    #[serde(default)]
+    pub sample_millis: Vec<f64>,
     pub rows: usize,
     pub iterations: usize,
 }
@@ -142,6 +149,45 @@ pub fn run_perf_measurements(artifact_root: impl AsRef<Path>) -> Result<Vec<Perf
     Ok(measurements)
 }
 
+pub fn run_perf_measurements_sampled(
+    artifact_root: impl AsRef<Path>,
+    samples: usize,
+) -> Result<Vec<PerfMeasurement>> {
+    let samples = samples.max(1);
+    if samples == 1 {
+        return run_perf_measurements(artifact_root);
+    }
+    let artifact_root = artifact_root.as_ref();
+    let mut grouped: BTreeMap<String, Vec<PerfMeasurement>> = BTreeMap::new();
+    for sample_idx in 0..samples {
+        let sample_root = artifact_root.join(format!("sample-{sample_idx}"));
+        for measurement in run_perf_measurements(&sample_root)? {
+            grouped
+                .entry(measurement.name.clone())
+                .or_default()
+                .push(measurement);
+        }
+    }
+    let mut combined = Vec::new();
+    for (_name, mut measurements) in grouped {
+        measurements.sort_by(|left, right| left.elapsed_millis.total_cmp(&right.elapsed_millis));
+        let mut median = measurements[measurements.len() / 2].clone();
+        let sample_millis = measurements
+            .iter()
+            .map(|measurement| measurement.elapsed_millis)
+            .collect::<Vec<_>>();
+        median.min_millis = sample_millis.iter().copied().fold(f64::INFINITY, f64::min);
+        median.max_millis = sample_millis
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        median.sample_millis = sample_millis;
+        combined.push(median);
+    }
+    combined.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(combined)
+}
+
 pub fn build_perf_budget(
     measurements: &[PerfMeasurement],
     threshold_percent: f64,
@@ -230,9 +276,13 @@ fn measure<T>(
 ) -> Result<PerfMeasurement> {
     let started = Instant::now();
     black_box(action()?);
+    let elapsed_millis = round_duration(started.elapsed());
     Ok(PerfMeasurement {
         name: name.to_string(),
-        elapsed_millis: round_duration(started.elapsed()),
+        elapsed_millis,
+        min_millis: elapsed_millis,
+        max_millis: elapsed_millis,
+        sample_millis: vec![elapsed_millis],
         rows,
         iterations,
     })

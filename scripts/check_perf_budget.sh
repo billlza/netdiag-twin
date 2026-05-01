@@ -7,6 +7,7 @@ OUTPUT="${NETDIAG_PERF_OUTPUT:-$ROOT/target/perf-budget-report.json}"
 ARTIFACTS="${NETDIAG_PERF_ARTIFACTS:-$ROOT/target/perf-artifacts}"
 THRESHOLD="${NETDIAG_PERF_THRESHOLD_PERCENT:-15}"
 BASELINE_SCALE="${NETDIAG_PERF_BASELINE_SCALE:-3.0}"
+SAMPLES="${NETDIAG_PERF_SAMPLES:-3}"
 MODE="${1:-check}"
 
 rm -rf "$ARTIFACTS"
@@ -28,6 +29,8 @@ args=(
   "$ARTIFACTS"
   --threshold-percent
   "$THRESHOLD"
+  --samples
+  "$SAMPLES"
 )
 
 case "$MODE" in

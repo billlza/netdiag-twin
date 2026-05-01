@@ -1,4 +1,6 @@
-use crate::models::{DiagnosisEvent, FaultLabel, HilState, Recommendation, WhatIfResult};
+use crate::models::{
+    DiagnosisEvent, FaultLabel, HilState, Recommendation, RecommendationKind, WhatIfResult,
+};
 
 pub fn recommend_actions(
     rule_events: &[DiagnosisEvent],
@@ -10,9 +12,14 @@ pub fn recommend_actions(
         recommendations.push(Recommendation {
             recommendation_id: format!("rule-{}", event.event_id),
             run_id: event.evidence.run_id.clone(),
+            kind: if symptom == FaultLabel::Normal {
+                RecommendationKind::Monitoring
+            } else {
+                RecommendationKind::DiagnosisMitigation
+            },
             source_event_id: Some(event.event_id.clone()),
             what_if_action_id: None,
-            diagnosis_symptom: symptom,
+            diagnosis_symptom: Some(symptom),
             recommended_action: action_for_symptom(symptom).to_string(),
             expected_effect: expected_effect(symptom, whatif),
             risk_level: risk_for_symptom(symptom).to_string(),
@@ -41,9 +48,10 @@ pub fn recommend_actions(
                     .map(|event| event.evidence.run_id.clone())
                     .unwrap_or_else(|| "unknown".to_string()),
                 recommendation_id: format!("whatif-{}", whatif.action_id),
+                kind: RecommendationKind::WhatIfAction,
                 source_event_id: None,
                 what_if_action_id: Some(whatif.action_id.clone()),
-                diagnosis_symptom: FaultLabel::Normal,
+                diagnosis_symptom: None,
                 recommended_action: format!(
                     "Execute what-if action: {} ({})",
                     whatif.action_id, whatif.action_notes

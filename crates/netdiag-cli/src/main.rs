@@ -6,11 +6,11 @@ use netdiag_core::connectors::{
     default_prometheus_mapping, load_http_json, load_native_pcap, load_otlp_grpc_receiver,
     load_prometheus_exposition, load_prometheus_query_range, load_system_counters,
 };
-use netdiag_core::ml::{export_feedback_training_dataset, train_model_from_jsonl};
-use netdiag_core::models::{HilState, TelemetrySummary};
+use netdiag_core::ml::{export_feedback_training_dataset, train_model_from_jsonl_with_validation};
+use netdiag_core::models::{FaultLabel, HilState, TelemetrySummary};
 use netdiag_core::perf_budget::{
     build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
-    run_perf_measurements, save_perf_budget,
+    run_perf_measurements_sampled, save_perf_budget,
 };
 use netdiag_core::storage::{read_json, review_recommendation, run_dir, save_json};
 use netdiag_core::twin::run_simulated_whatif;
@@ -51,6 +51,8 @@ enum Command {
         dataset: PathBuf,
         #[arg(long)]
         model_dir: PathBuf,
+        #[arg(long, default_value_t = 0.0)]
+        validation_split: f64,
     },
     Feedback {
         #[command(subcommand)]
@@ -65,6 +67,8 @@ enum Command {
         notes: String,
         #[arg(long, default_value = "cli")]
         reviewer: String,
+        #[arg(long)]
+        final_label: Option<String>,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
@@ -113,6 +117,8 @@ enum Command {
         update_baseline: bool,
         #[arg(long, default_value_t = 3.0)]
         baseline_scale: f64,
+        #[arg(long, default_value_t = 1)]
+        samples: usize,
     },
 }
 
@@ -148,9 +154,14 @@ fn run(args: Args) -> anyhow::Result<()> {
             let report = read_json(path)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::Train { dataset, model_dir } => {
-            let manifest = train_model_from_jsonl(&dataset, &model_dir)
-                .with_context(|| format!("training failed for {}", dataset.display()))?;
+        Command::Train {
+            dataset,
+            model_dir,
+            validation_split,
+        } => {
+            let manifest =
+                train_model_from_jsonl_with_validation(&dataset, &model_dir, validation_split)
+                    .with_context(|| format!("training failed for {}", dataset.display()))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -161,6 +172,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "manifest_file": "model_manifest.json",
                     "labels": manifest.labels,
                     "training_examples": manifest.training_examples,
+                    "evaluation": manifest.evaluation,
                 }))?
             );
         }
@@ -177,10 +189,16 @@ fn run(args: Args) -> anyhow::Result<()> {
             state,
             notes,
             reviewer,
+            final_label,
             artifacts,
         } => {
             let state = HilState::from_str(&state)
                 .map_err(|_| anyhow::anyhow!("invalid HIL state: {state}"))?;
+            let final_label = final_label
+                .as_deref()
+                .map(FaultLabel::from_str)
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("invalid final label"))?;
             let outcome = review_recommendation(
                 artifacts,
                 &run_id,
@@ -188,6 +206,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                 state,
                 &notes,
                 &reviewer,
+                final_label,
             )
             .context("review failed")?;
             println!(
@@ -198,6 +217,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "state": outcome.review.state,
                     "reviewer": outcome.review.reviewer,
                     "reviewed_at": outcome.review.reviewed_at,
+                    "final_label": outcome.review.final_label,
                     "status": outcome.status,
                 }))?
             );
@@ -284,8 +304,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             threshold_percent,
             update_baseline,
             baseline_scale,
+            samples,
         } => {
-            let measurements = run_perf_measurements(&artifacts)
+            let measurements = run_perf_measurements_sampled(&artifacts, samples)
                 .with_context(|| format!("performance run failed in {}", artifacts.display()))?;
             if update_baseline {
                 let budget = build_perf_budget(&measurements, threshold_percent, baseline_scale);
@@ -452,6 +473,7 @@ mod tests {
             HilState::Accepted,
             "accepted for supervised training",
             "cli-test",
+            Some(FaultLabel::Congestion),
         )
         .expect("review");
 

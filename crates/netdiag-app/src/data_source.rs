@@ -12,7 +12,9 @@ use netdiag_core::connectors::{
     load_prometheus_query_range, load_system_counters,
 };
 use netdiag_core::ingest::{build_ingest_result, ingest_trace};
-use netdiag_core::models::{IngestResult, IngestWarning, TraceRecord};
+use netdiag_core::models::{
+    IngestResult, IngestWarning, MetricProvenance, MetricQuality, TraceRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -461,6 +463,7 @@ impl TraceSource for LocalProbeTraceSource {
         }
         let mut ingest = build_ingest_result(records, "local_probe")?;
         ingest.warnings.extend(warnings);
+        apply_probe_metric_quality(&mut ingest, "local_probe");
         let total_bytes = estimate_bytes_from_records(&ingest.records);
         Ok(SourceSnapshot {
             descriptor: SourceDescriptor {
@@ -528,6 +531,7 @@ impl TraceSource for WebsiteProbeTraceSource {
         ingest
             .warnings
             .extend(probe_fallback_warnings("website probe"));
+        apply_probe_metric_quality(&mut ingest, "website_probe");
         let total_bytes = estimate_bytes_from_records(&ingest.records);
         Ok(SourceSnapshot {
             descriptor: SourceDescriptor {
@@ -545,6 +549,68 @@ impl TraceSource for WebsiteProbeTraceSource {
             ingest,
         })
     }
+}
+
+fn apply_probe_metric_quality(ingest: &mut IngestResult, source: &str) {
+    for (field, quality, reason) in [
+        (
+            "latency_ms",
+            MetricQuality::Estimated,
+            "derived from DNS/TCP/HTTP probe timing",
+        ),
+        (
+            "jitter_ms",
+            MetricQuality::Estimated,
+            "derived from repeated probe timing variation",
+        ),
+        (
+            "packet_loss_rate",
+            MetricQuality::Estimated,
+            "mapped from probe success/failure ratio",
+        ),
+        (
+            "throughput_mbps",
+            MetricQuality::Fallback,
+            "active probe does not measure sustained throughput",
+        ),
+        (
+            "retransmission_rate",
+            MetricQuality::Fallback,
+            "active probe does not observe TCP retransmissions",
+        ),
+        (
+            "quic_blocked_ratio",
+            MetricQuality::Fallback,
+            "active probe does not prove QUIC policy blocking",
+        ),
+    ] {
+        set_metric_quality(ingest, field, quality, source, reason);
+    }
+}
+
+fn set_metric_quality(
+    ingest: &mut IngestResult,
+    field: &str,
+    quality: MetricQuality,
+    source: &str,
+    reason: &str,
+) {
+    if let Some(item) = ingest
+        .metric_provenance
+        .iter_mut()
+        .find(|item| item.field == field)
+    {
+        item.quality = quality;
+        item.source = source.to_string();
+        item.reason = reason.to_string();
+        return;
+    }
+    ingest.metric_provenance.push(MetricProvenance {
+        field: field.to_string(),
+        quality,
+        source: source.to_string(),
+        reason: reason.to_string(),
+    });
 }
 
 fn simulate_records(scenario: SimScenario) -> Vec<TraceRecord> {

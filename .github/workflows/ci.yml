@@ -25,3 +25,10 @@ jobs:
         run: RUSTFLAGS="-D warnings" cargo test --workspace
       - name: Performance budget
         run: scripts/check_perf_budget.sh
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-budget-report
+          path: target/perf-budget-report.json
+          if-no-files-found: ignore

@@ -19,7 +19,9 @@ use netdiag_app::settings::{
 use netdiag_app::trend::{LatencyMetric, TrendRange, latency_trend_points};
 use netdiag_app::view_model::{DashboardViewModel, format_bytes};
 use netdiag_core::ml::load_or_train_model;
-use netdiag_core::models::{FaultLabel, HilReviewSummary, HilState, RunManifest, TopologyModel};
+use netdiag_core::models::{
+    FaultLabel, HilReviewSummary, HilState, MetricQuality, RunManifest, TopologyModel,
+};
 use netdiag_core::storage::review_recommendation;
 use netdiag_core::twin::{action_names, topology_model, topology_names, validate_topology_model};
 use netdiag_core::{PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif};
@@ -251,6 +253,10 @@ enum Text {
     SystemInterface,
     SamplingInterval,
     HttpJsonConnectorHint,
+    ConnectorHealth,
+    MeasurementQuality,
+    MissingMetrics,
+    LastSample,
     ImportTopology,
     ExportTopology,
     CustomTopology,
@@ -1808,6 +1814,8 @@ impl NetDiagApp {
         if ui.add_enabled(!testing, test_button).clicked() {
             self.start_api_test_connection();
         }
+        ui.add_space(10.0);
+        self.render_connector_health_panel(ui);
         if changed {
             self.settings.data_connectors.default_connector = active_kind;
             self.persist_settings();
@@ -1817,6 +1825,92 @@ impl NetDiagApp {
             if warning.is_some() {
                 self.settings_notice = warning;
             }
+        }
+    }
+
+    fn render_connector_health_panel(&self, ui: &mut egui::Ui) {
+        section_title(ui, tr(self.language, Text::ConnectorHealth));
+        ui.add_space(6.0);
+        let Some(snapshot) = &self.source_snapshot else {
+            ui.label(
+                RichText::new(tr(self.language, Text::NoSource))
+                    .size(12.0)
+                    .color(MUTED),
+            );
+            return;
+        };
+        let counts = metric_quality_counts(snapshot);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::Rows),
+                    snapshot.ingest.schema.rows
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::ValidationWarnings),
+                    snapshot.ingest.warnings.len()
+                ))
+                .size(12.0)
+                .color(if snapshot.ingest.warnings.is_empty() {
+                    GREEN
+                } else {
+                    ORANGE
+                }),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::LastSample),
+                    snapshot.ingest.schema.end_time.format("%H:%M:%S")
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+        });
+        ui.label(
+            RichText::new(format!(
+                "{}: measured={} estimated={} fallback={} missing={}",
+                tr(self.language, Text::MeasurementQuality),
+                counts.measured,
+                counts.estimated,
+                counts.fallback,
+                counts.missing
+            ))
+            .size(12.0)
+            .color(if counts.fallback + counts.missing == 0 {
+                GREEN
+            } else {
+                ORANGE
+            }),
+        );
+        let missing = snapshot
+            .ingest
+            .metric_provenance
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.quality,
+                    MetricQuality::Fallback | MetricQuality::Missing
+                )
+            })
+            .map(|item| item.field.as_str())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::MissingMetrics),
+                    missing.join(", ")
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
         }
     }
 
@@ -2133,6 +2227,7 @@ impl NetDiagApp {
             state,
             &notes,
             tr(self.language, Text::EngineerRole),
+            None,
         ) {
             Ok(outcome) => {
                 if let Some(result) = &mut self.result {
@@ -3122,6 +3217,10 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::HttpJsonConnectorHint) => {
             "HTTP/JSON 使用下方真实 API URL 和 Keychain Token"
         }
+        (Language::Zh, Text::ConnectorHealth) => "连接器健康",
+        (Language::Zh, Text::MeasurementQuality) => "测量质量",
+        (Language::Zh, Text::MissingMetrics) => "缺失指标",
+        (Language::Zh, Text::LastSample) => "最近采样",
         (Language::Zh, Text::ImportTopology) => "导入拓扑",
         (Language::Zh, Text::ExportTopology) => "导出拓扑",
         (Language::Zh, Text::CustomTopology) => "自定义拓扑",
@@ -3288,6 +3387,10 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::HttpJsonConnectorHint) => {
             "HTTP/JSON uses the Live API URL and Keychain token below"
         }
+        (Language::En, Text::ConnectorHealth) => "Connector Health",
+        (Language::En, Text::MeasurementQuality) => "Measurement Quality",
+        (Language::En, Text::MissingMetrics) => "Missing Metrics",
+        (Language::En, Text::LastSample) => "Last Sample",
         (Language::En, Text::ImportTopology) => "Import Topology",
         (Language::En, Text::ExportTopology) => "Export Topology",
         (Language::En, Text::CustomTopology) => "Custom Topology",
@@ -3404,14 +3507,54 @@ fn sparkle_available() -> bool {
 }
 
 fn sparkle_check_for_updates() -> Result<(), String> {
-    if sparkle_available() {
-        Err(
-            "Sparkle bridge is packaged; native update controller is enabled in release builds"
-                .to_string(),
-        )
-    } else {
-        Err("Sparkle.framework is not embedded in this build".to_string())
+    if !sparkle_available() {
+        return Err("Sparkle.framework is not embedded in this build".to_string());
     }
+    let feed_url = sparkle_feed_url()
+        .unwrap_or_else(|| "https://billlza.github.io/netdiag-twin/appcast.xml".to_string());
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| format!("failed to create update client: {err}"))?
+        .get(&feed_url)
+        .send()
+        .map_err(|err| format!("failed to reach update feed: {err}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "update feed is not reachable: {} ({feed_url})",
+            response.status()
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sparkle_feed_url() -> Option<String> {
+    let info_plist = std::env::current_exe().ok().and_then(|path| {
+        path.ancestors()
+            .find(|ancestor| {
+                ancestor
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+            })
+            .map(|app| app.join("Contents/Info.plist"))
+    })?;
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :SUFeedURL"])
+        .arg(info_plist)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sparkle_feed_url() -> Option<String> {
+    None
 }
 
 fn manifest_artifacts(run_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
@@ -3574,6 +3717,27 @@ fn fault_label_from_str(value: &str, lang: Language) -> String {
         .parse::<FaultLabel>()
         .map(|label| fault_label_display(label, lang).to_string())
         .unwrap_or_else(|_| value.replace('_', " "))
+}
+
+#[derive(Default)]
+struct MetricQualityCounts {
+    measured: usize,
+    estimated: usize,
+    fallback: usize,
+    missing: usize,
+}
+
+fn metric_quality_counts(snapshot: &SourceSnapshot) -> MetricQualityCounts {
+    let mut counts = MetricQualityCounts::default();
+    for item in &snapshot.ingest.metric_provenance {
+        match item.quality {
+            MetricQuality::Measured => counts.measured += 1,
+            MetricQuality::Estimated => counts.estimated += 1,
+            MetricQuality::Fallback => counts.fallback += 1,
+            MetricQuality::Missing => counts.missing += 1,
+        }
+    }
+    counts
 }
 
 fn comparison_agreement_text(agreement: bool, lang: Language) -> &'static str {

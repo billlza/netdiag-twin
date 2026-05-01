@@ -1,6 +1,6 @@
 use crate::error::{IoContext, Result};
 use crate::ingest::ingest_trace;
-use crate::ml::infer;
+use crate::ml::infer_with_quality;
 use crate::models::{
     DiagnosisEvent, HilReviewSummary, IngestResult, MlResult, Recommendation, RunIndexEntry,
     RunManifest, TelemetrySummary, TopologyModel, WhatIfResult,
@@ -9,7 +9,7 @@ use crate::recommendation::recommend_actions;
 use crate::report::{Report, RuleMlComparison, compare_rule_ml, render_report};
 use crate::rules::diagnose_rules;
 use crate::storage::{read_json, run_dir, save_json_atomic};
-use crate::telemetry::summarize_telemetry;
+use crate::telemetry::summarize_ingest;
 use crate::twin::{run_simulated_whatif_with_model, topology_model};
 use chrono::Utc;
 use serde::Serialize;
@@ -76,9 +76,14 @@ pub fn diagnose_ingest_with_whatif(
     let runs_root = artifact_root.join("runs");
     std::fs::create_dir_all(&runs_root).with_path(&runs_root)?;
     let run_id = Uuid::new_v4().to_string();
-    let telemetry = summarize_telemetry(&ingest.records, 5)?;
+    let telemetry = summarize_ingest(&ingest, 5)?;
     let diagnosis_events = diagnose_rules(&telemetry, &run_id);
-    let ml_result = infer(&telemetry.windows, &run_id, artifact_root)?;
+    let ml_result = infer_with_quality(
+        &telemetry.windows,
+        &run_id,
+        artifact_root,
+        &telemetry.metric_provenance,
+    )?;
     let comparison = compare_rule_ml(&diagnosis_events, &ml_result);
     let what_if = default_what_if
         .map(|request| {

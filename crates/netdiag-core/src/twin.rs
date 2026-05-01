@@ -298,6 +298,8 @@ pub fn run_simulated_whatif_with_policy(
     validate_topology_model(topology)?;
     validate_policy_action(action, topology)?;
     let stats = topology_stats(topology)?;
+    let modified_topology = apply_policy(topology, action)?;
+    let proposed_stats = topology_stats(&modified_topology)?;
     let baseline_latency = (telemetry.latency.mean + stats.path_latency_ms * 0.15).max(1.0);
     let baseline_loss = (telemetry.packet_loss_rate + stats.path_loss_pct * 0.2).max(0.0);
     let telemetry_throughput = telemetry.throughput_mbps.mean.max(0.0);
@@ -308,13 +310,24 @@ pub fn run_simulated_whatif_with_policy(
     };
 
     let action_deltas = action_deltas(action, &stats, baseline_throughput);
+    let topology_latency_factor =
+        (proposed_stats.path_latency_ms / stats.path_latency_ms.max(1e-6)).clamp(0.2, 5.0);
+    let topology_loss_factor =
+        ((proposed_stats.path_loss_pct + 1e-6) / (stats.path_loss_pct + 1e-6)).clamp(0.0, 5.0);
+    let topology_throughput_factor =
+        (proposed_stats.bottleneck_mbps / stats.bottleneck_mbps.max(1e-6)).clamp(0.05, 5.0);
 
-    let proposed_latency = (baseline_latency * (1.0 + action_deltas.latency_pct)).max(1.0);
+    let proposed_latency =
+        (baseline_latency * topology_latency_factor * (1.0 + action_deltas.latency_pct * 0.5))
+            .max(1.0);
     let proposed_jitter =
         (telemetry.jitter_ms.mean * (1.0 + 0.5 * action_deltas.latency_pct)).max(0.0);
-    let proposed_loss = (baseline_loss * (1.0 + action_deltas.loss_pct)).max(0.0);
-    let proposed_throughput = (baseline_throughput * (1.0 + action_deltas.throughput_pct))
-        .clamp(1.0, stats.bottleneck_mbps);
+    let proposed_loss =
+        (baseline_loss * topology_loss_factor * (1.0 + action_deltas.loss_pct * 0.5)).max(0.0);
+    let proposed_throughput = (baseline_throughput
+        * topology_throughput_factor
+        * (1.0 + action_deltas.throughput_pct * 0.5))
+        .clamp(1.0, proposed_stats.bottleneck_mbps);
 
     let baseline = BTreeMap::from([
         ("latency_ms".to_string(), json!(baseline_latency)),
@@ -331,7 +344,18 @@ pub fn run_simulated_whatif_with_policy(
         ("jitter_ms".to_string(), json!(proposed_jitter)),
         ("loss_rate".to_string(), json!(proposed_loss)),
         ("throughput_mbps".to_string(), json!(proposed_throughput)),
-        ("bottleneck_mbps".to_string(), json!(stats.bottleneck_mbps)),
+        (
+            "path_latency_ms".to_string(),
+            json!(proposed_stats.path_latency_ms),
+        ),
+        (
+            "bottleneck_mbps".to_string(),
+            json!(proposed_stats.bottleneck_mbps),
+        ),
+        (
+            "redundant_paths".to_string(),
+            json!(proposed_stats.redundant_paths),
+        ),
         ("policy_kind".to_string(), json!(action.kind)),
         ("qoe_risk".to_string(), json!(action.qoe_risk.as_str())),
     ]);
@@ -356,6 +380,7 @@ pub fn run_simulated_whatif_with_policy(
         policy_action: Some(action.clone()),
         topology: topology.key.to_string(),
         topology_snapshot: Some(topology.clone()),
+        modified_topology_snapshot: Some(modified_topology),
         baseline,
         proposed,
         delta,
@@ -419,6 +444,100 @@ fn validate_policy_action(action: &TwinPolicyAction, topology: &TopologyModel) -
         )));
     }
     Ok(())
+}
+
+fn apply_policy(topology: &TopologyModel, action: &TwinPolicyAction) -> Result<TopologyModel> {
+    let mut modified = topology.clone();
+    modified.metadata.insert(
+        "policy_action_id".to_string(),
+        serde_json::Value::String(action.id.clone()),
+    );
+    match action.kind {
+        TwinPolicyActionKind::Reroute => apply_reroute_policy(&mut modified, action),
+        TwinPolicyActionKind::QueueLimit => apply_queue_policy(&mut modified, action),
+        TwinPolicyActionKind::CapacityChange => apply_capacity_policy(&mut modified, action),
+        TwinPolicyActionKind::LinkDisable => apply_link_disable_policy(&mut modified, action),
+        TwinPolicyActionKind::TrafficShift => apply_traffic_shift_policy(&mut modified, action),
+    }
+    validate_topology_model(&modified)?;
+    Ok(modified)
+}
+
+fn apply_reroute_policy(topology: &mut TopologyModel, action: &TwinPolicyAction) {
+    if topology.links.len() < topology.nodes.len() {
+        apply_queue_policy(topology, action);
+        return;
+    }
+    let candidate = action_parameter_f64(action, "candidate_latency_multiplier").unwrap_or(0.85);
+    for link in topology.links.iter_mut().filter(|link| {
+        action
+            .target
+            .link_id
+            .as_ref()
+            .is_none_or(|target| target == &link.id)
+    }) {
+        link.latency_ms = (link.latency_ms * candidate).max(0.1);
+        link.loss_pct = (link.loss_pct * 0.75).max(0.0);
+    }
+}
+
+fn apply_queue_policy(topology: &mut TopologyModel, action: &TwinPolicyAction) {
+    let multiplier = action_parameter_f64(action, "queue_limit_multiplier")
+        .unwrap_or(1.15)
+        .clamp(0.25, 4.0);
+    for link in target_or_bottleneck_links(topology, action) {
+        link.loss_pct = (link.loss_pct / multiplier).max(0.0);
+        link.latency_ms = (link.latency_ms * (1.0 + (multiplier - 1.0) * 0.08)).max(0.1);
+    }
+}
+
+fn apply_capacity_policy(topology: &mut TopologyModel, action: &TwinPolicyAction) {
+    let delta = action_parameter_f64(action, "capacity_delta_pct")
+        .unwrap_or(action.impact.throughput_delta_pct)
+        .clamp(-0.95, 4.0);
+    for link in target_or_bottleneck_links(topology, action) {
+        link.capacity_mbps = (link.capacity_mbps * (1.0 + delta)).max(1.0);
+    }
+}
+
+fn apply_link_disable_policy(topology: &mut TopologyModel, action: &TwinPolicyAction) {
+    if let Some(link_id) = &action.target.link_id {
+        topology.links.retain(|link| link.id != *link_id);
+    }
+}
+
+fn apply_traffic_shift_policy(topology: &mut TopologyModel, action: &TwinPolicyAction) {
+    let shifted_share = action_parameter_f64(action, "traffic_shift_pct")
+        .unwrap_or(25.0)
+        .clamp(0.0, 100.0)
+        / 100.0;
+    for link in target_or_bottleneck_links(topology, action) {
+        link.capacity_mbps = (link.capacity_mbps * (1.0 + shifted_share * 0.5)).max(1.0);
+        link.loss_pct = (link.loss_pct * (1.0 - shifted_share * 0.35)).max(0.0);
+    }
+}
+
+fn target_or_bottleneck_links<'a>(
+    topology: &'a mut TopologyModel,
+    action: &TwinPolicyAction,
+) -> Vec<&'a mut TopologyLink> {
+    if let Some(link_id) = &action.target.link_id {
+        return topology
+            .links
+            .iter_mut()
+            .filter(|link| link.id == *link_id)
+            .collect();
+    }
+    let bottleneck = topology
+        .links
+        .iter()
+        .map(|link| link.capacity_mbps)
+        .fold(f64::INFINITY, f64::min);
+    topology
+        .links
+        .iter_mut()
+        .filter(|link| (link.capacity_mbps - bottleneck).abs() <= f64::EPSILON)
+        .collect()
 }
 
 fn action_deltas(
@@ -678,8 +797,9 @@ mod tests {
             result.policy_action.as_ref().map(|action| action.kind),
             Some(TwinPolicyActionKind::TrafficShift)
         );
-        assert_eq!(result.delta["latency_pct"], -10.0);
+        assert!(result.delta["latency_pct"] < 0.0);
         assert!(result.delta["throughput_pct"] > 0.0);
+        assert!(result.modified_topology_snapshot.is_some());
     }
 
     #[test]

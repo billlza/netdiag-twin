@@ -1,7 +1,8 @@
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{
-    FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, MlResult, ModelManifest,
-    Prediction, Recommendation, TelemetryWindow, TraceRecord,
+    FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, MetricProvenance, MetricQuality,
+    MlResult, ModelEvaluation, ModelManifest, Prediction, Recommendation, RecommendationKind,
+    TelemetryWindow, TraceRecord,
 };
 use crate::report::Report;
 use crate::storage::{read_json, save_json_atomic};
@@ -99,19 +100,30 @@ pub fn infer(
     run_id: &str,
     artifact_root: impl AsRef<Path>,
 ) -> Result<MlResult> {
+    infer_with_quality(windows, run_id, artifact_root, &[])
+}
+
+pub fn infer_with_quality(
+    windows: &[TelemetryWindow],
+    run_id: &str,
+    artifact_root: impl AsRef<Path>,
+    provenance: &[MetricProvenance],
+) -> Result<MlResult> {
     let model_dir = artifact_root.as_ref().join("model");
     let model = load_or_train_model(&model_dir)?;
     let model_manifest = read_json(model_dir.join(MODEL_MANIFEST_FILE_NAME))
         .ok()
         .and_then(|value| serde_json::from_value::<ModelManifest>(value).ok());
     let raw_features = extract_features_from_windows(windows);
-    let scaled = scale_row(&raw_features, &model.means, &model.stds);
+    let feature_quality = feature_quality_map(provenance);
+    let weighted_features = apply_feature_quality(&raw_features, &feature_quality);
+    let scaled = scale_row(&weighted_features, &model.means, &model.stds);
     let x = Array2::from_shape_vec((1, FEATURES.len()), scaled.clone())
         .map_err(|err| NetdiagError::Ml(err.to_string()))?;
     let probabilities = model.model.predict_probabilities(&x);
     let classes = model.model.classes().to_vec();
     let calibrated =
-        calibrate_probabilities(probabilities.row(0).to_vec(), &classes, &raw_features);
+        calibrate_probabilities(probabilities.row(0).to_vec(), &classes, &weighted_features);
     let mut ranking: Vec<Prediction> = calibrated
         .iter()
         .enumerate()
@@ -162,8 +174,66 @@ pub fn infer(
         top_predictions: ranking.into_iter().take(5).collect(),
         top_features: top_features.into_iter().take(5).collect(),
         features,
+        feature_quality,
         model_manifest,
     })
+}
+
+fn feature_quality_map(provenance: &[MetricProvenance]) -> BTreeMap<String, MetricQuality> {
+    let by_metric = provenance
+        .iter()
+        .map(|item| (item.field.as_str(), item.quality))
+        .collect::<BTreeMap<_, _>>();
+    FEATURES
+        .iter()
+        .map(|feature| {
+            let metric = feature_metric(feature);
+            (
+                (*feature).to_string(),
+                by_metric
+                    .get(metric)
+                    .copied()
+                    .unwrap_or(MetricQuality::Measured),
+            )
+        })
+        .collect()
+}
+
+fn apply_feature_quality(
+    features: &[f64],
+    feature_quality: &BTreeMap<String, MetricQuality>,
+) -> Vec<f64> {
+    FEATURES
+        .iter()
+        .enumerate()
+        .map(|(idx, feature)| {
+            let quality = feature_quality
+                .get(*feature)
+                .copied()
+                .unwrap_or(MetricQuality::Measured);
+            match quality {
+                MetricQuality::Measured | MetricQuality::Estimated => features[idx],
+                MetricQuality::Fallback => features[idx] * 0.25,
+                MetricQuality::Missing => 0.0,
+            }
+        })
+        .collect()
+}
+
+fn feature_metric(feature: &str) -> &'static str {
+    match feature {
+        "latency_mean" | "latency_p95" => "latency_ms",
+        "jitter_std" => "jitter_ms",
+        "loss_rate" => "packet_loss_rate",
+        "retrans_rate" => "retransmission_rate",
+        "timeout" => "timeout_events",
+        "retry" => "retry_events",
+        "throughput" => "throughput_mbps",
+        "dns_events" => "dns_failure_events",
+        "tls_events" => "tls_failure_events",
+        "quic_blocked" => "quic_blocked_ratio",
+        _ => "unknown",
+    }
 }
 
 pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
@@ -193,16 +263,37 @@ pub fn train_model_from_jsonl(
     dataset_path: impl AsRef<Path>,
     model_dir: impl AsRef<Path>,
 ) -> Result<ModelManifest> {
+    train_model_from_jsonl_with_validation(dataset_path, model_dir, 0.0)
+}
+
+pub fn train_model_from_jsonl_with_validation(
+    dataset_path: impl AsRef<Path>,
+    model_dir: impl AsRef<Path>,
+    validation_split: f64,
+) -> Result<ModelManifest> {
     let dataset_path = dataset_path.as_ref();
     let model_dir = model_dir.as_ref();
     let rows = read_training_jsonl(dataset_path)?;
-    let model = train_model_from_feature_rows(&rows)?;
-    let manifest = build_model_manifest(
+    let split_at = validation_split_index(rows.len(), validation_split);
+    let (training_rows, validation_rows) = rows.split_at(split_at);
+    let training_rows = if training_rows.is_empty() {
+        rows.as_slice()
+    } else {
+        training_rows
+    };
+    let model = train_model_from_feature_rows(training_rows)?;
+    let evaluation = if validation_rows.is_empty() || validation_rows.len() == rows.len() {
+        None
+    } else {
+        Some(evaluate_model(&model, validation_rows)?)
+    };
+    let mut manifest = build_model_manifest(
         format!("jsonl:{}", dataset_path.display()),
-        rows.len(),
+        training_rows.len(),
         false,
         &model,
     );
+    manifest.evaluation = evaluation;
     write_model_bundle(model_dir, &model, &manifest)?;
     Ok(manifest)
 }
@@ -243,13 +334,12 @@ pub fn export_feedback_training_dataset(
             serde_json::from_value(read_json(&feedback_path)?)?;
         feature_map_to_vec(&ml.features)?;
 
-        let Some((recommendation, feedback_record)) =
+        let Some((final_label, recommendation, feedback_record)) =
             accepted_feedback_label(&report.recommendations, &feedback)
         else {
             skipped_runs += 1;
             continue;
         };
-        let final_label = recommendation.diagnosis_symptom;
 
         rows.push(FeedbackTrainingRow {
             label: final_label,
@@ -307,6 +397,86 @@ fn train_model_from_feature_rows(rows: &[FeatureTrainingRow]) -> Result<RustMlMo
         .collect::<Vec<_>>();
     let targets = rows.iter().map(|row| row.label.index()).collect::<Vec<_>>();
     fit_model(&features, &targets)
+}
+
+fn validation_split_index(len: usize, split: f64) -> usize {
+    if len < 3 || !split.is_finite() || split <= 0.0 {
+        return len;
+    }
+    let validation = ((len as f64) * split.clamp(0.0, 0.8)).round() as usize;
+    len.saturating_sub(validation.max(1)).max(1)
+}
+
+fn evaluate_model(model: &RustMlModel, rows: &[FeatureTrainingRow]) -> Result<ModelEvaluation> {
+    let mut correct = 0usize;
+    let mut confusion = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    for row in rows {
+        let predicted = predict_label(model, &row.features)?;
+        if predicted == row.label {
+            correct += 1;
+        }
+        *confusion
+            .entry(row.label.as_str().to_string())
+            .or_default()
+            .entry(predicted.as_str().to_string())
+            .or_default() += 1;
+    }
+    let accuracy = correct as f64 / rows.len().max(1) as f64;
+    let macro_f1 = FaultLabel::ALL
+        .iter()
+        .map(|label| label_f1(*label, &confusion))
+        .sum::<f64>()
+        / FaultLabel::ALL.len() as f64;
+    Ok(ModelEvaluation {
+        validation_examples: rows.len(),
+        accuracy: round4(accuracy),
+        macro_f1: round4(macro_f1),
+        confusion_matrix: confusion,
+    })
+}
+
+fn predict_label(model: &RustMlModel, features: &[f64]) -> Result<FaultLabel> {
+    let scaled = scale_row(features, &model.means, &model.stds);
+    let x = Array2::from_shape_vec((1, FEATURES.len()), scaled)
+        .map_err(|err| NetdiagError::Ml(err.to_string()))?;
+    let probabilities = model.model.predict_probabilities(&x);
+    let classes = model.model.classes().to_vec();
+    let best_idx = probabilities
+        .row(0)
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    Ok(classes
+        .get(best_idx)
+        .copied()
+        .map(FaultLabel::from_index)
+        .unwrap_or(FaultLabel::Normal))
+}
+
+fn label_f1(label: FaultLabel, confusion: &BTreeMap<String, BTreeMap<String, usize>>) -> f64 {
+    let key = label.as_str();
+    let tp = confusion
+        .get(key)
+        .and_then(|predicted| predicted.get(key))
+        .copied()
+        .unwrap_or(0) as f64;
+    let fp = confusion
+        .values()
+        .map(|predicted| predicted.get(key).copied().unwrap_or(0))
+        .sum::<usize>() as f64
+        - tp;
+    let fn_ = confusion
+        .get(key)
+        .map(|predicted| predicted.values().sum::<usize>() as f64)
+        .unwrap_or(0.0)
+        - tp;
+    if tp == 0.0 {
+        0.0
+    } else {
+        (2.0 * tp) / (2.0 * tp + fp + fn_)
+    }
 }
 
 fn fit_model(rows: &[Vec<f64>], targets: &[usize]) -> Result<RustMlModel> {
@@ -479,13 +649,18 @@ fn build_model_manifest(
         training_examples,
         feature_count: FEATURES.len(),
         synthetic_fallback,
+        evaluation: None,
     }
+}
+
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
 }
 
 fn accepted_feedback_label(
     recommendations: &[Recommendation],
     feedback: &BTreeMap<String, HilFeedbackRecord>,
-) -> Option<(Recommendation, HilFeedbackRecord)> {
+) -> Option<(FaultLabel, Recommendation, HilFeedbackRecord)> {
     let mut selected = None;
     for record in feedback.values() {
         if record.review.state != HilState::Accepted {
@@ -497,13 +672,23 @@ fn accepted_feedback_label(
         else {
             continue;
         };
-        if selected
-            .as_ref()
-            .is_none_or(|(best, _): &(Recommendation, HilFeedbackRecord)| {
+        let final_label = record.review.final_label.or_else(|| {
+            matches!(
+                recommendation.kind,
+                RecommendationKind::DiagnosisMitigation | RecommendationKind::Monitoring
+            )
+            .then_some(recommendation.diagnosis_symptom)
+            .flatten()
+        });
+        let Some(final_label) = final_label else {
+            continue;
+        };
+        if selected.as_ref().is_none_or(
+            |(_, best, _): &(FaultLabel, Recommendation, HilFeedbackRecord)| {
                 recommendation.confidence > best.confidence
-            })
-        {
-            selected = Some((recommendation.clone(), record.clone()));
+            },
+        ) {
+            selected = Some((final_label, recommendation.clone(), record.clone()));
         }
     }
     selected

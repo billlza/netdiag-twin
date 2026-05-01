@@ -1,7 +1,7 @@
 use crate::error::{NetdiagError, Result};
-use crate::ingest::{CANONICAL_COLUMNS, build_ingest_result};
-use crate::models::{IngestResult, IngestWarning, TraceRecord};
-use chrono::{TimeZone, Utc};
+use crate::ingest::{CANONICAL_COLUMNS, build_ingest_result, measured_metric_provenance};
+use crate::models::{IngestResult, IngestWarning, MetricProvenance, MetricQuality, TraceRecord};
+use chrono::{DateTime, TimeZone, Utc};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use opentelemetry_proto::tonic as otlp;
 use otlp::collector::metrics::v1::{
@@ -12,11 +12,11 @@ use otlp::metrics::v1::{Metric, metric, number_data_point};
 use pcap::Capture;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
 
@@ -81,6 +81,162 @@ pub struct OtlpGrpcReceiverConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct OtlpMetricFrame {
+    pub received_at: DateTime<Utc>,
+    pub request: ExportMetricsServiceRequest,
+}
+
+#[derive(Debug)]
+pub struct OtlpReceiverSession {
+    bind_addr: SocketAddr,
+    metrics: BTreeMap<String, String>,
+    sample: String,
+    buffer: Arc<Mutex<VecDeque<OtlpMetricFrame>>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    server: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+}
+
+impl OtlpReceiverSession {
+    pub fn start(config: &OtlpGrpcReceiverConfig) -> Result<Self> {
+        let bind_addr: SocketAddr =
+            config.bind_addr.trim().parse().map_err(|err| {
+                NetdiagError::Connector(format!("invalid OTLP bind address: {err}"))
+            })?;
+        let buffer = Arc::new(Mutex::new(VecDeque::new()));
+        let service = OtlpMetricsReceiver {
+            buffer: Arc::clone(&buffer),
+            max_frames: 256,
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| err.to_string())?;
+            runtime
+                .block_on(async move {
+                    tonic::transport::Server::builder()
+                        .add_service(MetricsServiceServer::new(service))
+                        .serve_with_shutdown(bind_addr, async {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+                .map_err(|err| err.to_string())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        if server.is_finished() {
+            let outcome = server
+                .join()
+                .unwrap_or_else(|_| Err("OTLP receiver thread panicked".to_string()));
+            let err = outcome
+                .err()
+                .unwrap_or_else(|| "OTLP receiver exited immediately".to_string());
+            return Err(NetdiagError::Connector(format!(
+                "OTLP gRPC receiver failed to start: {err}"
+            )));
+        }
+        Ok(Self {
+            bind_addr,
+            metrics: merged_mapping(&config.metrics),
+            sample: config.sample.clone(),
+            buffer,
+            shutdown: Some(shutdown_tx),
+            server: Some(server),
+        })
+    }
+
+    pub fn snapshot(&self, lookback: Duration) -> Result<ConnectorLoadResult> {
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(lookback).unwrap_or_else(|_| chrono::Duration::seconds(1));
+        let frames = self
+            .buffer
+            .lock()
+            .map_err(|_| NetdiagError::Connector("OTLP receiver buffer poisoned".to_string()))?
+            .iter()
+            .filter(|frame| frame.received_at >= cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        if frames.is_empty() {
+            return Err(NetdiagError::Connector(
+                "OTLP receiver is listening but has not received metrics yet".to_string(),
+            ));
+        }
+        let mut records = Vec::new();
+        let mut warnings = Vec::new();
+        let mut dropped_frames = 0usize;
+        for frame in frames {
+            let (values, timestamp_ms) = parse_otlp_metrics_request(&frame.request, &self.metrics)?;
+            if !required_payload_metrics()
+                .iter()
+                .all(|metric| values.contains_key(*metric))
+            {
+                dropped_frames += 1;
+                continue;
+            }
+            warnings.extend(fallback_warnings_for_missing_events(
+                &values,
+                "OTLP metric is missing",
+            ));
+            records.push(record_from_values(timestamp_ms, &values, &mut warnings)?);
+        }
+        if dropped_frames > 0 {
+            warnings.push(IngestWarning {
+                row: None,
+                column: "otlp_frame".to_string(),
+                reason: format!(
+                    "OTLP frames missing required metrics were dropped: {dropped_frames}"
+                ),
+                fallback: "drop frame".to_string(),
+            });
+        }
+        if records.is_empty() {
+            return Err(NetdiagError::Connector(
+                "OTLP receiver has no complete metric frame to diagnose".to_string(),
+            ));
+        }
+        let mut ingest = build_ingest_result(records, self.sample.clone())?;
+        ingest.warnings.extend(warnings);
+        replace_metric_provenance(&mut ingest, "otlp_grpc_session");
+        Ok(ConnectorLoadResult {
+            sample: self.sample.clone(),
+            ingest,
+            provenance: BTreeMap::from([
+                ("kind".to_string(), "otlp_grpc_session".to_string()),
+                ("bind_addr".to_string(), self.bind_addr.to_string()),
+            ]),
+            payload: Some(serde_json::json!({
+                "frames_buffered": self.buffer.lock().map(|buffer| buffer.len()).unwrap_or_default(),
+            })),
+        })
+    }
+
+    pub fn stop(mut self) -> Result<()> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(server) = self.server.take() {
+            server
+                .join()
+                .map_err(|_| NetdiagError::Connector("OTLP receiver thread panicked".to_string()))?
+                .map_err(|err| NetdiagError::Connector(format!("OTLP receiver failed: {err}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OtlpReceiverSession {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum NativePcapSource {
     File(PathBuf),
     Interface(String),
@@ -117,6 +273,52 @@ pub fn default_prometheus_mapping() -> BTreeMap<String, String> {
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
     .collect()
+}
+
+fn replace_metric_provenance(ingest: &mut IngestResult, source: &str) {
+    ingest.metric_provenance = measured_metric_provenance(source);
+    mark_warning_backed_metrics(ingest, source);
+}
+
+fn mark_warning_backed_metrics(ingest: &mut IngestResult, source: &str) {
+    let warnings = ingest.warnings.clone();
+    for warning in warnings {
+        set_metric_provenance(
+            ingest,
+            &warning.column,
+            MetricQuality::Fallback,
+            source,
+            &warning.reason,
+        );
+    }
+}
+
+fn set_metric_provenance(
+    ingest: &mut IngestResult,
+    field: &str,
+    quality: MetricQuality,
+    source: &str,
+    reason: &str,
+) {
+    if field == "timestamp" {
+        return;
+    }
+    if let Some(item) = ingest
+        .metric_provenance
+        .iter_mut()
+        .find(|item| item.field == field)
+    {
+        item.quality = quality;
+        item.source = source.to_string();
+        item.reason = reason.to_string();
+        return;
+    }
+    ingest.metric_provenance.push(MetricProvenance {
+        field: field.to_string(),
+        quality,
+        source: source.to_string(),
+        reason: reason.to_string(),
+    });
 }
 
 pub fn load_http_json(config: &HttpJsonConfig) -> Result<ConnectorLoadResult> {
@@ -160,7 +362,8 @@ pub fn load_http_json(config: &HttpJsonConfig) -> Result<ConnectorLoadResult> {
         .and_then(Value::as_str)
         .unwrap_or("http_json")
         .to_string();
-    let ingest = build_ingest_result(records, sample.clone())?;
+    let mut ingest = build_ingest_result(records, sample.clone())?;
+    replace_metric_provenance(&mut ingest, "http_json");
     Ok(ConnectorLoadResult {
         ingest,
         sample,
@@ -262,6 +465,7 @@ pub fn load_prometheus_query_range(
     }
     let mut ingest = build_ingest_result(records, config.sample.clone())?;
     ingest.warnings.extend(warnings);
+    replace_metric_provenance(&mut ingest, "prometheus_query_range");
     Ok(ConnectorLoadResult {
         ingest,
         sample: config.sample.clone(),
@@ -320,6 +524,7 @@ pub fn load_prometheus_exposition(
     let record = record_from_values(Utc::now().timestamp_millis(), &values, &mut warnings)?;
     let mut ingest = build_ingest_result(vec![record], config.sample.clone())?;
     ingest.warnings.extend(warnings);
+    replace_metric_provenance(&mut ingest, "prometheus_exposition");
     Ok(ConnectorLoadResult {
         ingest,
         sample: config.sample.clone(),
@@ -329,72 +534,30 @@ pub fn load_prometheus_exposition(
 }
 
 pub fn load_otlp_grpc_receiver(config: &OtlpGrpcReceiverConfig) -> Result<ConnectorLoadResult> {
-    let bind_addr: SocketAddr = config
-        .bind_addr
-        .trim()
-        .parse()
-        .map_err(|err| NetdiagError::Connector(format!("invalid OTLP bind address: {err}")))?;
-    let (export_tx, export_rx) = mpsc::channel::<ExportMetricsServiceRequest>();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let service = OtlpMetricsReceiver {
-        sender: Arc::new(Mutex::new(Some(export_tx))),
-    };
-    let server = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| err.to_string())?;
-        runtime
-            .block_on(async move {
-                tonic::transport::Server::builder()
-                    .add_service(MetricsServiceServer::new(service))
-                    .serve_with_shutdown(bind_addr, async {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-                    .map_err(|err| err.to_string())
-            })
-            .map_err(|err| err.to_string())
-    });
-
-    let request = match export_rx.recv_timeout(config.timeout) {
-        Ok(request) => request,
-        Err(_) => {
-            let _ = shutdown_tx.send(());
-            let _ = server.join();
-            return Err(NetdiagError::Connector(format!(
-                "OTLP gRPC receiver timed out after {}s waiting for metrics",
-                config.timeout.as_secs().max(1)
-            )));
-        }
-    };
-    let _ = shutdown_tx.send(());
-    let _ = server.join();
-
-    let mapping = merged_mapping(&config.metrics);
-    let (values, timestamp_ms) = parse_otlp_metrics_request(&request, &mapping)?;
-    let mut warnings = fallback_warnings_for_missing_events(&values, "OTLP metric is missing");
-    for metric in required_payload_metrics() {
-        if !values.contains_key(metric) {
-            return Err(NetdiagError::Connector(format!(
-                "OTLP metrics missing required metric {metric}"
-            )));
+    let session = OtlpReceiverSession::start(config)?;
+    let started = Instant::now();
+    loop {
+        match session.snapshot(config.timeout) {
+            Ok(result) => {
+                session.stop()?;
+                return Ok(result);
+            }
+            Err(err) if started.elapsed() < config.timeout => {
+                if !err.to_string().contains("has not received metrics yet") {
+                    session.stop()?;
+                    return Err(err);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                session.stop()?;
+                return Err(NetdiagError::Connector(format!(
+                    "OTLP gRPC receiver timed out after {}s waiting for metrics",
+                    config.timeout.as_secs().max(1)
+                )));
+            }
         }
     }
-    let mut ingest = build_ingest_result(
-        vec![record_from_values(timestamp_ms, &values, &mut warnings)?],
-        config.sample.clone(),
-    )?;
-    ingest.warnings.extend(warnings);
-    Ok(ConnectorLoadResult {
-        ingest,
-        sample: config.sample.clone(),
-        provenance: BTreeMap::from([
-            ("kind".to_string(), "otlp_grpc_receiver".to_string()),
-            ("bind_addr".to_string(), config.bind_addr.clone()),
-        ]),
-        payload: None,
-    })
 }
 
 pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult> {
@@ -500,6 +663,21 @@ pub fn load_system_counters(config: &SystemCountersConfig) -> Result<ConnectorLo
             "system counters do not expose QUIC policy state",
         ),
     ]);
+    replace_metric_provenance(&mut ingest, "system_counters");
+    set_metric_provenance(
+        &mut ingest,
+        "packet_loss_rate",
+        MetricQuality::Measured,
+        "system_counters",
+        "derived from interface error counters",
+    );
+    set_metric_provenance(
+        &mut ingest,
+        "throughput_mbps",
+        MetricQuality::Measured,
+        "system_counters",
+        "derived from interface byte counters",
+    );
     Ok(ConnectorLoadResult {
         ingest,
         sample: config.sample.clone(),
@@ -715,7 +893,8 @@ fn fallback_warnings_for_missing_events(
 
 #[derive(Debug)]
 struct OtlpMetricsReceiver {
-    sender: Arc<Mutex<Option<mpsc::Sender<ExportMetricsServiceRequest>>>>,
+    buffer: Arc<Mutex<VecDeque<OtlpMetricFrame>>>,
+    max_frames: usize,
 }
 
 #[tonic::async_trait]
@@ -724,13 +903,16 @@ impl MetricsService for OtlpMetricsReceiver {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
-        if let Some(sender) = self
-            .sender
+        let mut buffer = self
+            .buffer
             .lock()
-            .map_err(|_| Status::internal("receiver lock poisoned"))?
-            .take()
-        {
-            let _ = sender.send(request.into_inner());
+            .map_err(|_| Status::internal("receiver buffer lock poisoned"))?;
+        buffer.push_back(OtlpMetricFrame {
+            received_at: Utc::now(),
+            request: request.into_inner(),
+        });
+        while buffer.len() > self.max_frames {
+            buffer.pop_front();
         }
         Ok(Response::new(ExportMetricsServiceResponse {
             partial_success: None,
@@ -952,6 +1134,21 @@ fn packet_stats_to_result(
             "pcap capture can observe UDP/443 but cannot prove QUIC policy blocking",
         ),
     ]);
+    replace_metric_provenance(&mut ingest, "native_pcap");
+    set_metric_provenance(
+        &mut ingest,
+        "throughput_mbps",
+        MetricQuality::Measured,
+        "native_pcap",
+        "computed from observed packet bytes over capture duration",
+    );
+    set_metric_provenance(
+        &mut ingest,
+        "retransmission_rate",
+        MetricQuality::Estimated,
+        "native_pcap",
+        "estimated from repeated TCP sequence observations",
+    );
     let mut top_talkers = stats.flows.into_iter().collect::<Vec<_>>();
     top_talkers.sort_by_key(|talker| std::cmp::Reverse(talker.1));
     top_talkers.truncate(5);
@@ -1322,6 +1519,110 @@ netdiag_throughput_mbps 99
                 .and_then(Value::as_u64),
             Some(4_000)
         );
+    }
+
+    #[test]
+    fn native_pcap_observe_extracts_flow_bytes_and_retransmission_hints() {
+        let mut stats = PacketStats::default();
+        let tcp = ethernet_ipv4_tcp_packet(443, 51_515, 7, b"payload");
+
+        observe_packet(1_000, tcp.len(), &tcp, &mut stats);
+        observe_packet(1_050, tcp.len(), &tcp, &mut stats);
+
+        assert_eq!(stats.packet_count, 2);
+        assert_eq!(stats.tcp_packets, 2);
+        assert_eq!(stats.retransmissions, 1);
+        assert_eq!(stats.tls_packets, 2);
+        assert_eq!(
+            stats.flows.get("10.0.0.1:443 -> 10.0.0.2:51515"),
+            Some(&(tcp.len() as u64 * 2))
+        );
+    }
+
+    #[test]
+    fn native_pcap_observe_extracts_dns_and_quic_hints_without_policy_claims() {
+        let mut stats = PacketStats::default();
+        let dns = ethernet_ipv4_udp_packet(53, 53_000, b"dns");
+        let quic_like = ethernet_ipv4_udp_packet(44_444, 443, b"quic");
+
+        observe_packet(1_000, dns.len(), &dns, &mut stats);
+        observe_packet(1_010, quic_like.len(), &quic_like, &mut stats);
+
+        assert_eq!(stats.udp_packets, 2);
+        assert_eq!(stats.dns_packets, 1);
+        assert_eq!(stats.quic_packets, 1);
+        let loaded = packet_stats_to_result(
+            stats,
+            "pcap_hints",
+            &NativePcapSource::Interface("fixture".to_string()),
+        )
+        .expect("pcap result");
+        assert!(
+            loaded
+                .ingest
+                .warnings
+                .iter()
+                .any(|warning| warning.column == "quic_blocked_ratio")
+        );
+    }
+
+    #[test]
+    fn native_pcap_malformed_short_packet_does_not_invent_transport_metrics() {
+        let mut stats = PacketStats::default();
+        observe_packet(1_000, 4, &[0xde, 0xad, 0xbe, 0xef], &mut stats);
+
+        assert_eq!(stats.packet_count, 1);
+        assert_eq!(stats.total_bytes, 4);
+        assert_eq!(stats.tcp_packets, 0);
+        assert_eq!(stats.udp_packets, 0);
+        assert_eq!(stats.retransmissions, 0);
+        assert!(stats.flows.is_empty());
+    }
+
+    fn ethernet_ipv4_tcp_packet(
+        source_port: u16,
+        target_port: u16,
+        seq: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = ethernet_ipv4_header(6, 20 + payload.len());
+        packet.extend_from_slice(&source_port.to_be_bytes());
+        packet.extend_from_slice(&target_port.to_be_bytes());
+        packet.extend_from_slice(&seq.to_be_bytes());
+        packet.extend_from_slice(&0_u32.to_be_bytes());
+        packet.extend_from_slice(&[0x50, 0x18]);
+        packet.extend_from_slice(&16_384_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    fn ethernet_ipv4_udp_packet(source_port: u16, target_port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = ethernet_ipv4_header(17, 8 + payload.len());
+        packet.extend_from_slice(&source_port.to_be_bytes());
+        packet.extend_from_slice(&target_port.to_be_bytes());
+        packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    fn ethernet_ipv4_header(protocol: u8, transport_and_payload_len: usize) -> Vec<u8> {
+        let total_len = 20 + transport_and_payload_len;
+        let mut packet = vec![
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x08, 0x00,
+            0x45, 0x00,
+        ];
+        packet.extend_from_slice(&(total_len as u16).to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.push(64);
+        packet.push(protocol);
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&[10, 0, 0, 1]);
+        packet.extend_from_slice(&[10, 0, 0, 2]);
+        packet
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{
-    HilFeedbackRecord, HilReview, HilReviewSummary, HilState, Recommendation, RunIndexEntry,
-    RunManifest,
+    FaultLabel, HilFeedbackRecord, HilReview, HilReviewSummary, HilState, Recommendation,
+    RunIndexEntry, RunManifest,
 };
 use crate::report::Report;
 use serde::Serialize;
@@ -75,6 +75,7 @@ pub fn review_recommendation(
     state: HilState,
     notes: &str,
     reviewer: &str,
+    final_label: Option<FaultLabel>,
 ) -> Result<HilReviewOutcome> {
     let artifact_root = artifact_root.as_ref();
     let dir = run_dir(artifact_root, run_id);
@@ -90,7 +91,7 @@ pub fn review_recommendation(
         ));
     };
 
-    let review = HilReview::new(state, notes.trim(), reviewer.trim());
+    let review = HilReview::with_final_label(state, notes.trim(), reviewer.trim(), final_label);
     recommendation.hil_state = state;
     recommendation.review = Some(review.clone());
     save_json_atomic(&recommendations_path, &recommendations)?;

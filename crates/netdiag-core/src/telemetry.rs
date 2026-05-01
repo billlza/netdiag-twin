@@ -1,7 +1,7 @@
 use crate::error::{NetdiagError, Result};
 use crate::models::{
-    DistributionStats, OverallTelemetry, TelemetrySummary, TelemetryWindow, ThroughputStats,
-    TraceRecord, WindowLatencyStats,
+    DistributionStats, IngestResult, OverallTelemetry, TelemetrySummary, TelemetryWindow,
+    ThroughputStats, TraceRecord, WindowLatencyStats,
 };
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use std::collections::BTreeMap;
@@ -51,7 +51,17 @@ pub fn summarize_telemetry(
         quic_blocked_ratio: mean(records.iter().map(|record| record.quic_blocked_ratio)),
         window_count: windows.len(),
     };
-    Ok(TelemetrySummary { overall, windows })
+    Ok(TelemetrySummary {
+        overall,
+        windows,
+        metric_provenance: Vec::new(),
+    })
+}
+
+pub fn summarize_ingest(ingest: &IngestResult, window_seconds: i64) -> Result<TelemetrySummary> {
+    let mut summary = summarize_telemetry(&ingest.records, window_seconds)?;
+    summary.metric_provenance = ingest.metric_provenance.clone();
+    Ok(summary)
 }
 
 pub fn aggregate_by_window(records: &[TraceRecord], window_seconds: i64) -> Vec<TelemetryWindow> {

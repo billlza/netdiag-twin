@@ -28,6 +28,10 @@ docs/
 
 ## Quick Start
 
+Start with [docs/getting-started.md](docs/getting-started.md) for the canonical
+trace schema, live adapter contracts, artifact layout, HIL review flow, and
+common ingestion errors.
+
 ```bash
 cargo run -p netdiag-app
 ```
@@ -129,6 +133,8 @@ cargo run -p netdiag-cli -- review <run_id> <recommendation_id> --state accepted
 cargo fmt --check --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RUSTFLAGS="-D warnings" cargo test --workspace
+scripts/check_perf_budget.sh
 ```
 
 Golden tests cover all six sample traces:
@@ -139,6 +145,13 @@ Golden tests cover all six sample traces:
 - `dns_failure`
 - `tls_failure`
 - `udp_quic_blocked`
+
+`perf-baseline.json` is the tracked performance budget. Refresh it only after an
+intentional performance change:
+
+```bash
+scripts/check_perf_budget.sh --update-baseline
+```
 
 ## Artifacts
 

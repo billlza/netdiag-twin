@@ -1,5 +1,6 @@
 use crate::models::{
-    DiagnosisEvent, HilReviewSummary, MlResult, Recommendation, TelemetrySummary, WhatIfResult,
+    DiagnosisEvent, HilReviewSummary, MlResult, ModelManifest, Recommendation, TelemetrySummary,
+    WhatIfResult,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ pub struct Report {
     pub trace_summary: TelemetrySummary,
     pub root_causes: Vec<RootCause>,
     pub rule_vs_ml: RuleMlComparison,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_manifest: Option<ModelManifest>,
     pub what_if: Option<WhatIfResult>,
     pub recommendations: Vec<Recommendation>,
     #[serde(default)]
@@ -104,6 +107,7 @@ pub fn render_report(
             })
             .collect(),
         rule_vs_ml: compare_rule_ml(events, ml),
+        model_manifest: ml.model_manifest.clone(),
         what_if,
         recommendations: recommendations.to_vec(),
         hil_summary: HilReviewSummary::from_recommendations(recommendations),

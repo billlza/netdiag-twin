@@ -12,16 +12,26 @@ csv.workspace = true
 linfa.workspace = true
 linfa-logistic.workspace = true
 ndarray.workspace = true
+opentelemetry-proto.workspace = true
+pcap.workspace = true
 petgraph.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
 uuid.workspace = true
+etherparse.workspace = true
 
 [dev-dependencies]
 float-cmp.workspace = true
 insta.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "perf_budget"
+harness = false

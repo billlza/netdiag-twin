@@ -2,10 +2,23 @@ use crate::error::{NetdiagError, Result};
 use crate::ingest::{CANONICAL_COLUMNS, build_ingest_result};
 use crate::models::{IngestResult, IngestWarning, TraceRecord};
 use chrono::{TimeZone, Utc};
+use etherparse::{NetSlice, SlicedPacket, TransportSlice};
+use opentelemetry_proto::tonic as otlp;
+use otlp::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    metrics_service_server::{MetricsService, MetricsServiceServer},
+};
+use otlp::metrics::v1::{Metric, metric, number_data_point};
+use pcap::Capture;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
+use tonic::{Request, Response, Status};
 
 const REQUIRED_METRICS: [&str; 6] = [
     "latency_ms",
@@ -56,6 +69,35 @@ pub struct PrometheusExpositionConfig {
     pub bearer_token: Option<String>,
     pub timeout: Duration,
     pub metrics: BTreeMap<String, String>,
+    pub sample: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OtlpGrpcReceiverConfig {
+    pub bind_addr: String,
+    pub timeout: Duration,
+    pub metrics: BTreeMap<String, String>,
+    pub sample: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum NativePcapSource {
+    File(PathBuf),
+    Interface(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct NativePcapConfig {
+    pub source: NativePcapSource,
+    pub timeout: Duration,
+    pub packet_limit: usize,
+    pub sample: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemCountersConfig {
+    pub interface: Option<String>,
+    pub interval: Duration,
     pub sample: String,
 }
 
@@ -286,6 +328,200 @@ pub fn load_prometheus_exposition(
     })
 }
 
+pub fn load_otlp_grpc_receiver(config: &OtlpGrpcReceiverConfig) -> Result<ConnectorLoadResult> {
+    let bind_addr: SocketAddr = config
+        .bind_addr
+        .trim()
+        .parse()
+        .map_err(|err| NetdiagError::Connector(format!("invalid OTLP bind address: {err}")))?;
+    let (export_tx, export_rx) = mpsc::channel::<ExportMetricsServiceRequest>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let service = OtlpMetricsReceiver {
+        sender: Arc::new(Mutex::new(Some(export_tx))),
+    };
+    let server = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())?;
+        runtime
+            .block_on(async move {
+                tonic::transport::Server::builder()
+                    .add_service(MetricsServiceServer::new(service))
+                    .serve_with_shutdown(bind_addr, async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .map_err(|err| err.to_string())
+            })
+            .map_err(|err| err.to_string())
+    });
+
+    let request = match export_rx.recv_timeout(config.timeout) {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = shutdown_tx.send(());
+            let _ = server.join();
+            return Err(NetdiagError::Connector(format!(
+                "OTLP gRPC receiver timed out after {}s waiting for metrics",
+                config.timeout.as_secs().max(1)
+            )));
+        }
+    };
+    let _ = shutdown_tx.send(());
+    let _ = server.join();
+
+    let mapping = merged_mapping(&config.metrics);
+    let (values, timestamp_ms) = parse_otlp_metrics_request(&request, &mapping)?;
+    let mut warnings = fallback_warnings_for_missing_events(&values, "OTLP metric is missing");
+    for metric in required_payload_metrics() {
+        if !values.contains_key(metric) {
+            return Err(NetdiagError::Connector(format!(
+                "OTLP metrics missing required metric {metric}"
+            )));
+        }
+    }
+    let mut ingest = build_ingest_result(
+        vec![record_from_values(timestamp_ms, &values, &mut warnings)?],
+        config.sample.clone(),
+    )?;
+    ingest.warnings.extend(warnings);
+    Ok(ConnectorLoadResult {
+        ingest,
+        sample: config.sample.clone(),
+        provenance: BTreeMap::from([
+            ("kind".to_string(), "otlp_grpc_receiver".to_string()),
+            ("bind_addr".to_string(), config.bind_addr.clone()),
+        ]),
+        payload: None,
+    })
+}
+
+pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult> {
+    let mut stats = PacketStats::default();
+    match &config.source {
+        NativePcapSource::File(path) => {
+            let mut capture = Capture::from_file(path).map_err(|err| {
+                NetdiagError::Connector(format!(
+                    "failed to open pcap file {}: {err}",
+                    path.display()
+                ))
+            })?;
+            while let Ok(packet) = capture.next_packet() {
+                observe_packet(
+                    packet_timestamp_ms(
+                        packet.header.ts.tv_sec,
+                        i64::from(packet.header.ts.tv_usec),
+                    ),
+                    packet.header.len as usize,
+                    packet.data,
+                    &mut stats,
+                );
+                if stats.packet_count >= config.packet_limit.max(1) {
+                    break;
+                }
+            }
+        }
+        NativePcapSource::Interface(interface) => {
+            let mut capture = Capture::from_device(interface.as_str())
+                .map_err(|err| {
+                    NetdiagError::Connector(format!(
+                        "failed to open capture device {interface}: {err}"
+                    ))
+                })?
+                .timeout(250)
+                .promisc(false)
+                .open()
+                .map_err(|err| {
+                    NetdiagError::Connector(format!(
+                        "failed to activate capture device {interface}: {err}"
+                    ))
+                })?;
+            let started = Instant::now();
+            while started.elapsed() < config.timeout
+                && stats.packet_count < config.packet_limit.max(1)
+            {
+                if let Ok(packet) = capture.next_packet() {
+                    observe_packet(
+                        packet_timestamp_ms(
+                            packet.header.ts.tv_sec,
+                            i64::from(packet.header.ts.tv_usec),
+                        ),
+                        packet.header.len as usize,
+                        packet.data,
+                        &mut stats,
+                    );
+                }
+            }
+        }
+    }
+    packet_stats_to_result(stats, &config.sample, &config.source)
+}
+
+pub fn load_system_counters(config: &SystemCountersConfig) -> Result<ConnectorLoadResult> {
+    let before = read_netstat_counters()?;
+    std::thread::sleep(config.interval.min(Duration::from_secs(10)));
+    let after = read_netstat_counters()?;
+    let delta = diff_counters(&before, &after, config.interface.as_deref())?;
+    let interval_s = config.interval.as_secs_f64().max(1e-6);
+    let throughput_mbps = (delta.bytes as f64 * 8.0) / interval_s / 1_000_000.0;
+    let total_packets = delta.packets + delta.errors;
+    let drop_rate = if total_packets > 0 {
+        (delta.errors as f64 / total_packets as f64) * 100.0
+    } else {
+        0.0
+    };
+    let timestamp = Utc::now();
+    let mut ingest = build_ingest_result(
+        vec![TraceRecord {
+            timestamp,
+            latency_ms: 0.1,
+            jitter_ms: 0.0,
+            packet_loss_rate: drop_rate,
+            retransmission_rate: 0.0,
+            timeout_events: 0.0,
+            retry_events: 0.0,
+            throughput_mbps,
+            dns_failure_events: 0.0,
+            tls_failure_events: 0.0,
+            quic_blocked_ratio: 0.0,
+        }],
+        config.sample.clone(),
+    )?;
+    ingest.warnings.extend([
+        fallback_warning("latency_ms", "system counters do not expose RTT"),
+        fallback_warning("jitter_ms", "system counters do not expose jitter"),
+        fallback_warning(
+            "retransmission_rate",
+            "system counters do not expose TCP retransmissions",
+        ),
+        fallback_warning(
+            "quic_blocked_ratio",
+            "system counters do not expose QUIC policy state",
+        ),
+    ]);
+    Ok(ConnectorLoadResult {
+        ingest,
+        sample: config.sample.clone(),
+        provenance: BTreeMap::from([
+            ("kind".to_string(), "system_counters".to_string()),
+            (
+                "interface".to_string(),
+                config
+                    .interface
+                    .clone()
+                    .unwrap_or_else(|| "all".to_string()),
+            ),
+        ]),
+        payload: Some(serde_json::json!({
+            "bytes": delta.bytes,
+            "packets": delta.packets,
+            "errors": delta.errors,
+            "interval_seconds": interval_s,
+        })),
+    })
+}
+
 fn query_prometheus_matrix(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -466,6 +702,405 @@ fn fallback_warning(column: &str, reason: impl Into<String>) -> IngestWarning {
     }
 }
 
+fn fallback_warnings_for_missing_events(
+    values: &BTreeMap<String, f64>,
+    reason: &'static str,
+) -> Vec<IngestWarning> {
+    EVENT_METRICS
+        .into_iter()
+        .filter(|metric| !values.contains_key(*metric))
+        .map(|metric| fallback_warning(metric, reason))
+        .collect()
+}
+
+#[derive(Debug)]
+struct OtlpMetricsReceiver {
+    sender: Arc<Mutex<Option<mpsc::Sender<ExportMetricsServiceRequest>>>>,
+}
+
+#[tonic::async_trait]
+impl MetricsService for OtlpMetricsReceiver {
+    async fn export(
+        &self,
+        request: Request<ExportMetricsServiceRequest>,
+    ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .map_err(|_| Status::internal("receiver lock poisoned"))?
+            .take()
+        {
+            let _ = sender.send(request.into_inner());
+        }
+        Ok(Response::new(ExportMetricsServiceResponse {
+            partial_success: None,
+        }))
+    }
+}
+
+fn parse_otlp_metrics_request(
+    request: &ExportMetricsServiceRequest,
+    mapping: &BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, f64>, i64)> {
+    let wanted: BTreeMap<&str, &str> = mapping
+        .iter()
+        .map(|(canonical, metric)| (metric.as_str(), canonical.as_str()))
+        .collect();
+    let mut values = BTreeMap::new();
+    let mut latest_time_nanos = 0_u64;
+    for resource in &request.resource_metrics {
+        for scope in &resource.scope_metrics {
+            for metric in &scope.metrics {
+                let Some(canonical) = wanted.get(metric.name.as_str()) else {
+                    continue;
+                };
+                if let Some((value, timestamp)) = latest_metric_number(metric)
+                    && value.is_finite()
+                    && value >= 0.0
+                {
+                    values.insert((*canonical).to_string(), value);
+                    latest_time_nanos = latest_time_nanos.max(timestamp);
+                }
+            }
+        }
+    }
+    if values.is_empty() {
+        return Err(NetdiagError::Connector(
+            "OTLP export did not contain mapped numeric metrics".to_string(),
+        ));
+    }
+    let timestamp_ms = if latest_time_nanos > 0 {
+        (latest_time_nanos / 1_000_000) as i64
+    } else {
+        Utc::now().timestamp_millis()
+    };
+    Ok((values, timestamp_ms))
+}
+
+fn latest_metric_number(metric: &Metric) -> Option<(f64, u64)> {
+    let points = match metric.data.as_ref()? {
+        metric::Data::Gauge(gauge) => &gauge.data_points,
+        metric::Data::Sum(sum) => &sum.data_points,
+        _ => return None,
+    };
+    points
+        .iter()
+        .filter_map(number_point_value)
+        .max_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| left.0.total_cmp(&right.0))
+        })
+}
+
+fn number_point_value(point: &otlp::metrics::v1::NumberDataPoint) -> Option<(f64, u64)> {
+    let value = match point.value.as_ref()? {
+        number_data_point::Value::AsDouble(value) => *value,
+        number_data_point::Value::AsInt(value) => *value as f64,
+    };
+    Some((value, point.time_unix_nano))
+}
+
+#[derive(Debug, Default)]
+struct PacketStats {
+    packet_count: usize,
+    total_bytes: u64,
+    tcp_packets: usize,
+    udp_packets: usize,
+    dns_packets: usize,
+    tls_packets: usize,
+    quic_packets: usize,
+    retransmissions: usize,
+    first_ts_ms: Option<i64>,
+    last_ts_ms: Option<i64>,
+    seen_tcp_sequences: BTreeSet<String>,
+    flows: BTreeMap<String, u64>,
+}
+
+fn observe_packet(timestamp_ms: i64, packet_len: usize, data: &[u8], stats: &mut PacketStats) {
+    stats.packet_count += 1;
+    stats.total_bytes += packet_len as u64;
+    stats.first_ts_ms = Some(
+        stats
+            .first_ts_ms
+            .map_or(timestamp_ms, |ts| ts.min(timestamp_ms)),
+    );
+    stats.last_ts_ms = Some(
+        stats
+            .last_ts_ms
+            .map_or(timestamp_ms, |ts| ts.max(timestamp_ms)),
+    );
+
+    let Ok(packet) = SlicedPacket::from_ethernet(data).or_else(|_| SlicedPacket::from_ip(data))
+    else {
+        return;
+    };
+    let (source, target) = ip_pair(packet.net.as_ref());
+    match packet.transport {
+        Some(TransportSlice::Tcp(tcp)) => {
+            stats.tcp_packets += 1;
+            let flow = format!(
+                "{}:{} -> {}:{}",
+                source,
+                tcp.source_port(),
+                target,
+                tcp.destination_port()
+            );
+            *stats.flows.entry(flow.clone()).or_default() += packet_len as u64;
+            if tcp.source_port() == 443 || tcp.destination_port() == 443 {
+                stats.tls_packets += 1;
+            }
+            let payload_len = tcp.payload().len();
+            if payload_len > 0 {
+                let sequence_key = format!("{flow}:{}", tcp.sequence_number());
+                if !stats.seen_tcp_sequences.insert(sequence_key) {
+                    stats.retransmissions += 1;
+                }
+            }
+        }
+        Some(TransportSlice::Udp(udp)) => {
+            stats.udp_packets += 1;
+            let flow = format!(
+                "{}:{} -> {}:{}",
+                source,
+                udp.source_port(),
+                target,
+                udp.destination_port()
+            );
+            *stats.flows.entry(flow).or_default() += packet_len as u64;
+            if udp.source_port() == 53 || udp.destination_port() == 53 {
+                stats.dns_packets += 1;
+            }
+            if udp.source_port() == 443 || udp.destination_port() == 443 {
+                stats.quic_packets += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ip_pair(net: Option<&NetSlice<'_>>) -> (String, String) {
+    match net {
+        Some(NetSlice::Ipv4(ip)) => (
+            ip.header().source_addr().to_string(),
+            ip.header().destination_addr().to_string(),
+        ),
+        Some(NetSlice::Ipv6(ip)) => (
+            ip.header().source_addr().to_string(),
+            ip.header().destination_addr().to_string(),
+        ),
+        _ => ("unknown".to_string(), "unknown".to_string()),
+    }
+}
+
+fn packet_stats_to_result(
+    stats: PacketStats,
+    sample: &str,
+    source: &NativePcapSource,
+) -> Result<ConnectorLoadResult> {
+    if stats.packet_count == 0 {
+        return Err(NetdiagError::Connector(
+            "native pcap capture produced no packets".to_string(),
+        ));
+    }
+    let duration_s = stats
+        .first_ts_ms
+        .zip(stats.last_ts_ms)
+        .map(|(start, end)| ((end - start) as f64 / 1000.0).max(1e-3))
+        .unwrap_or(1.0);
+    let retransmission_rate = if stats.tcp_packets > 0 {
+        (stats.retransmissions as f64 / stats.tcp_packets as f64) * 100.0
+    } else {
+        0.0
+    };
+    let throughput_mbps = (stats.total_bytes as f64 * 8.0) / duration_s / 1_000_000.0;
+    let timestamp = stats
+        .last_ts_ms
+        .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
+        .unwrap_or_else(Utc::now);
+    let mut ingest = build_ingest_result(
+        vec![TraceRecord {
+            timestamp,
+            latency_ms: 0.1,
+            jitter_ms: 0.0,
+            packet_loss_rate: 0.0,
+            retransmission_rate,
+            timeout_events: 0.0,
+            retry_events: 0.0,
+            throughput_mbps,
+            dns_failure_events: 0.0,
+            tls_failure_events: 0.0,
+            quic_blocked_ratio: 0.0,
+        }],
+        sample.to_string(),
+    )?;
+    ingest.warnings.extend([
+        fallback_warning(
+            "latency_ms",
+            "pcap capture does not directly expose RTT without request/response correlation",
+        ),
+        fallback_warning(
+            "jitter_ms",
+            "pcap capture does not directly expose jitter without RTT correlation",
+        ),
+        fallback_warning(
+            "packet_loss_rate",
+            "pcap capture observes packets but cannot infer end-to-end loss alone",
+        ),
+        fallback_warning(
+            "quic_blocked_ratio",
+            "pcap capture can observe UDP/443 but cannot prove QUIC policy blocking",
+        ),
+    ]);
+    let mut top_talkers = stats.flows.into_iter().collect::<Vec<_>>();
+    top_talkers.sort_by_key(|talker| std::cmp::Reverse(talker.1));
+    top_talkers.truncate(5);
+    Ok(ConnectorLoadResult {
+        ingest,
+        sample: sample.to_string(),
+        provenance: BTreeMap::from([
+            ("kind".to_string(), "native_pcap".to_string()),
+            (
+                "source".to_string(),
+                match source {
+                    NativePcapSource::File(path) => path.display().to_string(),
+                    NativePcapSource::Interface(name) => format!("interface:{name}"),
+                },
+            ),
+            ("packets".to_string(), stats.packet_count.to_string()),
+            ("tcp_packets".to_string(), stats.tcp_packets.to_string()),
+            ("udp_packets".to_string(), stats.udp_packets.to_string()),
+        ]),
+        payload: Some(serde_json::json!({
+            "total_bytes": stats.total_bytes,
+            "duration_seconds": duration_s,
+            "tcp_packets": stats.tcp_packets,
+            "udp_packets": stats.udp_packets,
+            "dns_packets": stats.dns_packets,
+            "tls_packets": stats.tls_packets,
+            "quic_packets": stats.quic_packets,
+            "retransmissions": stats.retransmissions,
+            "top_talkers": top_talkers.into_iter().map(|(label, bytes)| {
+                serde_json::json!({ "label": label, "bytes": bytes })
+            }).collect::<Vec<_>>(),
+        })),
+    })
+}
+
+fn packet_timestamp_ms(seconds: i64, micros: i64) -> i64 {
+    seconds.saturating_mul(1000) + micros.saturating_div(1000)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InterfaceCounters {
+    bytes: u64,
+    packets: u64,
+    errors: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CounterDelta {
+    bytes: u64,
+    packets: u64,
+    errors: u64,
+}
+
+fn read_netstat_counters() -> Result<BTreeMap<String, InterfaceCounters>> {
+    let output = Command::new("netstat")
+        .args(["-ibn"])
+        .output()
+        .map_err(|err| NetdiagError::Connector(format!("failed to run netstat -ibn: {err}")))?;
+    if !output.status.success() {
+        return Err(NetdiagError::Connector(format!(
+            "netstat -ibn failed with status {}",
+            output.status
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_netstat_counters(&text)
+}
+
+fn parse_netstat_counters(text: &str) -> Result<BTreeMap<String, InterfaceCounters>> {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let header = lines
+        .next()
+        .ok_or_else(|| NetdiagError::Connector("netstat output is empty".to_string()))?;
+    let columns = header.split_whitespace().collect::<Vec<_>>();
+    let index = |name: &str| {
+        columns
+            .iter()
+            .position(|column| *column == name)
+            .ok_or_else(|| NetdiagError::Connector(format!("netstat missing {name} column")))
+    };
+    let name_idx = index("Name")?;
+    let ipkts_idx = index("Ipkts")?;
+    let ierrs_idx = index("Ierrs")?;
+    let ibytes_idx = index("Ibytes")?;
+    let opkts_idx = index("Opkts")?;
+    let oerrs_idx = index("Oerrs")?;
+    let obytes_idx = index("Obytes")?;
+    let mut counters = BTreeMap::<String, InterfaceCounters>::new();
+    for line in lines {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() <= obytes_idx {
+            continue;
+        }
+        let name = fields[name_idx].to_string();
+        let parsed = InterfaceCounters {
+            bytes: parse_u64_field(fields[ibytes_idx])? + parse_u64_field(fields[obytes_idx])?,
+            packets: parse_u64_field(fields[ipkts_idx])? + parse_u64_field(fields[opkts_idx])?,
+            errors: parse_u64_field(fields[ierrs_idx])? + parse_u64_field(fields[oerrs_idx])?,
+        };
+        counters
+            .entry(name)
+            .and_modify(|current| {
+                current.bytes = current.bytes.max(parsed.bytes);
+                current.packets = current.packets.max(parsed.packets);
+                current.errors = current.errors.max(parsed.errors);
+            })
+            .or_insert(parsed);
+    }
+    if counters.is_empty() {
+        return Err(NetdiagError::Connector(
+            "netstat output contained no interface counters".to_string(),
+        ));
+    }
+    Ok(counters)
+}
+
+fn parse_u64_field(value: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .map_err(|_| NetdiagError::Connector(format!("invalid netstat counter: {value}")))
+}
+
+fn diff_counters(
+    before: &BTreeMap<String, InterfaceCounters>,
+    after: &BTreeMap<String, InterfaceCounters>,
+    interface: Option<&str>,
+) -> Result<CounterDelta> {
+    let mut delta = CounterDelta::default();
+    let mut matched = 0usize;
+    for (name, after_value) in after {
+        if interface.is_some_and(|wanted| wanted != "all" && wanted != name) {
+            continue;
+        }
+        matched += 1;
+        let before_value = before.get(name).copied().unwrap_or_default();
+        delta.bytes += after_value.bytes.saturating_sub(before_value.bytes);
+        delta.packets += after_value.packets.saturating_sub(before_value.packets);
+        delta.errors += after_value.errors.saturating_sub(before_value.errors);
+    }
+    if matched == 0
+        && let Some(wanted) = interface.filter(|wanted| *wanted != "all")
+    {
+        return Err(NetdiagError::Connector(format!(
+            "system counter interface not found: {wanted}"
+        )));
+    }
+    Ok(delta)
+}
+
 #[derive(Debug, Deserialize)]
 struct PrometheusEnvelope {
     status: String,
@@ -586,6 +1221,200 @@ netdiag_throughput_mbps 99
         assert!(err.to_string().contains("bad_data"));
     }
 
+    #[test]
+    fn prometheus_exposition_missing_optional_events_emit_warnings() {
+        let body = r#"
+netdiag_latency_ms 42
+netdiag_jitter_ms 3
+netdiag_packet_loss_rate 0.2
+netdiag_retransmission_rate 0.4
+netdiag_throughput_mbps 99
+"#;
+        let (url, handle) = serve_once(200, body.to_string(), None);
+        let loaded = load_prometheus_exposition(&PrometheusExpositionConfig {
+            endpoint: url,
+            bearer_token: None,
+            timeout: Duration::from_secs(2),
+            metrics: BTreeMap::new(),
+            sample: "prom_text".to_string(),
+        })
+        .expect("prom exposition with optional fallbacks");
+        handle.join().expect("server thread");
+
+        assert_eq!(loaded.ingest.records.len(), 1);
+        for column in EVENT_METRICS {
+            assert!(
+                loaded
+                    .ingest
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.column == column),
+                "{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_metrics_parse_required_matrix_and_warn_for_optional_events() {
+        let timestamp = 1_777_000_000_000_000_000;
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![otlp::metrics::v1::ResourceMetrics {
+                scope_metrics: vec![otlp::metrics::v1::ScopeMetrics {
+                    metrics: vec![
+                        otlp_metric("netdiag_latency_ms", 41.0, timestamp),
+                        otlp_metric("netdiag_jitter_ms", 2.0, timestamp),
+                        otlp_metric("netdiag_packet_loss_rate", 0.1, timestamp),
+                        otlp_metric("netdiag_retransmission_rate", 0.3, timestamp),
+                        otlp_metric("netdiag_throughput_mbps", 88.0, timestamp),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let (values, timestamp_ms) =
+            parse_otlp_metrics_request(&request, &default_prometheus_mapping())
+                .expect("otlp values");
+        let warnings = fallback_warnings_for_missing_events(&values, "OTLP metric is missing");
+
+        assert_eq!(values["latency_ms"], 41.0);
+        assert_eq!(timestamp_ms, (timestamp / 1_000_000) as i64);
+        assert_eq!(warnings.len(), EVENT_METRICS.len());
+    }
+
+    #[test]
+    fn native_pcap_stats_keep_observed_values_and_warn_on_missing_fields() {
+        let mut stats = PacketStats {
+            packet_count: 4,
+            total_bytes: 4_000,
+            tcp_packets: 4,
+            retransmissions: 1,
+            first_ts_ms: Some(1_000),
+            last_ts_ms: Some(2_000),
+            ..PacketStats::default()
+        };
+        stats
+            .flows
+            .insert("10.0.0.1:443 -> 10.0.0.2:51515".to_string(), 4_000);
+
+        let loaded = packet_stats_to_result(
+            stats,
+            "pcap_fixture",
+            &NativePcapSource::Interface("lo0".to_string()),
+        )
+        .expect("pcap stats");
+
+        assert_eq!(loaded.ingest.records[0].throughput_mbps, 0.032);
+        assert_eq!(loaded.ingest.records[0].retransmission_rate, 25.0);
+        assert!(
+            loaded
+                .ingest
+                .warnings
+                .iter()
+                .any(|warning| warning.column == "packet_loss_rate")
+        );
+        assert_eq!(
+            loaded
+                .payload
+                .as_ref()
+                .and_then(|value| value.get("total_bytes"))
+                .and_then(Value::as_u64),
+            Some(4_000)
+        );
+    }
+
+    #[test]
+    fn netstat_parser_computes_interface_counter_deltas() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n",
+        )
+        .expect("after");
+
+        let delta = diff_counters(&before, &after, Some("en0")).expect("delta");
+
+        assert_eq!(delta.bytes, 1_200);
+        assert_eq!(delta.packets, 15);
+        assert_eq!(delta.errors, 1);
+    }
+
+    #[test]
+    fn netstat_counter_delta_allows_quiet_interfaces() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("after");
+
+        let delta = diff_counters(&before, &after, Some("en0")).expect("quiet delta");
+
+        assert_eq!(delta.bytes, 0);
+        assert_eq!(delta.packets, 0);
+        assert_eq!(delta.errors, 0);
+    }
+
+    #[test]
+    fn netstat_counter_delta_reports_unknown_interface() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n",
+        )
+        .expect("after");
+
+        let err = diff_counters(&before, &after, Some("utun404")).expect_err("unknown interface");
+
+        assert!(err.to_string().contains("interface not found: utun404"));
+    }
+
+    #[test]
+    fn netstat_counter_delta_aggregates_all_interfaces() {
+        let before = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n\
+             en1 1500 <Link#5> bb 4 0 400 6 1 600 0\n",
+        )
+        .expect("before");
+        let after = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n\
+             en1 1500 <Link#5> bb 8 1 900 9 1 900 0\n",
+        )
+        .expect("after");
+
+        let delta = diff_counters(&before, &after, Some("all")).expect("all interfaces");
+
+        assert_eq!(delta.bytes, 2_000);
+        assert_eq!(delta.packets, 22);
+        assert_eq!(delta.errors, 2);
+    }
+
+    #[test]
+    fn netstat_parser_rejects_malformed_counter_values() {
+        let err = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             en0 1500 <Link#4> aa nope 1 1000 20 2 2000 0\n",
+        )
+        .expect_err("bad counter");
+
+        assert!(err.to_string().contains("invalid netstat counter"));
+    }
+
     fn serve_once(
         status: u16,
         body: String,
@@ -623,5 +1452,19 @@ netdiag_throughput_mbps 99
             }
         });
         (format!("http://{addr}"), handle)
+    }
+
+    fn otlp_metric(name: &str, value: f64, timestamp: u64) -> Metric {
+        Metric {
+            name: name.to_string(),
+            data: Some(metric::Data::Gauge(otlp::metrics::v1::Gauge {
+                data_points: vec![otlp::metrics::v1::NumberDataPoint {
+                    time_unix_nano: timestamp,
+                    value: Some(number_data_point::Value::AsDouble(value)),
+                    ..Default::default()
+                }],
+            })),
+            ..Default::default()
+        }
     }
 }

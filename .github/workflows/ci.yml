@@ -21,3 +21,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Warning-deny test
+        run: RUSTFLAGS="-D warnings" cargo test --workspace
+      - name: Performance budget
+        run: scripts/check_perf_budget.sh

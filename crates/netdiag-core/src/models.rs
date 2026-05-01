@@ -165,6 +165,21 @@ pub struct IngestResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudget {
+    pub schema_version: u32,
+    pub generated_at: DateTime<Utc>,
+    pub threshold_percent: f64,
+    pub scenarios: BTreeMap<String, PerfBudgetEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfBudgetEntry {
+    pub max_millis: f64,
+    pub rows: usize,
+    pub iterations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionStats {
     pub p50: f64,
     pub p95: f64,
@@ -315,18 +330,82 @@ pub struct MlResult {
     pub top_predictions: Vec<Prediction>,
     pub top_features: Vec<FeatureImportance>,
     pub features: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_manifest: Option<ModelManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelManifest {
+    pub schema_version: String,
+    pub model_name: String,
+    pub model_kind: String,
+    pub created_at: DateTime<Utc>,
+    pub training_source: String,
+    pub model_file: String,
+    pub feature_names: Vec<String>,
+    pub labels: Vec<String>,
+    pub training_examples: usize,
+    pub feature_count: usize,
+    pub synthetic_fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhatIfResult {
     pub action_id: String,
     pub action_notes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_action: Option<TwinPolicyAction>,
     pub topology: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology_snapshot: Option<TopologyModel>,
     pub baseline: BTreeMap<String, serde_json::Value>,
     pub proposed: BTreeMap<String, serde_json::Value>,
     pub delta: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TwinPolicyAction {
+    pub id: String,
+    pub kind: TwinPolicyActionKind,
+    #[serde(default)]
+    pub target: TwinPolicyTarget,
+    #[serde(default)]
+    pub parameters: BTreeMap<String, serde_json::Value>,
+    pub impact: TwinPolicyImpact,
+    pub qoe_risk: String,
+    pub notes: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TwinPolicyActionKind {
+    Reroute,
+    QueueLimit,
+    CapacityChange,
+    LinkDisable,
+    TrafficShift,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TwinPolicyTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct TwinPolicyImpact {
+    #[serde(default)]
+    pub latency_delta_pct: f64,
+    #[serde(default)]
+    pub loss_delta_pct: f64,
+    #[serde(default)]
+    pub throughput_delta_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

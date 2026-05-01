@@ -1,8 +1,11 @@
 use crate::error::{NetdiagError, Result};
-use crate::models::{OverallTelemetry, TopologyLink, TopologyModel, TopologyNode, WhatIfResult};
+use crate::models::{
+    OverallTelemetry, TopologyLink, TopologyModel, TopologyNode, TwinPolicyAction,
+    TwinPolicyActionKind, TwinPolicyImpact, TwinPolicyTarget, WhatIfResult,
+};
 use petgraph::algo::dijkstra;
 use petgraph::graph::{NodeIndex, UnGraph};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -16,14 +19,12 @@ pub struct Topology {
     pub base_throughput: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct WhatIfAction {
-    pub key: &'static str,
-    pub latency_delta_pct: f64,
-    pub loss_delta_pct: f64,
-    pub throughput_delta_pct: f64,
-    pub qoe_risk: &'static str,
-    pub notes: &'static str,
+pub type WhatIfAction = TwinPolicyAction;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyFormat {
+    Json,
+    Yaml,
 }
 
 pub fn topology_names() -> Vec<&'static str> {
@@ -78,34 +79,112 @@ pub fn topology(key: &str) -> Result<Topology> {
     }
 }
 
-pub fn action(key: &str) -> Result<WhatIfAction> {
+pub fn policy_action_presets() -> Vec<TwinPolicyAction> {
+    vec![
+        reroute_path_b_policy(),
+        increase_queue_policy(),
+        reduce_bandwidth_policy(),
+    ]
+}
+
+pub fn policy_action(key: &str) -> Result<TwinPolicyAction> {
     match key {
-        "reroute_path_b" => Ok(WhatIfAction {
-            key: "reroute_path_b",
+        "reroute_path_b" => Ok(reroute_path_b_policy()),
+        "increase_queue" => Ok(increase_queue_policy()),
+        "reduce_bandwidth" => Ok(reduce_bandwidth_policy()),
+        other => Err(NetdiagError::UnknownAction(other.to_string())),
+    }
+}
+
+pub fn action(key: &str) -> Result<WhatIfAction> {
+    policy_action(key)
+}
+
+fn reroute_path_b_policy() -> TwinPolicyAction {
+    TwinPolicyAction {
+        id: "reroute_path_b".to_string(),
+        kind: TwinPolicyActionKind::Reroute,
+        target: TwinPolicyTarget {
+            path_id: Some("path_b".to_string()),
+            ..TwinPolicyTarget::default()
+        },
+        parameters: BTreeMap::from([("candidate_path".to_string(), json!("path_b"))]),
+        impact: TwinPolicyImpact {
             latency_delta_pct: -0.25,
             loss_delta_pct: -0.45,
             throughput_delta_pct: 0.25,
-            qoe_risk: "low",
-            notes: "Reroute to less-loaded path B",
-        }),
-        "increase_queue" => Ok(WhatIfAction {
-            key: "increase_queue",
+        },
+        qoe_risk: "low".to_string(),
+        notes: "Reroute to less-loaded path B".to_string(),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn increase_queue_policy() -> TwinPolicyAction {
+    TwinPolicyAction {
+        id: "increase_queue".to_string(),
+        kind: TwinPolicyActionKind::QueueLimit,
+        target: TwinPolicyTarget::default(),
+        parameters: BTreeMap::from([("queue_limit_multiplier".to_string(), json!(1.25))]),
+        impact: TwinPolicyImpact {
             latency_delta_pct: -0.08,
             loss_delta_pct: -0.15,
             throughput_delta_pct: 0.10,
-            qoe_risk: "low",
-            notes: "Increase queue limit at bottleneck router",
-        }),
-        "reduce_bandwidth" => Ok(WhatIfAction {
-            key: "reduce_bandwidth",
+        },
+        qoe_risk: "low".to_string(),
+        notes: "Increase queue limit at bottleneck router".to_string(),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn reduce_bandwidth_policy() -> TwinPolicyAction {
+    TwinPolicyAction {
+        id: "reduce_bandwidth".to_string(),
+        kind: TwinPolicyActionKind::CapacityChange,
+        target: TwinPolicyTarget::default(),
+        parameters: BTreeMap::from([("capacity_delta_pct".to_string(), json!(-0.10))]),
+        impact: TwinPolicyImpact {
             latency_delta_pct: 0.15,
             loss_delta_pct: 0.35,
             throughput_delta_pct: -0.10,
-            qoe_risk: "high",
-            notes: "Artificial throttling, usually for compliance but may degrade QoE",
-        }),
-        other => Err(NetdiagError::UnknownAction(other.to_string())),
+        },
+        qoe_risk: "high".to_string(),
+        notes: "Artificial throttling, usually for compliance but may degrade QoE".to_string(),
+        metadata: BTreeMap::new(),
     }
+}
+
+pub fn import_topology(input: &str, format: TopologyFormat) -> Result<TopologyModel> {
+    match format {
+        TopologyFormat::Json => import_topology_json(input),
+        TopologyFormat::Yaml => {
+            let model: TopologyModel = serde_yaml::from_str(input).map_err(|err| {
+                NetdiagError::InvalidTrace(format!("invalid topology YAML: {err}"))
+            })?;
+            validate_topology_model(&model)?;
+            Ok(model)
+        }
+    }
+}
+
+pub fn export_topology(model: &TopologyModel, format: TopologyFormat) -> Result<String> {
+    match format {
+        TopologyFormat::Json => export_topology_json(model),
+        TopologyFormat::Yaml => serde_yaml::to_string(model).map_err(|err| {
+            NetdiagError::InvalidTrace(format!("failed to encode topology YAML: {err}"))
+        }),
+    }
+}
+
+pub fn import_topology_json(input: &str) -> Result<TopologyModel> {
+    let model: TopologyModel = serde_json::from_str(input)?;
+    validate_topology_model(&model)?;
+    Ok(model)
+}
+
+pub fn export_topology_json(model: &TopologyModel) -> Result<String> {
+    validate_topology_model(model)?;
+    serde_json::to_string_pretty(model).map_err(NetdiagError::from)
 }
 
 pub fn topology_graph(key: &str) -> Result<UnGraph<String, ()>> {
@@ -147,11 +226,23 @@ pub fn validate_topology_model(model: &TopologyModel) -> Result<()> {
             )));
         }
     }
+    if model.links.is_empty() {
+        return Err(NetdiagError::InvalidTrace(
+            "topology has no links".to_string(),
+        ));
+    }
+    let mut link_ids = BTreeSet::new();
     for link in &model.links {
         if link.id.trim().is_empty() {
             return Err(NetdiagError::InvalidTrace(
                 "topology link id is empty".to_string(),
             ));
+        }
+        if !link_ids.insert(link.id.as_str()) {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "duplicate topology link id: {}",
+                link.id
+            )));
         }
         if !node_ids.contains(link.source.as_str()) || !node_ids.contains(link.target.as_str()) {
             return Err(NetdiagError::InvalidTrace(format!(
@@ -195,8 +286,17 @@ pub fn run_simulated_whatif_with_model(
     topology: &TopologyModel,
     action_id: &str,
 ) -> Result<WhatIfResult> {
+    let action = policy_action(action_id)?;
+    run_simulated_whatif_with_policy(telemetry, topology, &action)
+}
+
+pub fn run_simulated_whatif_with_policy(
+    telemetry: &OverallTelemetry,
+    topology: &TopologyModel,
+    action: &TwinPolicyAction,
+) -> Result<WhatIfResult> {
     validate_topology_model(topology)?;
-    let action = action(action_id)?;
+    validate_policy_action(action, topology)?;
     let stats = topology_stats(topology)?;
     let baseline_latency = (telemetry.latency.mean + stats.path_latency_ms * 0.15).max(1.0);
     let baseline_loss = (telemetry.packet_loss_rate + stats.path_loss_pct * 0.2).max(0.0);
@@ -207,18 +307,14 @@ pub fn run_simulated_whatif_with_model(
         (stats.bottleneck_mbps * 0.5).max(1.0)
     };
 
-    let redundancy_factor = if stats.redundant_paths { 0.85 } else { 1.0 };
-    let capacity_headroom = (stats.bottleneck_mbps / baseline_throughput.max(1.0)).clamp(1.0, 3.0);
-    let action_latency_delta = action.latency_delta_pct * redundancy_factor;
-    let action_loss_delta = action.loss_delta_pct * redundancy_factor;
-    let action_throughput_delta =
-        (action.throughput_delta_pct * capacity_headroom.sqrt()).clamp(-0.95, 1.5);
+    let action_deltas = action_deltas(action, &stats, baseline_throughput);
 
-    let proposed_latency = (baseline_latency * (1.0 + action_latency_delta)).max(1.0);
-    let proposed_jitter = (telemetry.jitter_ms.mean * (1.0 + 0.5 * action_latency_delta)).max(0.0);
-    let proposed_loss = (baseline_loss * (1.0 + action_loss_delta)).max(0.0);
-    let proposed_throughput =
-        (baseline_throughput * (1.0 + action_throughput_delta)).clamp(1.0, stats.bottleneck_mbps);
+    let proposed_latency = (baseline_latency * (1.0 + action_deltas.latency_pct)).max(1.0);
+    let proposed_jitter =
+        (telemetry.jitter_ms.mean * (1.0 + 0.5 * action_deltas.latency_pct)).max(0.0);
+    let proposed_loss = (baseline_loss * (1.0 + action_deltas.loss_pct)).max(0.0);
+    let proposed_throughput = (baseline_throughput * (1.0 + action_deltas.throughput_pct))
+        .clamp(1.0, stats.bottleneck_mbps);
 
     let baseline = BTreeMap::from([
         ("latency_ms".to_string(), json!(baseline_latency)),
@@ -236,7 +332,8 @@ pub fn run_simulated_whatif_with_model(
         ("loss_rate".to_string(), json!(proposed_loss)),
         ("throughput_mbps".to_string(), json!(proposed_throughput)),
         ("bottleneck_mbps".to_string(), json!(stats.bottleneck_mbps)),
-        ("qoe_risk".to_string(), json!(action.qoe_risk)),
+        ("policy_kind".to_string(), json!(action.kind)),
+        ("qoe_risk".to_string(), json!(action.qoe_risk.as_str())),
     ]);
     let delta = BTreeMap::from([
         (
@@ -254,14 +351,125 @@ pub fn run_simulated_whatif_with_model(
     ]);
 
     Ok(WhatIfResult {
-        action_id: action.key.to_string(),
-        action_notes: action.notes.to_string(),
+        action_id: action.id.clone(),
+        action_notes: action.notes.clone(),
+        policy_action: Some(action.clone()),
         topology: topology.key.to_string(),
         topology_snapshot: Some(topology.clone()),
         baseline,
         proposed,
         delta,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActionDeltas {
+    latency_pct: f64,
+    loss_pct: f64,
+    throughput_pct: f64,
+}
+
+fn validate_policy_action(action: &TwinPolicyAction, topology: &TopologyModel) -> Result<()> {
+    if action.id.trim().is_empty() {
+        return Err(NetdiagError::InvalidTrace(
+            "policy action id is empty".to_string(),
+        ));
+    }
+    if action.qoe_risk.trim().is_empty() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "policy action {} qoe_risk is empty",
+            action.id
+        )));
+    }
+    for (name, value) in [
+        ("latency_delta_pct", action.impact.latency_delta_pct),
+        ("loss_delta_pct", action.impact.loss_delta_pct),
+        ("throughput_delta_pct", action.impact.throughput_delta_pct),
+    ] {
+        if !value.is_finite() {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "policy action {} has invalid {name}",
+                action.id
+            )));
+        }
+    }
+
+    if let Some(node_id) = &action.target.node_id {
+        let known = topology.nodes.iter().any(|node| node.id == *node_id);
+        if !known {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "policy action {} targets unknown node {}",
+                action.id, node_id
+            )));
+        }
+    }
+    if let Some(link_id) = &action.target.link_id {
+        let known = topology.links.iter().any(|link| link.id == *link_id);
+        if !known {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "policy action {} targets unknown link {}",
+                action.id, link_id
+            )));
+        }
+    }
+    if action.kind == TwinPolicyActionKind::LinkDisable && action.target.link_id.is_none() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "policy action {} must target a link",
+            action.id
+        )));
+    }
+    Ok(())
+}
+
+fn action_deltas(
+    action: &TwinPolicyAction,
+    stats: &TopologyStats,
+    baseline_throughput: f64,
+) -> ActionDeltas {
+    let redundancy_factor = if stats.redundant_paths { 0.85 } else { 1.0 };
+    let capacity_headroom = (stats.bottleneck_mbps / baseline_throughput.max(1.0)).clamp(1.0, 3.0);
+    let mut latency_pct = action.impact.latency_delta_pct * redundancy_factor;
+    let mut loss_pct = action.impact.loss_delta_pct * redundancy_factor;
+    let mut throughput_pct = action.impact.throughput_delta_pct * capacity_headroom.sqrt();
+
+    match action.kind {
+        TwinPolicyActionKind::Reroute
+        | TwinPolicyActionKind::QueueLimit
+        | TwinPolicyActionKind::CapacityChange => {}
+        TwinPolicyActionKind::LinkDisable => {
+            if stats.redundant_paths {
+                latency_pct *= 0.75;
+                loss_pct *= 0.75;
+            } else {
+                latency_pct = latency_pct.max(0.20);
+                loss_pct = loss_pct.max(0.50);
+                throughput_pct = throughput_pct.min(-0.50);
+            }
+        }
+        TwinPolicyActionKind::TrafficShift => {
+            let shifted_share = action_parameter_f64(action, "traffic_shift_pct")
+                .unwrap_or(100.0)
+                .clamp(0.0, 100.0)
+                / 100.0;
+            latency_pct *= shifted_share;
+            loss_pct *= shifted_share;
+            throughput_pct *= shifted_share;
+        }
+    }
+
+    ActionDeltas {
+        latency_pct: latency_pct.clamp(-0.95, 2.0),
+        loss_pct: loss_pct.clamp(-0.95, 5.0),
+        throughput_pct: throughput_pct.clamp(-0.95, 1.5),
+    }
+}
+
+fn action_parameter_f64(action: &TwinPolicyAction, key: &str) -> Option<f64> {
+    action
+        .parameters
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
 }
 
 impl Topology {
@@ -373,7 +581,11 @@ fn pct_delta(proposed: f64, baseline: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DistributionStats, OverallTelemetry, ThroughputStats};
+    use crate::models::{
+        DistributionStats, OverallTelemetry, ThroughputStats, TwinPolicyActionKind,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[test]
     fn built_in_topology_models_are_valid() {
@@ -409,6 +621,84 @@ mod tests {
         model.links[0].target = "missing".to_string();
         let err = validate_topology_model(&model).expect_err("invalid");
         assert!(err.to_string().contains("unknown node"));
+    }
+
+    #[test]
+    fn topology_json_import_export_round_trips_and_validates() {
+        let model = topology_model("mesh").expect("mesh");
+
+        let exported = export_topology(&model, TopologyFormat::Json).expect("export");
+        let imported = import_topology(&exported, TopologyFormat::Json).expect("import");
+
+        assert_eq!(imported, model);
+
+        let yaml = export_topology(&model, TopologyFormat::Yaml).expect("yaml export");
+        let imported_yaml = import_topology(&yaml, TopologyFormat::Yaml).expect("yaml import");
+
+        assert_eq!(imported_yaml, model);
+    }
+
+    #[test]
+    fn topology_json_import_rejects_invalid_model() {
+        let mut model = topology_model("line").expect("line");
+        model.links[0].capacity_mbps = 0.0;
+        let invalid_json = serde_json::to_string(&model).expect("json");
+
+        let err = import_topology_json(&invalid_json).expect_err("invalid topology");
+
+        assert!(err.to_string().contains("capacity must be greater than 0"));
+    }
+
+    #[test]
+    fn policy_action_traffic_shift_scales_deltas() {
+        let telemetry = telemetry();
+        let line = topology_model("line").expect("line");
+        let action = TwinPolicyAction {
+            id: "shift_half_to_path_b".to_string(),
+            kind: TwinPolicyActionKind::TrafficShift,
+            target: TwinPolicyTarget {
+                path_id: Some("path_b".to_string()),
+                ..TwinPolicyTarget::default()
+            },
+            parameters: BTreeMap::from([("traffic_shift_pct".to_string(), json!(50.0))]),
+            impact: TwinPolicyImpact {
+                latency_delta_pct: -0.20,
+                loss_delta_pct: -0.30,
+                throughput_delta_pct: 0.20,
+            },
+            qoe_risk: "medium".to_string(),
+            notes: "Shift half of matching traffic to path B".to_string(),
+            metadata: BTreeMap::new(),
+        };
+
+        let result = run_simulated_whatif_with_policy(&telemetry, &line, &action).expect("whatif");
+
+        assert_eq!(result.action_id, "shift_half_to_path_b");
+        assert_eq!(
+            result.policy_action.as_ref().map(|action| action.kind),
+            Some(TwinPolicyActionKind::TrafficShift)
+        );
+        assert_eq!(result.delta["latency_pct"], -10.0);
+        assert!(result.delta["throughput_pct"] > 0.0);
+    }
+
+    #[test]
+    fn policy_presets_keep_legacy_action_ids() {
+        let presets = policy_action_presets();
+
+        assert_eq!(presets.len(), action_names().len());
+        assert_eq!(
+            action("reroute_path_b").expect("action").id,
+            "reroute_path_b"
+        );
+        assert_eq!(
+            action("increase_queue").expect("action").kind,
+            TwinPolicyActionKind::QueueLimit
+        );
+        assert_eq!(
+            action("reduce_bandwidth").expect("action").kind,
+            TwinPolicyActionKind::CapacityChange
+        );
     }
 
     fn telemetry() -> OverallTelemetry {

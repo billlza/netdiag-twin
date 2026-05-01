@@ -35,6 +35,7 @@ if [[ "$PROFILE" == "release" ]]; then
 fi
 
 if [[ "$PROFILE" == "release" ]]; then
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-D warnings"
   cargo build --release -p netdiag-app
   TARGET_DIR="$ROOT/target/release"
 else

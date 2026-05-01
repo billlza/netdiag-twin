@@ -1,18 +1,23 @@
 use float_cmp::approx_eq;
 use netdiag_core::error::NetdiagError;
 use netdiag_core::ingest::ingest_trace;
-use netdiag_core::models::{
-    FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState, Recommendation, RunIndexEntry,
-    RunManifest,
+use netdiag_core::ml::{
+    MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_or_train_model, train_model_from_jsonl,
 };
-use netdiag_core::pipeline::diagnose_file;
+use netdiag_core::models::{
+    FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState, ModelManifest, Recommendation,
+    RunIndexEntry, RunManifest, TwinPolicyActionKind,
+};
+use netdiag_core::pipeline::{PipelineResult, diagnose_file};
 use netdiag_core::report::Report;
 use netdiag_core::rules::diagnose_rules;
 use netdiag_core::storage::{review_recommendation, save_json_atomic};
 use netdiag_core::telemetry::summarize_telemetry;
 use netdiag_core::twin::run_simulated_whatif;
 use serde::ser::{Error as _, Serialize, Serializer};
+use serde_json::json;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 fn sample(name: &str) -> PathBuf {
@@ -88,6 +93,31 @@ fn full_pipeline_writes_artifacts_and_rust_ml_top_label() {
         let manifest: RunManifest =
             serde_json::from_slice(&fs::read(result.run_dir.join("manifest.json")).unwrap())
                 .expect("manifest json");
+        let whatif_path = PathBuf::from(
+            manifest
+                .artifact_paths
+                .get("whatif_default")
+                .expect("whatif path"),
+        );
+        let whatif_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&whatif_path).expect("whatif artifact"))
+                .expect("whatif json");
+        assert!(whatif_json["topology_snapshot"].is_object(), "{name}");
+        assert_eq!(whatif_json["policy_action"]["kind"], "reroute", "{name}");
+
+        let report_artifact: Report =
+            serde_json::from_slice(&fs::read(result.run_dir.join("report.json")).expect("report"))
+                .expect("report json");
+        let report_whatif = report_artifact.what_if.as_ref().expect("report whatif");
+        assert!(report_whatif.topology_snapshot.is_some(), "{name}");
+        assert_eq!(
+            report_whatif
+                .policy_action
+                .as_ref()
+                .map(|action| action.kind),
+            Some(TwinPolicyActionKind::Reroute),
+            "{name}"
+        );
         for (key, path) in &manifest.artifact_paths {
             if key == "run_id" {
                 continue;
@@ -120,6 +150,300 @@ fn full_pipeline_writes_artifacts_and_rust_ml_top_label() {
             .iter()
             .all(|entry| entry.status == "pending_review")
     );
+
+    let model_manifest: ModelManifest = serde_json::from_slice(
+        &fs::read(temp.path().join("model").join(MODEL_MANIFEST_FILE_NAME))
+            .expect("model manifest"),
+    )
+    .expect("model manifest json");
+    assert!(model_manifest.synthetic_fallback);
+    assert_eq!(model_manifest.model_file, MODEL_FILE_NAME);
+    assert_eq!(model_manifest.feature_names.len(), 11);
+    assert_eq!(model_manifest.labels.len(), FaultLabel::ALL.len());
+}
+
+#[test]
+fn training_jsonl_writes_model_manifest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dataset_path = temp.path().join("training.jsonl");
+    let mut dataset = fs::File::create(&dataset_path).expect("create dataset");
+    for name in [
+        "normal",
+        "congestion",
+        "random_loss",
+        "dns_failure",
+        "tls_failure",
+        "udp_quic_blocked",
+    ] {
+        let ingest = ingest_trace(sample(name)).expect("sample ingest");
+        let row = json!({
+            "label": name,
+            "records": ingest.records,
+        });
+        writeln!(dataset, "{row}").expect("write training row");
+    }
+
+    let model_dir = temp.path().join("trained-model");
+    let manifest = train_model_from_jsonl(&dataset_path, &model_dir).expect("train model");
+    assert!(!manifest.synthetic_fallback);
+    assert_eq!(manifest.training_examples, FaultLabel::ALL.len());
+    assert_eq!(manifest.feature_names.len(), 11);
+    assert_eq!(manifest.labels.len(), FaultLabel::ALL.len());
+    assert!(model_dir.join(MODEL_FILE_NAME).exists());
+    assert!(model_dir.join(MODEL_MANIFEST_FILE_NAME).exists());
+}
+
+#[test]
+fn load_or_train_model_writes_synthetic_fallback_manifest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let model_dir = temp.path().join("model");
+    load_or_train_model(&model_dir).expect("fallback model");
+
+    let manifest: ModelManifest = serde_json::from_slice(
+        &fs::read(model_dir.join(MODEL_MANIFEST_FILE_NAME)).expect("model manifest"),
+    )
+    .expect("model manifest json");
+    assert!(manifest.synthetic_fallback);
+    assert_eq!(manifest.training_source, "synthetic_fallback");
+    assert_eq!(manifest.model_file, MODEL_FILE_NAME);
+    assert_eq!(manifest.labels.len(), FaultLabel::ALL.len());
+}
+
+#[test]
+fn stable_golden_summaries_cover_six_sample_contracts() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cases = [
+        (
+            "normal",
+            json!({
+                "sample": "normal",
+                "root_causes": ["normal"],
+                "rule_labels": ["normal"],
+                "ml_top3": [
+                    { "label": "normal", "prob": 0.9997 },
+                    { "label": "random_loss", "prob": 0.0002 },
+                    { "label": "udp_quic_blocked", "prob": 0.0001 }
+                ],
+                "recommendations": [
+                    {
+                        "symptom": "normal",
+                        "action": "No action required; continue monitoring.",
+                        "effect": "What-if expects throughput improve by 0.0% with latency -25.0% change.",
+                        "risk": "low",
+                        "confidence": 0.855,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    }
+                ],
+                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 0.0 }
+            }),
+        ),
+        (
+            "congestion",
+            json!({
+                "sample": "congestion",
+                "root_causes": ["congestion", "random_loss"],
+                "rule_labels": ["congestion", "random_loss"],
+                "ml_top3": [
+                    { "label": "congestion", "prob": 0.9972 },
+                    { "label": "dns_failure", "prob": 0.0021 },
+                    { "label": "random_loss", "prob": 0.0006 }
+                ],
+                "recommendations": [
+                    {
+                        "symptom": "congestion",
+                        "action": "Reroute traffic window + check queue limits and active queue management.",
+                        "effect": "What-if expects throughput improve by 43.3% with latency -25.0% change.",
+                        "risk": "medium",
+                        "confidence": 0.774,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    },
+                    {
+                        "symptom": "random_loss",
+                        "action": "Enable packet-loss mitigation profile and inspect underlay noise source.",
+                        "effect": "What-if expects throughput improve by 43.3% with latency -25.0% change.",
+                        "risk": "medium",
+                        "confidence": 0.729,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    },
+                    {
+                        "symptom": "normal",
+                        "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
+                        "effect": "Expected latency/throughput changes validated in simulation.",
+                        "risk": "low",
+                        "confidence": 0.85,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": "reroute_path_b"
+                    }
+                ],
+                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 43.3 }
+            }),
+        ),
+        (
+            "random_loss",
+            json!({
+                "sample": "random_loss",
+                "root_causes": ["random_loss"],
+                "rule_labels": ["random_loss"],
+                "ml_top3": [
+                    { "label": "random_loss", "prob": 0.9416 },
+                    { "label": "dns_failure", "prob": 0.0557 },
+                    { "label": "congestion", "prob": 0.002 }
+                ],
+                "recommendations": [
+                    {
+                        "symptom": "random_loss",
+                        "action": "Enable packet-loss mitigation profile and inspect underlay noise source.",
+                        "effect": "What-if expects throughput improve by 31.3% with latency -25.0% change.",
+                        "risk": "medium",
+                        "confidence": 0.729,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    },
+                    {
+                        "symptom": "normal",
+                        "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
+                        "effect": "Expected latency/throughput changes validated in simulation.",
+                        "risk": "low",
+                        "confidence": 0.85,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": "reroute_path_b"
+                    }
+                ],
+                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 31.27 }
+            }),
+        ),
+        (
+            "dns_failure",
+            json!({
+                "sample": "dns_failure",
+                "root_causes": ["dns_failure"],
+                "rule_labels": ["dns_failure"],
+                "ml_top3": [
+                    { "label": "dns_failure", "prob": 0.7735 },
+                    { "label": "normal", "prob": 0.2115 },
+                    { "label": "random_loss", "prob": 0.0121 }
+                ],
+                "recommendations": [
+                    {
+                        "symptom": "dns_failure",
+                        "action": "Check DNS resolver health and confirm certificate trust path.",
+                        "effect": "What-if expects throughput improve by 15.1% with latency -25.0% change.",
+                        "risk": "high",
+                        "confidence": 0.855,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    },
+                    {
+                        "symptom": "normal",
+                        "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
+                        "effect": "Expected latency/throughput changes validated in simulation.",
+                        "risk": "low",
+                        "confidence": 0.85,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": "reroute_path_b"
+                    }
+                ],
+                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 15.13 }
+            }),
+        ),
+        (
+            "tls_failure",
+            json!({
+                "sample": "tls_failure",
+                "root_causes": ["tls_failure"],
+                "rule_labels": ["tls_failure"],
+                "ml_top3": [
+                    { "label": "tls_failure", "prob": 0.994 },
+                    { "label": "normal", "prob": 0.0051 },
+                    { "label": "random_loss", "prob": 0.0005 }
+                ],
+                "recommendations": [
+                    {
+                        "symptom": "tls_failure",
+                        "action": "Validate TLS versions/ciphers and retry handshake after cert rotation.",
+                        "effect": "What-if expects throughput improve by 29.0% with latency -25.0% change.",
+                        "risk": "high",
+                        "confidence": 0.873,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    },
+                    {
+                        "symptom": "normal",
+                        "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
+                        "effect": "Expected latency/throughput changes validated in simulation.",
+                        "risk": "low",
+                        "confidence": 0.85,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": "reroute_path_b"
+                    }
+                ],
+                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 28.97 }
+            }),
+        ),
+        (
+            "udp_quic_blocked",
+            json!({
+                "sample": "udp_quic_blocked",
+                "root_causes": ["udp_quic_blocked"],
+                "rule_labels": ["udp_quic_blocked"],
+                "ml_top3": [
+                    { "label": "udp_quic_blocked", "prob": 0.9989 },
+                    { "label": "dns_failure", "prob": 0.0011 },
+                    { "label": "congestion", "prob": 0.0 }
+                ],
+                "recommendations": [
+                    {
+                        "symptom": "udp_quic_blocked",
+                        "action": "Fall back to TCP transport or alternative relay while verifying UDP policy.",
+                        "effect": "What-if expects throughput improve by 32.5% with latency -25.0% change.",
+                        "risk": "high",
+                        "confidence": 0.675,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": null
+                    },
+                    {
+                        "symptom": "normal",
+                        "action": "Execute what-if action: reroute_path_b (Reroute to less-loaded path B)",
+                        "effect": "Expected latency/throughput changes validated in simulation.",
+                        "risk": "low",
+                        "confidence": 0.85,
+                        "approval": true,
+                        "hil": "unreviewed",
+                        "what_if": "reroute_path_b"
+                    }
+                ],
+                "what_if_delta": { "latency_pct": -25.0, "loss_pct": -45.0, "throughput_pct": 32.54 }
+            }),
+        ),
+    ];
+
+    for (name, expected) in cases {
+        let result = diagnose_file(sample(name), temp.path(), Some(("line", "reroute_path_b")))
+            .expect("diagnose");
+        let summary = stable_golden_summary(name, &result);
+        assert_eq!(summary, expected, "{name}");
+
+        let encoded = serde_json::to_string(&summary).expect("summary json");
+        assert!(!encoded.contains(&result.run_id), "{name}: run_id leaked");
+        assert!(
+            !encoded.contains(&result.run_dir.display().to_string()),
+            "{name}: run_dir leaked"
+        );
+    }
 }
 
 #[test]
@@ -331,4 +655,68 @@ impl Serialize for FailingSerialize {
     {
         Err(S::Error::custom("intentional serialization failure"))
     }
+}
+
+fn stable_golden_summary(sample_name: &str, result: &PipelineResult) -> serde_json::Value {
+    let root_causes = result
+        .report
+        .root_causes
+        .iter()
+        .map(|cause| cause.symptom.as_str())
+        .collect::<Vec<_>>();
+    let ml_top3 = result
+        .ml_result
+        .top_predictions
+        .iter()
+        .take(3)
+        .map(|prediction| {
+            json!({
+                "label": prediction.label.as_str(),
+                "prob": round4(prediction.prob),
+            })
+        })
+        .collect::<Vec<_>>();
+    let recommendations = result
+        .recommendations
+        .iter()
+        .map(|recommendation| {
+            json!({
+                "symptom": recommendation.diagnosis_symptom.as_str(),
+                "action": recommendation.recommended_action,
+                "effect": recommendation.expected_effect,
+                "risk": recommendation.risk_level,
+                "confidence": round4(recommendation.confidence),
+                "approval": recommendation.recommendation_need_approval,
+                "hil": recommendation.hil_state.as_str(),
+                "what_if": recommendation.what_if_action_id.as_deref(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut what_if_delta = serde_json::Map::new();
+    if let Some(what_if) = &result.what_if {
+        for (key, value) in &what_if.delta {
+            what_if_delta.insert(key.clone(), json!(round2(*value)));
+        }
+    }
+
+    json!({
+        "sample": sample_name,
+        "root_causes": root_causes,
+        "rule_labels": result.comparison.rule_labels,
+        "ml_top3": ml_top3,
+        "recommendations": recommendations,
+        "what_if_delta": what_if_delta,
+    })
+}
+
+fn round4(value: f64) -> f64 {
+    round_to(value, 10_000.0)
+}
+
+fn round2(value: f64) -> f64 {
+    round_to(value, 100.0)
+}
+
+fn round_to(value: f64, scale: f64) -> f64 {
+    (value * scale).round() / scale
 }

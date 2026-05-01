@@ -1,11 +1,17 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use netdiag_core::connectors::{
-    HttpJsonConfig, PrometheusExpositionConfig, PrometheusQueryRangeConfig,
-    default_prometheus_mapping, load_http_json, load_prometheus_exposition,
-    load_prometheus_query_range,
+    HttpJsonConfig, NativePcapConfig, NativePcapSource, OtlpGrpcReceiverConfig,
+    PrometheusExpositionConfig, PrometheusQueryRangeConfig, SystemCountersConfig,
+    default_prometheus_mapping, load_http_json, load_native_pcap, load_otlp_grpc_receiver,
+    load_prometheus_exposition, load_prometheus_query_range, load_system_counters,
 };
+use netdiag_core::ml::{export_feedback_training_dataset, train_model_from_jsonl};
 use netdiag_core::models::{HilState, TelemetrySummary};
+use netdiag_core::perf_budget::{
+    build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
+    run_perf_measurements, save_perf_budget,
+};
 use netdiag_core::storage::{read_json, review_recommendation, run_dir, save_json};
 use netdiag_core::twin::run_simulated_whatif;
 use netdiag_core::{Result as CoreResult, diagnose_file};
@@ -40,6 +46,16 @@ enum Command {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+    Train {
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long)]
+        model_dir: PathBuf,
+    },
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackCommand,
+    },
     Review {
         run_id: String,
         recommendation_id: String,
@@ -53,7 +69,17 @@ enum Command {
         artifacts: PathBuf,
     },
     Collect {
-        #[arg(long, value_parser = ["http-json", "prometheus-query", "prometheus-metrics"])]
+        #[arg(
+            long,
+            value_parser = [
+                "http-json",
+                "prometheus-query",
+                "prometheus-metrics",
+                "otlp-grpc",
+                "native-pcap",
+                "system-counters"
+            ]
+        )]
         kind: String,
         #[arg(long)]
         endpoint: String,
@@ -63,6 +89,10 @@ enum Command {
         lookback_secs: i64,
         #[arg(long, default_value_t = 15)]
         step_secs: u64,
+        #[arg(long, default_value_t = 256)]
+        packet_limit: usize,
+        #[arg(long, default_value_t = 1)]
+        interval_secs: u64,
         #[arg(long)]
         mapping: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
@@ -70,10 +100,37 @@ enum Command {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+    PerfBudget {
+        #[arg(long, default_value = "perf-baseline.json")]
+        baseline: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value = "target/perf-artifacts")]
+        artifacts: PathBuf,
+        #[arg(long, default_value_t = 15.0)]
+        threshold_percent: f64,
+        #[arg(long, default_value_t = false)]
+        update_baseline: bool,
+        #[arg(long, default_value_t = 3.0)]
+        baseline_scale: f64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FeedbackCommand {
+    Export {
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    run(Args::parse())
+}
+
+fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
         Command::Diagnose { file, artifacts } => {
             let result = diagnose_file(file, artifacts, Some(("line", "reroute_path_b")))
@@ -91,6 +148,29 @@ fn main() -> anyhow::Result<()> {
             let report = read_json(path)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Train { dataset, model_dir } => {
+            let manifest = train_model_from_jsonl(&dataset, &model_dir)
+                .with_context(|| format!("training failed for {}", dataset.display()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "trained",
+                    "dataset": dataset,
+                    "model_dir": model_dir,
+                    "model_file": manifest.model_file,
+                    "manifest_file": "model_manifest.json",
+                    "labels": manifest.labels,
+                    "training_examples": manifest.training_examples,
+                }))?
+            );
+        }
+        Command::Feedback { command } => match command {
+            FeedbackCommand::Export { artifacts, output } => {
+                let summary = export_feedback_training_dataset(&artifacts, &output)
+                    .context("feedback export failed")?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+        },
         Command::Review {
             run_id,
             recommendation_id,
@@ -128,6 +208,8 @@ fn main() -> anyhow::Result<()> {
             timeout_secs,
             lookback_secs,
             step_secs,
+            packet_limit,
+            interval_secs,
             mapping,
             diagnose,
             artifacts,
@@ -156,6 +238,24 @@ fn main() -> anyhow::Result<()> {
                     metrics: mapping,
                     sample: "cli_prometheus_metrics".to_string(),
                 })?,
+                "otlp-grpc" => load_otlp_grpc_receiver(&OtlpGrpcReceiverConfig {
+                    bind_addr: endpoint,
+                    timeout: Duration::from_secs(timeout_secs),
+                    metrics: mapping,
+                    sample: "cli_otlp_grpc".to_string(),
+                })?,
+                "native-pcap" => load_native_pcap(&NativePcapConfig {
+                    source: native_pcap_source(&endpoint),
+                    timeout: Duration::from_secs(timeout_secs),
+                    packet_limit,
+                    sample: "cli_native_pcap".to_string(),
+                })?,
+                "system-counters" => load_system_counters(&SystemCountersConfig {
+                    interface: (!endpoint.trim().is_empty() && endpoint.trim() != "all")
+                        .then(|| endpoint.trim().to_string()),
+                    interval: Duration::from_secs(interval_secs.clamp(1, 10)),
+                    sample: "cli_system_counters".to_string(),
+                })?,
                 _ => unreachable!("clap restricts connector kind"),
             };
             if diagnose {
@@ -177,8 +277,67 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::PerfBudget {
+            baseline,
+            output,
+            artifacts,
+            threshold_percent,
+            update_baseline,
+            baseline_scale,
+        } => {
+            let measurements = run_perf_measurements(&artifacts)
+                .with_context(|| format!("performance run failed in {}", artifacts.display()))?;
+            if update_baseline {
+                let budget = build_perf_budget(&measurements, threshold_percent, baseline_scale);
+                save_perf_budget(&baseline, &budget).with_context(|| {
+                    format!(
+                        "failed to write performance baseline {}",
+                        baseline.display()
+                    )
+                })?;
+                let report = compare_perf_budget(measurements, &budget, threshold_percent);
+                ensure_budget_has_measurements(&report)?;
+                if let Some(output) = output {
+                    save_json(&output, &report).with_context(|| {
+                        format!("failed to write performance report {}", output.display())
+                    })?;
+                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let budget = load_perf_budget(&baseline).with_context(|| {
+                    format!("failed to read performance baseline {}", baseline.display())
+                })?;
+                let report = compare_perf_budget(measurements, &budget, threshold_percent);
+                ensure_budget_has_measurements(&report)?;
+                if let Some(output) = output {
+                    save_json(&output, &report).with_context(|| {
+                        format!("failed to write performance report {}", output.display())
+                    })?;
+                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.passed {
+                    anyhow::bail!(
+                        "performance budget failed for {} scenario(s)",
+                        report.failures.len()
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn native_pcap_source(endpoint: &str) -> NativePcapSource {
+    let trimmed = endpoint.trim();
+    if let Some(interface) = trimmed.strip_prefix("iface:") {
+        return NativePcapSource::Interface(interface.trim().to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_file() {
+        NativePcapSource::File(path)
+    } else {
+        NativePcapSource::Interface(trimmed.to_string())
+    }
 }
 
 fn run_whatif(
@@ -214,4 +373,109 @@ fn load_mapping(
 #[allow(dead_code)]
 fn _core_result<T>(value: CoreResult<T>) -> CoreResult<T> {
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netdiag_core::ingest::ingest_trace;
+    use netdiag_core::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME};
+    use netdiag_core::models::{HilState, ModelManifest};
+    use std::fs;
+    use std::io::Write;
+
+    fn sample(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../data/samples")
+            .join(format!("{name}.csv"))
+    }
+
+    fn path_str(path: &std::path::Path) -> &str {
+        path.to_str().expect("test path is utf-8")
+    }
+
+    #[test]
+    fn train_command_writes_model_and_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset_path = temp.path().join("training.jsonl");
+        let mut dataset = fs::File::create(&dataset_path).expect("create dataset");
+        for name in [
+            "normal",
+            "congestion",
+            "random_loss",
+            "dns_failure",
+            "tls_failure",
+            "udp_quic_blocked",
+        ] {
+            let ingest = ingest_trace(sample(name)).expect("sample ingest");
+            let row = serde_json::json!({
+                "label": name,
+                "records": ingest.records,
+            });
+            writeln!(dataset, "{row}").expect("write training row");
+        }
+
+        let model_dir = temp.path().join("model");
+        let args = Args::parse_from([
+            "netdiag",
+            "train",
+            "--dataset",
+            path_str(&dataset_path),
+            "--model-dir",
+            path_str(&model_dir),
+        ]);
+        run(args).expect("train command");
+
+        assert!(model_dir.join(MODEL_FILE_NAME).exists());
+        let manifest: ModelManifest = serde_json::from_slice(
+            &fs::read(model_dir.join(MODEL_MANIFEST_FILE_NAME)).expect("manifest"),
+        )
+        .expect("manifest json");
+        assert!(!manifest.synthetic_fallback);
+        assert_eq!(manifest.training_examples, 6);
+    }
+
+    #[test]
+    fn feedback_export_command_writes_training_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let result = diagnose_file(
+            sample("congestion"),
+            temp.path(),
+            Some(("line", "reroute_path_b")),
+        )
+        .expect("diagnose");
+        let recommendation_id = result.recommendations[0].recommendation_id.clone();
+        review_recommendation(
+            temp.path(),
+            &result.run_id,
+            &recommendation_id,
+            HilState::Accepted,
+            "accepted for supervised training",
+            "cli-test",
+        )
+        .expect("review");
+
+        let output = temp.path().join("feedback.jsonl");
+        let args = Args::parse_from([
+            "netdiag",
+            "feedback",
+            "export",
+            "--artifacts",
+            path_str(temp.path()),
+            "--output",
+            path_str(&output),
+        ]);
+        run(args).expect("feedback export");
+
+        let body = fs::read_to_string(&output).expect("read jsonl");
+        let lines = body.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let row: serde_json::Value = serde_json::from_str(lines[0]).expect("row json");
+        assert_eq!(row["label"], row["final_label"]);
+        assert_eq!(row["source"], "hil_accepted");
+        assert_eq!(row["recommendation_id"], recommendation_id);
+        assert!(row["features"]["latency_mean"].is_number());
+        assert!(row["rule_labels"].is_array());
+        assert_eq!(row["feedback_state"], "accepted");
+    }
 }

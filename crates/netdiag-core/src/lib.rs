@@ -3,6 +3,7 @@ pub mod error;
 pub mod ingest;
 pub mod ml;
 pub mod models;
+pub mod perf_budget;
 pub mod pipeline;
 pub mod recommendation;
 pub mod report;

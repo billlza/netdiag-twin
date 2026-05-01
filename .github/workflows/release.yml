@@ -283,6 +283,21 @@ jobs:
           files: |
             target/release/NetDiag-Twin-*.dmg
             target/release/appcast.xml
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/pages
+      - name: Deploy appcast to Pages
+        uses: actions/deploy-pages@v4
+      - name: Validate published appcast
+        run: |
+          set -euo pipefail
+          appcast_url="https://billlza.github.io/netdiag-twin/appcast.xml"
+          dmg_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${RELEASE_DMG_FILENAME}"
+          curl -fsSL --retry 5 --retry-delay 3 "$appcast_url" -o "$RUNNER_TEMP/appcast.xml"
+          grep -F "$RELEASE_VERSION" "$RUNNER_TEMP/appcast.xml" >/dev/null
+          grep -F "$dmg_url" "$RUNNER_TEMP/appcast.xml" >/dev/null
+          curl -fsIL --retry 5 --retry-delay 3 "$dmg_url" >/dev/null
       - name: Checkout Homebrew tap
         uses: actions/checkout@v4
         with:
@@ -340,9 +355,3 @@ jobs:
           if [[ "$tap_changed" == "1" ]]; then
             git -C "$tap_dir_abs" push origin "HEAD:$tap_branch"
           fi
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: target/pages
-      - name: Deploy appcast to Pages
-        uses: actions/deploy-pages@v4

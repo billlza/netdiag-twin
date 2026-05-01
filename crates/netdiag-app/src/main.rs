@@ -3,7 +3,9 @@ use eframe::egui::{
     Sense, Stroke, UiBuilder, Vec2,
 };
 use egui_remixicon::icons;
-use netdiag_app::data_source::{SimScenario, SourceMode, SourceSnapshot};
+use netdiag_app::data_source::{
+    FlowSummary, SimScenario, SourceDescriptor, SourceMode, SourceSnapshot,
+};
 use netdiag_app::layout::{
     HEADER_ACTION_HEIGHT, HEADER_ACTION_WIDTH, OVERVIEW_MIN_CONTENT_HEIGHT, SUMMARY_CARD_HEIGHT,
     overview_content_height, summary_card_rects,
@@ -17,7 +19,9 @@ use netdiag_app::settings::{
     self, AppSettings, ConnectorKind, DefaultSource, LanguageSetting, SettingsStore, StartupTab,
 };
 use netdiag_app::trend::{LatencyMetric, TrendRange, latency_trend_points};
+use netdiag_app::updater::{UpdateCheckOutcome, sparkle_check_for_updates, sparkle_status};
 use netdiag_app::view_model::{DashboardViewModel, format_bytes};
+use netdiag_core::connectors::{ConnectorLoadResult, OtlpGrpcReceiverConfig, OtlpReceiverSession};
 use netdiag_core::ml::load_or_train_model;
 use netdiag_core::models::{
     FaultLabel, HilReviewSummary, HilState, MetricQuality, RunManifest, TopologyModel,
@@ -217,6 +221,8 @@ enum Text {
     OpenReport,
     CheckForUpdates,
     UpdateStatus,
+    UpdateDialogOpened,
+    UpdateFeedReachable,
     OpenRunFolder,
     ArtifactFiles,
     ValidationWarnings,
@@ -250,6 +256,10 @@ enum Text {
     CaptureSource,
     PacketLimit,
     CaptureTimeout,
+    CaptureSession,
+    StartReceiver,
+    StopReceiver,
+    DiagnoseBuffer,
     SystemInterface,
     SamplingInterval,
     HttpJsonConnectorHint,
@@ -300,6 +310,8 @@ struct NetDiagApp {
     settings_notice: Option<String>,
     api_test_status: Option<String>,
     api_test_job: Option<ApiTestJob>,
+    otlp_session: Option<OtlpReceiverSession>,
+    otlp_session_status: Option<String>,
     pending_delete_token: bool,
     pending_clear_runs: bool,
     pending_rebuild_model: bool,
@@ -380,6 +392,8 @@ impl NetDiagApp {
             settings_notice: startup_warning.clone(),
             api_test_status: None,
             api_test_job: None,
+            otlp_session: None,
+            otlp_session_status: None,
             pending_delete_token: false,
             pending_clear_runs: false,
             pending_rebuild_model: false,
@@ -448,6 +462,107 @@ impl NetDiagApp {
         let result =
             diagnose_ingest_with_whatif(source_snapshot.ingest.clone(), &artifacts_root, request)?;
         Ok((result, source_snapshot))
+    }
+
+    fn start_diagnosis_from_snapshot(&mut self, source_snapshot: SourceSnapshot) {
+        if self.diagnosis_job.is_some() {
+            self.settings_notice =
+                Some(tr(self.language, Text::AnalysisAlreadyRunning).to_string());
+            return;
+        }
+        let artifacts_root = self.artifacts_root.clone();
+        let what_if = self.current_what_if_request();
+        let action = self.action.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.status = "Running".to_string();
+        self.error = None;
+        self.diagnosis_restore_startup_warning = false;
+        self.diagnosis_job = Some(receiver);
+        thread::spawn(move || {
+            let request = what_if.or_else(|| WhatIfRequest::built_in("line", action.as_str()).ok());
+            let result = diagnose_ingest_with_whatif(
+                source_snapshot.ingest.clone(),
+                &artifacts_root,
+                request,
+            )
+            .map_err(anyhow::Error::from)
+            .map(|result| (result, source_snapshot));
+            let _ = sender.send(result);
+        });
+    }
+
+    fn current_otlp_receiver_config(&self) -> anyhow::Result<OtlpGrpcReceiverConfig> {
+        let profile = self
+            .settings
+            .data_connectors
+            .active_profile()
+            .ok_or_else(|| anyhow::anyhow!("no active source profile"))?;
+        if profile.kind != ConnectorKind::OtlpGrpcReceiver {
+            anyhow::bail!("active source profile is not OTLP gRPC");
+        }
+        Ok(OtlpGrpcReceiverConfig {
+            bind_addr: profile.otlp_grpc.bind_addr.clone(),
+            timeout: Duration::from_secs(profile.otlp_grpc.timeout_secs.max(1)),
+            metrics: profile.otlp_grpc.mapping.clone(),
+            sample: "otlp_grpc_session".to_string(),
+        })
+    }
+
+    fn start_otlp_receiver(&mut self) {
+        if self.otlp_session.is_some() {
+            return;
+        }
+        match self.current_otlp_receiver_config().and_then(|config| {
+            let bind_addr = config.bind_addr.clone();
+            OtlpReceiverSession::start(&config)
+                .map(|session| (session, format!("Listening on {bind_addr}")))
+                .map_err(anyhow::Error::from)
+        }) {
+            Ok((session, status)) => {
+                self.otlp_session = Some(session);
+                self.otlp_session_status = Some(status);
+            }
+            Err(err) => {
+                self.otlp_session_status = Some(err.to_string());
+            }
+        }
+    }
+
+    fn stop_otlp_receiver(&mut self) {
+        let Some(session) = self.otlp_session.take() else {
+            return;
+        };
+        match session.stop() {
+            Ok(()) => self.otlp_session_status = Some("Receiver stopped".to_string()),
+            Err(err) => self.otlp_session_status = Some(err.to_string()),
+        }
+    }
+
+    fn diagnose_otlp_buffer(&mut self) {
+        let Some(session) = &self.otlp_session else {
+            self.otlp_session_status = Some("Receiver is not running".to_string());
+            return;
+        };
+        let lookback = self
+            .settings
+            .data_connectors
+            .active_profile()
+            .filter(|profile| profile.kind == ConnectorKind::OtlpGrpcReceiver)
+            .map(|profile| Duration::from_secs(profile.otlp_grpc.timeout_secs.max(1)))
+            .unwrap_or_else(|| Duration::from_secs(20));
+        match session.snapshot(lookback) {
+            Ok(loaded) => {
+                let source_snapshot = source_snapshot_from_otlp_session(loaded);
+                self.otlp_session_status = Some(format!(
+                    "Buffered rows: {}",
+                    source_snapshot.ingest.records.len()
+                ));
+                self.start_diagnosis_from_snapshot(source_snapshot);
+            }
+            Err(err) => {
+                self.otlp_session_status = Some(err.to_string());
+            }
+        }
     }
 
     fn current_what_if_request(&self) -> Option<WhatIfRequest> {
@@ -1814,6 +1929,10 @@ impl NetDiagApp {
         if ui.add_enabled(!testing, test_button).clicked() {
             self.start_api_test_connection();
         }
+        if active_kind == ConnectorKind::OtlpGrpcReceiver {
+            ui.add_space(8.0);
+            self.render_otlp_capture_session_controls(ui);
+        }
         ui.add_space(10.0);
         self.render_connector_health_panel(ui);
         if changed {
@@ -1825,6 +1944,53 @@ impl NetDiagApp {
             if warning.is_some() {
                 self.settings_notice = warning;
             }
+        }
+    }
+
+    fn render_otlp_capture_session_controls(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, tr(self.language, Text::CaptureSession));
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            let running = self.otlp_session.is_some();
+            let start = egui::Button::new(
+                RichText::new(tr(self.language, Text::StartReceiver))
+                    .size(13.0)
+                    .color(INK),
+            )
+            .fill(Color32::from_white_alpha(130))
+            .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
+            .corner_radius(8);
+            if ui.add_enabled(!running, start).clicked() {
+                self.start_otlp_receiver();
+            }
+            let diagnose = egui::Button::new(
+                RichText::new(tr(self.language, Text::DiagnoseBuffer))
+                    .size(13.0)
+                    .color(INK),
+            )
+            .fill(Color32::from_white_alpha(130))
+            .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
+            .corner_radius(8);
+            if ui
+                .add_enabled(running && self.diagnosis_job.is_none(), diagnose)
+                .clicked()
+            {
+                self.diagnose_otlp_buffer();
+            }
+            let stop = egui::Button::new(
+                RichText::new(tr(self.language, Text::StopReceiver))
+                    .size(13.0)
+                    .color(INK),
+            )
+            .fill(Color32::from_white_alpha(130))
+            .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
+            .corner_radius(8);
+            if ui.add_enabled(running, stop).clicked() {
+                self.stop_otlp_receiver();
+            }
+        });
+        if let Some(status) = &self.otlp_session_status {
+            ui.label(RichText::new(status).size(12.0).color(MUTED));
         }
     }
 
@@ -2103,8 +2269,15 @@ impl NetDiagApp {
 
     fn check_for_updates(&mut self) {
         match sparkle_check_for_updates() {
-            Ok(()) => {
-                self.settings_notice = Some(tr(self.language, Text::CheckForUpdates).to_string());
+            Ok(UpdateCheckOutcome::NativeDialogOpened) => {
+                self.settings_notice =
+                    Some(tr(self.language, Text::UpdateDialogOpened).to_string());
+            }
+            Ok(UpdateCheckOutcome::FeedReachable { feed_url }) => {
+                self.settings_notice = Some(format!(
+                    "{}: {feed_url}",
+                    tr(self.language, Text::UpdateFeedReachable)
+                ));
             }
             Err(err) => {
                 self.settings_notice = Some(err);
@@ -3066,6 +3239,29 @@ fn connector_source_mode_from_profile(
     }
 }
 
+fn source_snapshot_from_otlp_session(loaded: ConnectorLoadResult) -> SourceSnapshot {
+    let rows = loaded.ingest.records.len();
+    SourceSnapshot {
+        descriptor: SourceDescriptor {
+            name: loaded.sample,
+            kind: "OTLP gRPC Session".to_string(),
+            captured_label: format!("Buffered  •  {}", chrono::Utc::now().format("%H:%M")),
+            data_source_label: loaded
+                .provenance
+                .get("bind_addr")
+                .cloned()
+                .unwrap_or_else(|| "OTLP receiver".to_string()),
+        },
+        flow_summary: FlowSummary {
+            protocol: Some("OTLP".to_string()),
+            flows: Some(rows),
+            total_bytes: None,
+            top_talkers: Vec::new(),
+        },
+        ingest: loaded.ingest,
+    }
+}
+
 fn tr(lang: Language, text: Text) -> &'static str {
     match (lang, text) {
         (Language::Zh, Text::Subtitle) => "实时网络诊断与分析",
@@ -3179,6 +3375,8 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::OpenReport) => "打开报告",
         (Language::Zh, Text::CheckForUpdates) => "检查更新",
         (Language::Zh, Text::UpdateStatus) => "更新状态",
+        (Language::Zh, Text::UpdateDialogOpened) => "更新窗口已打开",
+        (Language::Zh, Text::UpdateFeedReachable) => "更新源可访问",
         (Language::Zh, Text::OpenRunFolder) => "打开运行目录",
         (Language::Zh, Text::ArtifactFiles) => "产物文件",
         (Language::Zh, Text::ValidationWarnings) => "校验警告",
@@ -3212,6 +3410,10 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::CaptureSource) => "抓包来源",
         (Language::Zh, Text::PacketLimit) => "包数上限",
         (Language::Zh, Text::CaptureTimeout) => "抓包超时",
+        (Language::Zh, Text::CaptureSession) => "采集会话",
+        (Language::Zh, Text::StartReceiver) => "启动接收器",
+        (Language::Zh, Text::StopReceiver) => "停止接收器",
+        (Language::Zh, Text::DiagnoseBuffer) => "诊断缓冲区",
         (Language::Zh, Text::SystemInterface) => "接口",
         (Language::Zh, Text::SamplingInterval) => "采样间隔",
         (Language::Zh, Text::HttpJsonConnectorHint) => {
@@ -3349,6 +3551,8 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::OpenReport) => "Open Report",
         (Language::En, Text::CheckForUpdates) => "Check for Updates",
         (Language::En, Text::UpdateStatus) => "Update Status",
+        (Language::En, Text::UpdateDialogOpened) => "Update window opened",
+        (Language::En, Text::UpdateFeedReachable) => "Update feed reachable",
         (Language::En, Text::OpenRunFolder) => "Open Run Folder",
         (Language::En, Text::ArtifactFiles) => "Artifact Files",
         (Language::En, Text::ValidationWarnings) => "Validation Warnings",
@@ -3382,6 +3586,10 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::CaptureSource) => "Capture Source",
         (Language::En, Text::PacketLimit) => "Packet Limit",
         (Language::En, Text::CaptureTimeout) => "Capture Timeout",
+        (Language::En, Text::CaptureSession) => "Capture Session",
+        (Language::En, Text::StartReceiver) => "Start Receiver",
+        (Language::En, Text::StopReceiver) => "Stop Receiver",
+        (Language::En, Text::DiagnoseBuffer) => "Diagnose Buffer",
         (Language::En, Text::SystemInterface) => "Interface",
         (Language::En, Text::SamplingInterval) => "Sampling Interval",
         (Language::En, Text::HttpJsonConnectorHint) => {
@@ -3474,87 +3682,6 @@ fn action_display(key: &str) -> String {
 
 fn open_path(path: &Path) -> std::io::Result<()> {
     Command::new("open").arg(path).spawn().map(|_| ())
-}
-
-fn sparkle_status() -> &'static str {
-    if sparkle_available() {
-        "Sparkle ready"
-    } else {
-        "Sparkle framework not embedded"
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn sparkle_available() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.ancestors()
-                .find(|ancestor| {
-                    ancestor
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
-                })
-                .map(|app| app.join("Contents/Frameworks/Sparkle.framework"))
-        })
-        .is_some_and(|path| path.exists())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn sparkle_available() -> bool {
-    false
-}
-
-fn sparkle_check_for_updates() -> Result<(), String> {
-    if !sparkle_available() {
-        return Err("Sparkle.framework is not embedded in this build".to_string());
-    }
-    let feed_url = sparkle_feed_url()
-        .unwrap_or_else(|| "https://billlza.github.io/netdiag-twin/appcast.xml".to_string());
-    let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|err| format!("failed to create update client: {err}"))?
-        .get(&feed_url)
-        .send()
-        .map_err(|err| format!("failed to reach update feed: {err}"))?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "update feed is not reachable: {} ({feed_url})",
-            response.status()
-        ))
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn sparkle_feed_url() -> Option<String> {
-    let info_plist = std::env::current_exe().ok().and_then(|path| {
-        path.ancestors()
-            .find(|ancestor| {
-                ancestor
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
-            })
-            .map(|app| app.join("Contents/Info.plist"))
-    })?;
-    let output = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :SUFeedURL"])
-        .arg(info_plist)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn sparkle_feed_url() -> Option<String> {
-    None
 }
 
 fn manifest_artifacts(run_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {

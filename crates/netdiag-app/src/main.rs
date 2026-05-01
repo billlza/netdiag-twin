@@ -308,6 +308,7 @@ struct NetDiagApp {
     probe_targets_text: String,
     hil_notes: BTreeMap<String, String>,
     settings_notice: Option<String>,
+    update_notice: Option<String>,
     api_test_status: Option<String>,
     api_test_job: Option<ApiTestJob>,
     otlp_session: Option<OtlpReceiverSession>,
@@ -390,6 +391,7 @@ impl NetDiagApp {
                 .unwrap_or_else(|| settings.data_connectors.website_probe.targets.join("\n")),
             hil_notes: BTreeMap::new(),
             settings_notice: startup_warning.clone(),
+            update_notice: None,
             api_test_status: None,
             api_test_job: None,
             otlp_session: None,
@@ -2270,16 +2272,22 @@ impl NetDiagApp {
     fn check_for_updates(&mut self) {
         match sparkle_check_for_updates() {
             Ok(UpdateCheckOutcome::NativeDialogOpened) => {
-                self.settings_notice =
-                    Some(tr(self.language, Text::UpdateDialogOpened).to_string());
+                let message = tr(self.language, Text::UpdateDialogOpened).to_string();
+                self.update_notice = Some(message.clone());
+                self.settings_notice = Some(message);
+                self.error = None;
             }
             Ok(UpdateCheckOutcome::FeedReachable { feed_url }) => {
-                self.settings_notice = Some(format!(
+                let message = format!(
                     "{}: {feed_url}",
                     tr(self.language, Text::UpdateFeedReachable)
-                ));
+                );
+                self.update_notice = Some(message.clone());
+                self.settings_notice = Some(message);
+                self.error = None;
             }
             Err(err) => {
+                self.update_notice = Some(err.clone());
                 self.settings_notice = Some(err);
             }
         }
@@ -2483,6 +2491,10 @@ impl NetDiagApp {
                 if let Some(error) = &self.error {
                     ui.add_space(4.0);
                     ui.label(RichText::new(error).size(12.0).color(RED));
+                }
+                if let Some(notice) = &self.update_notice {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(notice).size(12.0).color(BLUE));
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

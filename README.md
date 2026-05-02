@@ -2,7 +2,7 @@
 
 ## Rust-native telemetry diagnosis and digital-twin validation
 
-NetDiag Twin is now a pure Rust desktop application and CLI for telemetry-driven network diagnosis. It compares evidence-first rules with Rust ML inference, runs graph-backed what-if validation over a digital twin topology, and writes reproducible run artifacts for human review.
+NetDiag Twin is now a pure Rust desktop application and CLI for telemetry-driven network diagnosis. It compares evidence-first rules with Rust ML inference, runs graph-backed what-if validation over a digital twin topology, and writes reproducible run artifacts for human review and run-to-run comparison.
 
 ## Product Flow
 
@@ -11,7 +11,7 @@ NetDiag Twin is now a pure Rust desktop application and CLI for telemetry-driven
 3. Diagnosis Result
 4. Rule vs ML Comparison
 5. Digital Twin / Topology View
-6. Recommendation Report
+6. Run Center / Recommendation Report
 
 ## Rust Workspace
 
@@ -93,9 +93,9 @@ The desktop app supports three data source families:
 
 - `Simulate`: deterministic fault scenarios generated in Rust and diagnosed through the real core pipeline.
 - `Import Trace`: local CSV/JSON files using canonical trace ingest.
-- `Live collection`: source profiles for local host probes, website/Cloudflare-style probes, HTTP/JSON lab adapters, Prometheus `query_range`, and Prometheus `/metrics` exposition. Tokens use macOS Keychain with environment-variable fallback.
+- `Live collection`: source profiles for Local Probe, Website Probe, HTTP/JSON lab adapters, Prometheus `query_range`, Prometheus `/metrics` exposition, OTLP gRPC receiver, Rust-native pcap capture/import, and macOS system counters. Tokens use macOS Keychain with environment-variable fallback.
 
-See [docs/api-source.md](docs/api-source.md) for the connector and HTTP/JSON lab adapter contract.
+See [docs/api-source.md](docs/api-source.md) for the connector overview and HTTP/JSON lab adapter contract, and [docs/getting-started.md](docs/getting-started.md) for OTLP, native pcap, system counters, artifacts, and HIL review examples.
 
 Run a batch diagnosis:
 
@@ -109,6 +109,9 @@ Run a connector smoke without opening the GUI:
 cargo run -p netdiag-cli -- collect --kind prometheus-metrics --endpoint http://127.0.0.1:9100/metrics
 cargo run -p netdiag-cli -- collect --kind prometheus-query --endpoint http://127.0.0.1:9090 --diagnose
 cargo run -p netdiag-cli -- collect --kind http-json --endpoint https://example.internal/netdiag/trace
+cargo run -p netdiag-cli -- collect --kind otlp-grpc --endpoint 127.0.0.1:4317 --timeout-secs 20
+cargo run -p netdiag-cli -- collect --kind native-pcap --endpoint ./fixtures/retransmission.pcap --diagnose
+cargo run -p netdiag-cli -- collect --kind system-counters --endpoint all --interval-secs 1
 ```
 
 Run a what-if action against an existing run:
@@ -121,6 +124,14 @@ Export a saved report:
 
 ```bash
 cargo run -p netdiag-cli -- export <run_id>
+```
+
+List recent runs, inspect artifacts, and compare two incidents:
+
+```bash
+cargo run -p netdiag-cli -- history --artifacts artifacts --limit 20
+cargo run -p netdiag-cli -- artifacts <run_id> --artifacts artifacts
+cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts artifacts
 ```
 
 Review a recommendation and persist HIL state:

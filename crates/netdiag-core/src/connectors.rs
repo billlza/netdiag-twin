@@ -1,6 +1,9 @@
 use crate::error::{NetdiagError, Result};
-use crate::ingest::{CANONICAL_COLUMNS, build_ingest_result, measured_metric_provenance};
-use crate::models::{IngestResult, IngestWarning, MetricProvenance, MetricQuality, TraceRecord};
+use crate::ingest::{
+    CANONICAL_COLUMNS, build_ingest_result, finalize_warning_metric_provenance,
+    measured_metric_provenance, set_metric_provenance,
+};
+use crate::models::{IngestResult, IngestWarning, MetricQuality, TraceRecord};
 use chrono::{DateTime, TimeZone, Utc};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use opentelemetry_proto::tonic as otlp;
@@ -354,48 +357,7 @@ pub fn default_prometheus_mapping() -> BTreeMap<String, String> {
 
 fn replace_metric_provenance(ingest: &mut IngestResult, source: &str) {
     ingest.metric_provenance = measured_metric_provenance(source);
-    mark_warning_backed_metrics(ingest, source);
-}
-
-fn mark_warning_backed_metrics(ingest: &mut IngestResult, source: &str) {
-    let warnings = ingest.warnings.clone();
-    for warning in warnings {
-        set_metric_provenance(
-            ingest,
-            &warning.column,
-            MetricQuality::Fallback,
-            source,
-            &warning.reason,
-        );
-    }
-}
-
-fn set_metric_provenance(
-    ingest: &mut IngestResult,
-    field: &str,
-    quality: MetricQuality,
-    source: &str,
-    reason: &str,
-) {
-    if field == "timestamp" {
-        return;
-    }
-    if let Some(item) = ingest
-        .metric_provenance
-        .iter_mut()
-        .find(|item| item.field == field)
-    {
-        item.quality = quality;
-        item.source = source.to_string();
-        item.reason = reason.to_string();
-        return;
-    }
-    ingest.metric_provenance.push(MetricProvenance {
-        field: field.to_string(),
-        quality,
-        source: source.to_string(),
-        reason: reason.to_string(),
-    });
+    finalize_warning_metric_provenance(ingest, source);
 }
 
 pub fn load_http_json(config: &HttpJsonConfig) -> Result<ConnectorLoadResult> {
@@ -818,6 +780,15 @@ pub fn load_system_counters_with_control(
         "finishing",
         "building counter sample",
     );
+    system_counter_delta_to_result(delta, interval, Utc::now(), config)
+}
+
+fn system_counter_delta_to_result(
+    delta: CounterDelta,
+    interval: Duration,
+    timestamp: DateTime<Utc>,
+    config: &SystemCountersConfig,
+) -> Result<ConnectorLoadResult> {
     let interval_s = interval.as_secs_f64().max(1e-6);
     let throughput_mbps = (delta.bytes as f64 * 8.0) / interval_s / 1_000_000.0;
     let total_packets = delta.packets + delta.errors;
@@ -826,7 +797,6 @@ pub fn load_system_counters_with_control(
     } else {
         0.0
     };
-    let timestamp = Utc::now();
     let mut ingest = build_ingest_result(
         vec![TraceRecord {
             timestamp,
@@ -1567,8 +1537,10 @@ struct PrometheusSeries {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::Path;
     use std::thread;
 
     #[test]
@@ -1728,6 +1700,28 @@ netdiag_throughput_mbps 99
     }
 
     #[test]
+    fn otlp_metrics_use_latest_numeric_sum_point() {
+        let early = 1_777_000_000_000_000_000;
+        let late = early + 1_000_000;
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![otlp::metrics::v1::ResourceMetrics {
+                scope_metrics: vec![otlp::metrics::v1::ScopeMetrics {
+                    metrics: vec![otlp_sum_metric("netdiag_latency_ms", 40, early, 42, late)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let (values, timestamp_ms) =
+            parse_otlp_metrics_request(&request, &default_prometheus_mapping())
+                .expect("otlp values");
+
+        assert_eq!(values["latency_ms"], 42.0);
+        assert_eq!(timestamp_ms, (late / 1_000_000) as i64);
+    }
+
+    #[test]
     fn native_pcap_stats_keep_observed_values_and_warn_on_missing_fields() {
         let mut stats = PacketStats {
             packet_count: 4,
@@ -1766,6 +1760,34 @@ netdiag_throughput_mbps 99
                 .and_then(Value::as_u64),
             Some(4_000)
         );
+    }
+
+    #[test]
+    fn native_pcap_file_fixture_runs_full_loader() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("tcp_retransmission.pcap");
+        let tcp = ethernet_ipv4_tcp_packet(443, 51_515, 7, b"payload");
+        write_pcap_fixture(&path, &[tcp.clone(), tcp]).expect("pcap fixture");
+
+        let loaded = load_native_pcap(&NativePcapConfig {
+            source: NativePcapSource::File(path),
+            timeout: Duration::from_secs(1),
+            packet_limit: 32,
+            sample: "pcap_file_fixture".to_string(),
+        })
+        .expect("pcap file load");
+
+        assert_eq!(loaded.ingest.records.len(), 1);
+        assert_eq!(loaded.ingest.records[0].retransmission_rate, 50.0);
+        assert_eq!(
+            quality(&loaded.ingest, "throughput_mbps"),
+            MetricQuality::Measured
+        );
+        assert_eq!(
+            quality(&loaded.ingest, "quic_blocked_ratio"),
+            MetricQuality::Fallback
+        );
+        assert_eq!(loaded.provenance["kind"], "native_pcap");
     }
 
     #[test]
@@ -1978,6 +2000,37 @@ netdiag_throughput_mbps 99
     }
 
     #[test]
+    fn system_counter_delta_to_result_marks_quality_without_netstat() {
+        let loaded = system_counter_delta_to_result(
+            CounterDelta {
+                bytes: 2_000_000,
+                packets: 95,
+                errors: 5,
+            },
+            Duration::from_secs(2),
+            Utc::now(),
+            &SystemCountersConfig {
+                interface: Some("en0".to_string()),
+                interval: Duration::from_secs(2),
+                sample: "counter_fixture".to_string(),
+            },
+        )
+        .expect("counter result");
+
+        assert_eq!(loaded.ingest.records[0].throughput_mbps, 8.0);
+        assert_eq!(loaded.ingest.records[0].packet_loss_rate, 5.0);
+        assert_eq!(
+            quality(&loaded.ingest, "throughput_mbps"),
+            MetricQuality::Measured
+        );
+        assert_eq!(
+            quality(&loaded.ingest, "retransmission_rate"),
+            MetricQuality::Fallback
+        );
+        assert_eq!(loaded.provenance["interface"], "en0");
+    }
+
+    #[test]
     fn capture_control_reports_progress_and_cancels_before_work() {
         let cancel = Arc::new(AtomicBool::new(false));
         let observed = Arc::new(Mutex::new(Vec::<CaptureProgress>::new()));
@@ -2055,5 +2108,61 @@ netdiag_throughput_mbps 99
             })),
             ..Default::default()
         }
+    }
+
+    fn otlp_sum_metric(
+        name: &str,
+        early_value: i64,
+        early_timestamp: u64,
+        late_value: i64,
+        late_timestamp: u64,
+    ) -> Metric {
+        Metric {
+            name: name.to_string(),
+            data: Some(metric::Data::Sum(otlp::metrics::v1::Sum {
+                data_points: vec![
+                    otlp::metrics::v1::NumberDataPoint {
+                        time_unix_nano: early_timestamp,
+                        value: Some(number_data_point::Value::AsInt(early_value)),
+                        ..Default::default()
+                    },
+                    otlp::metrics::v1::NumberDataPoint {
+                        time_unix_nano: late_timestamp,
+                        value: Some(number_data_point::Value::AsInt(late_value)),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn quality(ingest: &IngestResult, field: &str) -> MetricQuality {
+        ingest
+            .metric_provenance
+            .iter()
+            .find(|item| item.field == field)
+            .map(|item| item.quality)
+            .expect("metric quality")
+    }
+
+    fn write_pcap_fixture(path: &Path, packets: &[Vec<u8>]) -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        file.write_all(&0xa1b2c3d4_u32.to_le_bytes())?;
+        file.write_all(&2_u16.to_le_bytes())?;
+        file.write_all(&4_u16.to_le_bytes())?;
+        file.write_all(&0_i32.to_le_bytes())?;
+        file.write_all(&0_u32.to_le_bytes())?;
+        file.write_all(&65_535_u32.to_le_bytes())?;
+        file.write_all(&1_u32.to_le_bytes())?;
+        for (idx, packet) in packets.iter().enumerate() {
+            file.write_all(&1_777_000_000_u32.to_le_bytes())?;
+            file.write_all(&((idx as u32) * 1_000).to_le_bytes())?;
+            file.write_all(&(packet.len() as u32).to_le_bytes())?;
+            file.write_all(&(packet.len() as u32).to_le_bytes())?;
+            file.write_all(packet)?;
+        }
+        Ok(())
     }
 }

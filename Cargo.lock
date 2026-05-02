@@ -3605,7 +3605,7 @@ dependencies = [
 
 [[package]]
 name = "netdiag-app"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3628,7 +3628,7 @@ dependencies = [
 
 [[package]]
 name = "netdiag-cli"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "netdiag-core"
-version = "0.2.6"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "csv",
@@ -3659,6 +3659,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

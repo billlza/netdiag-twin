@@ -137,6 +137,47 @@ pub fn measured_metric_provenance(source: &str) -> Vec<MetricProvenance> {
         .collect()
 }
 
+pub fn finalize_warning_metric_provenance(ingest: &mut IngestResult, source: &str) {
+    let warnings = ingest.warnings.clone();
+    for warning in warnings {
+        set_metric_provenance(
+            ingest,
+            &warning.column,
+            MetricQuality::Fallback,
+            source,
+            &warning.reason,
+        );
+    }
+}
+
+pub fn set_metric_provenance(
+    ingest: &mut IngestResult,
+    field: &str,
+    quality: MetricQuality,
+    source: &str,
+    reason: &str,
+) {
+    if field == "timestamp" {
+        return;
+    }
+    if let Some(item) = ingest
+        .metric_provenance
+        .iter_mut()
+        .find(|item| item.field == field)
+    {
+        item.quality = quality;
+        item.source = source.to_string();
+        item.reason = reason.to_string();
+        return;
+    }
+    ingest.metric_provenance.push(MetricProvenance {
+        field: field.to_string(),
+        quality,
+        source: source.to_string(),
+        reason: reason.to_string(),
+    });
+}
+
 fn load_csv(path: &Path) -> Result<RawTrace> {
     let file = File::open(path).with_path(path)?;
     let mut reader = csv::ReaderBuilder::new()
@@ -257,6 +298,7 @@ fn normalize(mut raw_trace: RawTrace, sample: String) -> Result<IngestResult> {
 
     let mut ingest = build_ingest_result(records, sample)?;
     ingest.warnings = raw_trace.warnings;
+    finalize_warning_metric_provenance(&mut ingest, "ingest");
     Ok(ingest)
 }
 
@@ -381,4 +423,51 @@ fn validate_finite_non_negative(row: usize, column: &str, value: f64) -> Result<
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn metric_quality(ingest: &IngestResult, field: &str) -> Option<MetricQuality> {
+        ingest
+            .metric_provenance
+            .iter()
+            .find(|item| item.field == field)
+            .map(|item| item.quality)
+    }
+
+    #[test]
+    fn ingest_missing_optional_events_are_marked_fallback_provenance() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("minimal.csv");
+        let mut file = File::create(&path).expect("csv");
+        writeln!(
+            file,
+            "timestamp,latency_ms,jitter_ms,packet_loss_rate,retransmission_rate,throughput_mbps"
+        )
+        .expect("header");
+        writeln!(file, "2026-05-02T00:00:00Z,10,1,0,0,100").expect("row");
+
+        let ingest = ingest_trace(&path).expect("ingest");
+
+        assert_eq!(ingest.warnings.len(), EVENT_COLUMNS.len());
+        assert_eq!(
+            metric_quality(&ingest, "timeout_events"),
+            Some(MetricQuality::Fallback)
+        );
+        assert_eq!(
+            metric_quality(&ingest, "dns_failure_events"),
+            Some(MetricQuality::Fallback)
+        );
+        assert_eq!(
+            metric_quality(&ingest, "quic_blocked_ratio"),
+            Some(MetricQuality::Fallback)
+        );
+        assert_eq!(
+            metric_quality(&ingest, "latency_ms"),
+            Some(MetricQuality::Measured)
+        );
+    }
 }

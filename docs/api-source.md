@@ -17,6 +17,15 @@ The desktop app now treats live collection as a connector family:
   `/api/v1/query_range` and maps them into canonical `TraceRecord` fields.
 - `Prometheus /metrics`: scrapes Prometheus text exposition and maps metric
   names into a single canonical `TraceRecord` sample.
+- `OTLP gRPC`: starts a local Metrics receiver and converts pushed metric
+  exports into canonical records.
+- `Native pcap`: reads `.pcap` files or captures a live interface with
+  Rust-native packet parsing.
+- `System counters`: samples macOS interface counters and records byte/error
+  deltas with explicit measurement-quality provenance.
+
+For OTLP, native pcap, and system counter examples, see
+[getting-started.md](getting-started.md#otlp-grpc).
 
 ## Settings And Environment
 

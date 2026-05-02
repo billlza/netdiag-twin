@@ -1,8 +1,8 @@
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{
-    FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, MetricProvenance, MetricQuality,
-    MlResult, ModelEvaluation, ModelManifest, Prediction, Recommendation, RecommendationKind,
-    TelemetryWindow, TraceRecord,
+    FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, LabelMetrics, MetricProvenance,
+    MetricQuality, MlResult, ModelEvaluation, ModelManifest, ModelTrainingConfig, Prediction,
+    Recommendation, RecommendationKind, TelemetryWindow, TraceRecord,
 };
 use crate::report::Report;
 use crate::storage::{read_json, save_json_atomic};
@@ -16,9 +16,10 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const MODEL_FILE_NAME: &str = "rust_logistic_model.json";
@@ -54,6 +55,23 @@ pub struct RustMlModel {
     pub stds: Vec<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TrainingOptions {
+    pub validation_split: f64,
+    pub shuffle_seed: Option<u64>,
+    pub stratified: bool,
+}
+
+impl Default for TrainingOptions {
+    fn default() -> Self {
+        Self {
+            validation_split: 0.0,
+            shuffle_seed: None,
+            stratified: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedbackTrainingRow {
     pub label: FaultLabel,
@@ -75,6 +93,7 @@ pub struct FeedbackExportSummary {
     pub output: String,
     pub rows: usize,
     pub skipped_runs: usize,
+    pub dataset_hash_sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,7 +250,7 @@ fn feature_metric(feature: &str) -> &'static str {
         "throughput" => "throughput_mbps",
         "dns_events" => "dns_failure_events",
         "tls_events" => "tls_failure_events",
-        "quic_blocked" => "quic_blocked_ratio",
+        "quic" => "quic_blocked_ratio",
         _ => "unknown",
     }
 }
@@ -245,7 +264,15 @@ pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
         let reader = BufReader::new(file);
         if let Ok(model) = serde_json::from_reader::<_, RustMlModel>(reader) {
             if !manifest_path.exists() {
-                let manifest = build_model_manifest("cached_existing_model", 0, false, &model);
+                let manifest = build_model_manifest(
+                    "cached_existing_model",
+                    0,
+                    BTreeMap::new(),
+                    false,
+                    &model,
+                    None,
+                    None,
+                );
                 save_json_atomic(&manifest_path, &manifest)?;
             }
             return Ok(model);
@@ -254,7 +281,19 @@ pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
 
     std::fs::create_dir_all(model_dir).with_path(model_dir)?;
     let model = train_default_model()?;
-    let manifest = build_model_manifest("synthetic_fallback", BASELINES.len() * 130, true, &model);
+    let manifest = build_model_manifest(
+        "synthetic_fallback",
+        BASELINES.len() * 130,
+        synthetic_label_distribution(130),
+        true,
+        &model,
+        None,
+        Some(ModelTrainingConfig {
+            validation_split: 0.0,
+            shuffle_seed: Some(2026),
+            stratified: false,
+        }),
+    );
     write_model_bundle(model_dir, &model, &manifest)?;
     Ok(model)
 }
@@ -271,27 +310,45 @@ pub fn train_model_from_jsonl_with_validation(
     model_dir: impl AsRef<Path>,
     validation_split: f64,
 ) -> Result<ModelManifest> {
+    train_model_from_jsonl_with_options(
+        dataset_path,
+        model_dir,
+        TrainingOptions {
+            validation_split,
+            ..TrainingOptions::default()
+        },
+    )
+}
+
+pub fn train_model_from_jsonl_with_options(
+    dataset_path: impl AsRef<Path>,
+    model_dir: impl AsRef<Path>,
+    options: TrainingOptions,
+) -> Result<ModelManifest> {
     let dataset_path = dataset_path.as_ref();
     let model_dir = model_dir.as_ref();
     let rows = read_training_jsonl(dataset_path)?;
-    let split_at = validation_split_index(rows.len(), validation_split);
-    let (training_rows, validation_rows) = rows.split_at(split_at);
-    let training_rows = if training_rows.is_empty() {
-        rows.as_slice()
-    } else {
-        training_rows
-    };
-    let model = train_model_from_feature_rows(training_rows)?;
-    let evaluation = if validation_rows.is_empty() || validation_rows.len() == rows.len() {
+    let dataset_hash = sha256_file(dataset_path)?;
+    let options = normalize_training_options(options);
+    let (training_rows, validation_rows) = partition_training_rows(&rows, options);
+    let model = train_model_from_feature_rows(&training_rows)?;
+    let evaluation = if validation_rows.is_empty() {
         None
     } else {
-        Some(evaluate_model(&model, validation_rows)?)
+        Some(evaluate_model(&model, &validation_rows)?)
     };
     let mut manifest = build_model_manifest(
         format!("jsonl:{}", dataset_path.display()),
         training_rows.len(),
+        label_distribution(&training_rows),
         false,
         &model,
+        Some(dataset_hash),
+        Some(ModelTrainingConfig {
+            validation_split: options.validation_split,
+            shuffle_seed: options.shuffle_seed,
+            stratified: options.stratified,
+        }),
     );
     manifest.evaluation = evaluation;
     write_model_bundle(model_dir, &model, &manifest)?;
@@ -308,9 +365,14 @@ pub fn export_feedback_training_dataset(
     let mut rows = Vec::new();
     let mut skipped_runs = 0usize;
 
-    for entry in std::fs::read_dir(&runs_root).with_path(&runs_root)? {
-        let entry = entry.with_path(&runs_root)?;
-        let run_dir = entry.path();
+    let mut run_dirs = std::fs::read_dir(&runs_root)
+        .with_path(&runs_root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_path(&runs_root)?;
+    run_dirs.sort();
+
+    for run_dir in run_dirs {
         if !run_dir.is_dir()
             || run_dir
                 .file_name()
@@ -357,11 +419,18 @@ pub fn export_feedback_training_dataset(
         });
     }
 
+    rows.sort_by(|left, right| {
+        left.run_id
+            .cmp(&right.run_id)
+            .then_with(|| left.recommendation_id.cmp(&right.recommendation_id))
+    });
     write_jsonl_atomic(output_path, &rows)?;
+    let dataset_hash_sha256 = sha256_file(output_path)?;
     Ok(FeedbackExportSummary {
         output: output_path.display().to_string(),
         rows: rows.len(),
         skipped_runs,
+        dataset_hash_sha256,
     })
 }
 
@@ -399,17 +468,115 @@ fn train_model_from_feature_rows(rows: &[FeatureTrainingRow]) -> Result<RustMlMo
     fit_model(&features, &targets)
 }
 
+fn normalize_training_options(options: TrainingOptions) -> TrainingOptions {
+    TrainingOptions {
+        validation_split: if options.validation_split.is_finite() {
+            options.validation_split.clamp(0.0, 0.8)
+        } else {
+            0.0
+        },
+        shuffle_seed: options.shuffle_seed,
+        stratified: options.stratified,
+    }
+}
+
+fn partition_training_rows(
+    rows: &[FeatureTrainingRow],
+    options: TrainingOptions,
+) -> (Vec<FeatureTrainingRow>, Vec<FeatureTrainingRow>) {
+    if rows.len() < 3 || options.validation_split <= 0.0 {
+        return (
+            ordered_rows(rows, options.shuffle_seed)
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
+            Vec::new(),
+        );
+    }
+
+    if options.stratified {
+        let mut training_rows = Vec::new();
+        let mut validation_rows = Vec::new();
+        for label in FaultLabel::ALL {
+            let bucket = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.label == label)
+                .map(|(idx, row)| (idx, row.clone()))
+                .collect::<Vec<_>>();
+            if bucket.is_empty() {
+                continue;
+            }
+            let ordered = order_indexed_rows(bucket, options.shuffle_seed);
+            let validation_count =
+                validation_count(ordered.len(), options.validation_split).min(ordered.len() - 1);
+            let split_at = ordered.len().saturating_sub(validation_count);
+            training_rows.extend(ordered[..split_at].iter().map(|(_, row)| row.clone()));
+            validation_rows.extend(ordered[split_at..].iter().map(|(_, row)| row.clone()));
+        }
+        (training_rows, validation_rows)
+    } else {
+        let ordered = ordered_rows(rows, options.shuffle_seed);
+        let split_at = validation_split_index(ordered.len(), options.validation_split);
+        let (training_rows, validation_rows) = ordered.split_at(split_at);
+        (
+            training_rows.iter().map(|(_, row)| row.clone()).collect(),
+            validation_rows.iter().map(|(_, row)| row.clone()).collect(),
+        )
+    }
+}
+
+fn ordered_rows(
+    rows: &[FeatureTrainingRow],
+    seed: Option<u64>,
+) -> Vec<(usize, FeatureTrainingRow)> {
+    let indexed = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| (idx, row.clone()))
+        .collect::<Vec<_>>();
+    order_indexed_rows(indexed, seed)
+}
+
+fn order_indexed_rows(
+    mut rows: Vec<(usize, FeatureTrainingRow)>,
+    seed: Option<u64>,
+) -> Vec<(usize, FeatureTrainingRow)> {
+    if let Some(seed) = seed {
+        rows.sort_by_key(|(idx, row)| seeded_row_key(seed, *idx, row));
+    }
+    rows
+}
+
+fn seeded_row_key(seed: u64, idx: usize, row: &FeatureTrainingRow) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(seed.to_le_bytes());
+    hasher.update(idx.to_le_bytes());
+    hasher.update((row.label.index() as u64).to_le_bytes());
+    for value in &row.features {
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.finalize().to_vec()
+}
+
 fn validation_split_index(len: usize, split: f64) -> usize {
     if len < 3 || !split.is_finite() || split <= 0.0 {
         return len;
     }
+    len.saturating_sub(validation_count(len, split)).max(1)
+}
+
+fn validation_count(len: usize, split: f64) -> usize {
+    if len < 2 || !split.is_finite() || split <= 0.0 {
+        return 0;
+    }
     let validation = ((len as f64) * split.clamp(0.0, 0.8)).round() as usize;
-    len.saturating_sub(validation.max(1)).max(1)
+    validation.max(1).min(len.saturating_sub(1))
 }
 
 fn evaluate_model(model: &RustMlModel, rows: &[FeatureTrainingRow]) -> Result<ModelEvaluation> {
     let mut correct = 0usize;
-    let mut confusion = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    let mut confusion = dense_confusion_matrix();
     for row in rows {
         let predicted = predict_label(model, &row.features)?;
         if predicted == row.label {
@@ -422,15 +589,22 @@ fn evaluate_model(model: &RustMlModel, rows: &[FeatureTrainingRow]) -> Result<Mo
             .or_default() += 1;
     }
     let accuracy = correct as f64 / rows.len().max(1) as f64;
-    let macro_f1 = FaultLabel::ALL
+    let per_label = FaultLabel::ALL
         .iter()
-        .map(|label| label_f1(*label, &confusion))
-        .sum::<f64>()
-        / FaultLabel::ALL.len() as f64;
+        .map(|label| {
+            (
+                label.as_str().to_string(),
+                label_metrics(*label, &confusion),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let macro_f1 =
+        per_label.values().map(|metrics| metrics.f1).sum::<f64>() / FaultLabel::ALL.len() as f64;
     Ok(ModelEvaluation {
         validation_examples: rows.len(),
         accuracy: round4(accuracy),
         macro_f1: round4(macro_f1),
+        per_label,
         confusion_matrix: confusion,
     })
 }
@@ -455,27 +629,55 @@ fn predict_label(model: &RustMlModel, features: &[f64]) -> Result<FaultLabel> {
         .unwrap_or(FaultLabel::Normal))
 }
 
-fn label_f1(label: FaultLabel, confusion: &BTreeMap<String, BTreeMap<String, usize>>) -> f64 {
+fn dense_confusion_matrix() -> BTreeMap<String, BTreeMap<String, usize>> {
+    FaultLabel::ALL
+        .iter()
+        .map(|actual| {
+            (
+                actual.as_str().to_string(),
+                FaultLabel::ALL
+                    .iter()
+                    .map(|predicted| (predicted.as_str().to_string(), 0usize))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn label_metrics(
+    label: FaultLabel,
+    confusion: &BTreeMap<String, BTreeMap<String, usize>>,
+) -> LabelMetrics {
     let key = label.as_str();
     let tp = confusion
         .get(key)
         .and_then(|predicted| predicted.get(key))
         .copied()
         .unwrap_or(0) as f64;
-    let fp = confusion
+    let predicted_total = confusion
         .values()
         .map(|predicted| predicted.get(key).copied().unwrap_or(0))
-        .sum::<usize>() as f64
-        - tp;
-    let fn_ = confusion
+        .sum::<usize>() as f64;
+    let support = confusion
         .get(key)
         .map(|predicted| predicted.values().sum::<usize>() as f64)
-        .unwrap_or(0.0)
-        - tp;
-    if tp == 0.0 {
-        0.0
+        .unwrap_or(0.0);
+    let precision = if predicted_total > 0.0 {
+        tp / predicted_total
     } else {
-        (2.0 * tp) / (2.0 * tp + fp + fn_)
+        0.0
+    };
+    let recall = if support > 0.0 { tp / support } else { 0.0 };
+    let f1 = if precision + recall > 0.0 {
+        (2.0 * precision * recall) / (precision + recall)
+    } else {
+        0.0
+    };
+    LabelMetrics {
+        support: support as usize,
+        precision: round4(precision),
+        recall: round4(recall),
+        f1: round4(f1),
     }
 }
 
@@ -629,8 +831,11 @@ fn write_model_bundle(
 fn build_model_manifest(
     training_source: impl Into<String>,
     training_examples: usize,
+    label_distribution: BTreeMap<String, usize>,
     synthetic_fallback: bool,
     model: &RustMlModel,
+    dataset_hash_sha256: Option<String>,
+    training_config: Option<ModelTrainingConfig>,
 ) -> ModelManifest {
     ModelManifest {
         schema_version: "netdiag-model-manifest/v1".to_string(),
@@ -638,6 +843,7 @@ fn build_model_manifest(
         model_kind: "linfa_multinomial_logistic_regression".to_string(),
         created_at: Utc::now(),
         training_source: training_source.into(),
+        dataset_hash_sha256,
         model_file: MODEL_FILE_NAME.to_string(),
         feature_names: FEATURES.iter().map(|name| (*name).to_string()).collect(),
         labels: model
@@ -647,10 +853,47 @@ fn build_model_manifest(
             .map(|class| FaultLabel::from_index(*class).as_str().to_string())
             .collect(),
         training_examples,
+        label_distribution,
         feature_count: FEATURES.len(),
         synthetic_fallback,
+        training_config,
         evaluation: None,
     }
+}
+
+fn label_distribution(rows: &[FeatureTrainingRow]) -> BTreeMap<String, usize> {
+    let mut distribution = BTreeMap::new();
+    for row in rows {
+        *distribution
+            .entry(row.label.as_str().to_string())
+            .or_default() += 1;
+    }
+    distribution
+}
+
+fn synthetic_label_distribution(samples_per_label: usize) -> BTreeMap<String, usize> {
+    FaultLabel::ALL
+        .iter()
+        .map(|label| (label.as_str().to_string(), samples_per_label))
+        .collect()
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_path(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).with_path(path)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn round4(value: f64) -> f64 {
@@ -783,4 +1026,76 @@ fn scale_probability(probs: &mut [f64], classes: &[usize], label: FaultLabel, fa
 #[allow(dead_code)]
 fn model_path(root: &Path) -> PathBuf {
     root.join("model").join(MODEL_FILE_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(label: FaultLabel, value: f64) -> FeatureTrainingRow {
+        FeatureTrainingRow {
+            label,
+            features: vec![value; FEATURES.len()],
+        }
+    }
+
+    #[test]
+    fn ml_feature_quality_maps_quic_feature_to_quic_blocked_ratio() {
+        let quality = feature_quality_map(&[MetricProvenance {
+            field: "quic_blocked_ratio".to_string(),
+            quality: MetricQuality::Fallback,
+            source: "native_pcap".to_string(),
+            reason: "pcap cannot prove QUIC policy blocking".to_string(),
+        }]);
+
+        assert_eq!(quality.get("quic"), Some(&MetricQuality::Fallback));
+    }
+
+    #[test]
+    fn stratified_split_keeps_each_label_in_training() {
+        let mut rows = Vec::new();
+        for label in FaultLabel::ALL {
+            rows.push(row(label, label.index() as f64));
+            rows.push(row(label, label.index() as f64 + 0.5));
+        }
+
+        let (training, validation) = partition_training_rows(
+            &rows,
+            TrainingOptions {
+                validation_split: 0.5,
+                shuffle_seed: Some(2026),
+                stratified: true,
+            },
+        );
+
+        assert_eq!(training.len(), FaultLabel::ALL.len());
+        assert_eq!(validation.len(), FaultLabel::ALL.len());
+        for label in FaultLabel::ALL {
+            assert!(training.iter().any(|row| row.label == label), "{label}");
+            assert!(validation.iter().any(|row| row.label == label), "{label}");
+        }
+    }
+
+    #[test]
+    fn evaluation_reports_dense_confusion_and_per_label_metrics() {
+        let mut confusion = dense_confusion_matrix();
+        *confusion
+            .entry("congestion".to_string())
+            .or_default()
+            .entry("congestion".to_string())
+            .or_default() = 2;
+        *confusion
+            .entry("congestion".to_string())
+            .or_default()
+            .entry("normal".to_string())
+            .or_default() = 1;
+
+        let metrics = label_metrics(FaultLabel::Congestion, &confusion);
+
+        assert_eq!(confusion.len(), FaultLabel::ALL.len());
+        assert_eq!(metrics.support, 3);
+        assert_eq!(metrics.precision, 1.0);
+        assert_eq!(metrics.recall, 0.6667);
+        assert_eq!(metrics.f1, 0.8);
+    }
 }

@@ -380,14 +380,28 @@ pub struct ModelManifest {
     pub model_kind: String,
     pub created_at: DateTime<Utc>,
     pub training_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_hash_sha256: Option<String>,
     pub model_file: String,
     pub feature_names: Vec<String>,
     pub labels: Vec<String>,
     pub training_examples: usize,
+    #[serde(default)]
+    pub label_distribution: BTreeMap<String, usize>,
     pub feature_count: usize,
     pub synthetic_fallback: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_config: Option<ModelTrainingConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<ModelEvaluation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTrainingConfig {
+    pub validation_split: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle_seed: Option<u64>,
+    pub stratified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,7 +409,17 @@ pub struct ModelEvaluation {
     pub validation_examples: usize,
     pub accuracy: f64,
     pub macro_f1: f64,
+    #[serde(default)]
+    pub per_label: BTreeMap<String, LabelMetrics>,
     pub confusion_matrix: BTreeMap<String, BTreeMap<String, usize>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabelMetrics {
+    pub support: usize,
+    pub precision: f64,
+    pub recall: f64,
+    pub f1: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -618,4 +642,68 @@ pub struct RunIndexEntry {
     pub created_at: DateTime<Utc>,
     pub status: String,
     pub run_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunArtifactEntry {
+    pub key: String,
+    pub path: String,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunHistoryEntry {
+    pub run_id: String,
+    pub sample: String,
+    pub created_at: DateTime<Utc>,
+    pub status: String,
+    pub run_dir: String,
+    #[serde(default)]
+    pub root_causes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ml_top_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ml_top_probability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_kind: Option<String>,
+    #[serde(default)]
+    pub synthetic_model: bool,
+    #[serde(default)]
+    pub measurement_quality: Vec<MetricProvenance>,
+    #[serde(default)]
+    pub hil_summary: HilReviewSummary,
+    #[serde(default)]
+    pub artifact_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunComparison {
+    pub left: RunHistoryEntry,
+    pub right: RunHistoryEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_p95_delta_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_delta_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_delta_pct: Option<f64>,
+    pub ml_label_changed: bool,
+    pub new_root_causes: Vec<String>,
+    pub resolved_root_causes: Vec<String>,
+    pub review_status_changed: bool,
+    pub recommendation_state_changes: Vec<RecommendationStateChange>,
+    pub measurement_quality_changes: Vec<MetricQualityChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecommendationStateChange {
+    pub recommendation_id: String,
+    pub left_state: HilState,
+    pub right_state: HilState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricQualityChange {
+    pub field: String,
+    pub left_quality: MetricQuality,
+    pub right_quality: MetricQuality,
 }

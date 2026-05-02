@@ -28,9 +28,10 @@ use netdiag_core::connectors::{
 };
 use netdiag_core::ml::load_or_train_model;
 use netdiag_core::models::{
-    FaultLabel, HilReviewSummary, HilState, MetricQuality, RunManifest, TopologyModel,
+    FaultLabel, HilReviewSummary, HilState, MetricProvenance, MetricQuality, RunManifest,
+    TopologyModel,
 };
-use netdiag_core::storage::review_recommendation;
+use netdiag_core::storage::{compare_runs, list_run_history, review_recommendation};
 use netdiag_core::twin::{action_names, topology_model, topology_names, validate_topology_model};
 use netdiag_core::{PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif};
 use serde_json::Value;
@@ -156,6 +157,13 @@ enum Text {
     ReviewNeeded,
     SettingsLanguage,
     Artifacts,
+    CurrentRun,
+    RunHistory,
+    LatestComparison,
+    ReviewState,
+    RootCauses,
+    ModelType,
+    SyntheticModel,
     Recommendations,
     Evidence,
     WhatIfResult,
@@ -1599,161 +1607,366 @@ impl NetDiagApp {
         glass_frame(ui, |ui| {
             section_title(ui, tr(self.language, Text::Artifacts));
             ui.add_space(10.0);
-            let Some(result) = &self.result else {
-                ui.label(tr(self.language, Text::NoArtifacts));
-                return;
-            };
-            let run_dir = result.run_dir.clone();
-            let recommendations = result.recommendations.clone();
-            let warnings = result.ingest.warnings.clone();
-            ui.label(
-                RichText::new(run_dir.display().to_string())
-                    .size(13.0)
-                    .color(INK),
-            );
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if soft_button(ui, tr(self.language, Text::OpenReport)).clicked() {
-                    self.open_current_report();
-                }
-                if soft_button(ui, tr(self.language, Text::OpenRunFolder)).clicked() {
-                    self.open_current_run_folder();
-                }
-            });
+            if let Some(result) = &self.result {
+                section_title(ui, tr(self.language, Text::CurrentRun));
+                ui.add_space(6.0);
+                let run_dir = result.run_dir.clone();
+                let recommendations = result.recommendations.clone();
+                let warnings = result.ingest.warnings.clone();
+                ui.label(
+                    RichText::new(run_dir.display().to_string())
+                        .size(13.0)
+                        .color(INK),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if soft_button(ui, tr(self.language, Text::OpenReport)).clicked() {
+                        self.open_current_report();
+                    }
+                    if soft_button(ui, tr(self.language, Text::OpenRunFolder)).clicked() {
+                        self.open_current_run_folder();
+                    }
+                });
 
-            ui.add_space(14.0);
-            section_title(ui, tr(self.language, Text::ArtifactFiles));
-            match manifest_artifacts(&run_dir) {
-                Ok(entries) if entries.is_empty() => {
-                    ui.label(tr(self.language, Text::NoArtifacts));
+                ui.add_space(14.0);
+                section_title(ui, tr(self.language, Text::ArtifactFiles));
+                match manifest_artifacts(&run_dir) {
+                    Ok(entries) if entries.is_empty() => {
+                        ui.label(tr(self.language, Text::NoArtifacts));
+                    }
+                    Ok(entries) => {
+                        for (key, path) in entries {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(key).size(12.0).strong().color(INK));
+                                ui.label(
+                                    RichText::new(path.display().to_string())
+                                        .size(12.0)
+                                        .color(MUTED),
+                                );
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {err}",
+                                tr(self.language, Text::OpenFailed)
+                            ))
+                            .size(12.0)
+                            .color(RED),
+                        );
+                    }
                 }
-                Ok(entries) => {
-                    for (key, path) in entries {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(key).size(12.0).strong().color(INK));
+
+                if !warnings.is_empty() {
+                    ui.add_space(14.0);
+                    section_title(ui, tr(self.language, Text::ValidationWarnings));
+                    for warning in warnings.iter().take(6) {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {} -> {}",
+                                warning.column, warning.reason, warning.fallback
+                            ))
+                            .size(12.0)
+                            .color(ORANGE),
+                        );
+                    }
+                }
+
+                ui.add_space(16.0);
+                section_title(ui, tr(self.language, Text::Recommendations));
+                ui.label(
+                    RichText::new(tr(self.language, Text::HilReview))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+                ui.add_space(6.0);
+                for rec in &recommendations {
+                    let mut review_action = None;
+                    ui.group(|ui| {
+                        ui.label(
+                            RichText::new(&rec.recommended_action)
+                                .size(14.0)
+                                .strong()
+                                .color(INK),
+                        );
+                        ui.label(RichText::new(&rec.expected_effect).size(13.0).color(MUTED));
+                        ui.label(format!(
+                            "{}={}  {}={:.2}  {}={}",
+                            tr(self.language, Text::Risk),
+                            rec.risk_level,
+                            tr(self.language, Text::Confidence),
+                            rec.confidence,
+                            tr(self.language, Text::Approval),
+                            approval_display(rec.recommendation_need_approval, self.language)
+                        ));
+                        ui.label(
+                            RichText::new(format!(
+                                "{}={}  ID={}",
+                                tr(self.language, Text::HilStatus),
+                                hil_state_display(rec.hil_state, self.language),
+                                rec.recommendation_id
+                            ))
+                            .size(12.0)
+                            .color(hil_state_color(rec.hil_state)),
+                        );
+                        if let Some(review) = &rec.review {
                             ui.label(
-                                RichText::new(path.display().to_string())
+                                RichText::new(format!(
+                                    "{}={}  {}",
+                                    tr(self.language, Text::ReviewedBy),
+                                    review.reviewer,
+                                    review.reviewed_at.format("%H:%M:%S")
+                                ))
+                                .size(12.0)
+                                .color(MUTED),
+                            );
+                            if !review.notes.is_empty() {
+                                ui.label(RichText::new(&review.notes).size(12.0).color(MUTED));
+                            }
+                        }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(tr(self.language, Text::ReviewNotes))
                                     .size(12.0)
                                     .color(MUTED),
                             );
+                            let notes = self
+                                .hil_notes
+                                .entry(rec.recommendation_id.clone())
+                                .or_insert_with(|| {
+                                    rec.review
+                                        .as_ref()
+                                        .map(|review| review.notes.clone())
+                                        .unwrap_or_default()
+                                });
+                            ui.add(egui::TextEdit::singleline(notes).desired_width(320.0));
                         });
+                        ui.horizontal(|ui| {
+                            if soft_button(ui, tr(self.language, Text::Accept)).clicked() {
+                                review_action = Some(HilState::Accepted);
+                            }
+                            if soft_button(ui, tr(self.language, Text::Reject)).clicked() {
+                                review_action = Some(HilState::Rejected);
+                            }
+                            if soft_button(ui, tr(self.language, Text::MarkUncertain)).clicked() {
+                                review_action = Some(HilState::Uncertain);
+                            }
+                            if soft_button(ui, tr(self.language, Text::RequireRerun)).clicked() {
+                                review_action = Some(HilState::RequiresRerun);
+                            }
+                        });
+                    });
+                    if let Some(state) = review_action {
+                        self.apply_hil_review(&rec.recommendation_id, state);
                     }
+                    ui.add_space(8.0);
                 }
-                Err(err) => {
-                    ui.label(
-                        RichText::new(format!("{}: {err}", tr(self.language, Text::OpenFailed)))
-                            .size(12.0)
-                            .color(RED),
-                    );
-                }
+            } else {
+                ui.label(tr(self.language, Text::NoArtifacts));
             }
 
-            if !warnings.is_empty() {
-                ui.add_space(14.0);
-                section_title(ui, tr(self.language, Text::ValidationWarnings));
-                for warning in warnings.iter().take(6) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: {} -> {}",
-                            warning.column, warning.reason, warning.fallback
-                        ))
+            ui.add_space(18.0);
+            self.render_run_history(ui);
+        });
+    }
+
+    fn render_run_history(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, tr(self.language, Text::RunHistory));
+        ui.add_space(8.0);
+        let history = match list_run_history(&self.artifacts_root, 10) {
+            Ok(history) => history,
+            Err(err) => {
+                ui.label(
+                    RichText::new(format!("{}: {err}", tr(self.language, Text::OpenFailed)))
                         .size(12.0)
-                        .color(ORANGE),
-                    );
-                }
+                        .color(RED),
+                );
+                return;
             }
-
-            ui.add_space(16.0);
-            section_title(ui, tr(self.language, Text::Recommendations));
-            ui.label(
-                RichText::new(tr(self.language, Text::HilReview))
+        };
+        if history.is_empty() {
+            ui.label(tr(self.language, Text::NoArtifacts));
+            return;
+        }
+        if history.len() >= 2
+            && let Ok(comparison) =
+                compare_runs(&self.artifacts_root, &history[1].run_id, &history[0].run_id)
+        {
+            ui.group(|ui| {
+                ui.label(
+                    RichText::new(tr(self.language, Text::LatestComparison))
+                        .size(13.0)
+                        .strong()
+                        .color(INK),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} -> {}",
+                        short_run_id(&comparison.left.run_id),
+                        short_run_id(&comparison.right.run_id)
+                    ))
                     .size(12.0)
                     .color(MUTED),
-            );
-            ui.add_space(6.0);
-            for rec in &recommendations {
-                let mut review_action = None;
-                ui.group(|ui| {
+                );
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        RichText::new(&rec.recommended_action)
-                            .size(14.0)
+                        RichText::new(format_delta("P95", comparison.latency_p95_delta_pct, "%"))
+                            .size(12.0)
+                            .color(INK),
+                    );
+                    ui.label(
+                        RichText::new(format_delta("loss", comparison.loss_delta_pct, "%"))
+                            .size(12.0)
+                            .color(INK),
+                    );
+                    ui.label(
+                        RichText::new(format_delta(
+                            "throughput",
+                            comparison.throughput_delta_pct,
+                            "%",
+                        ))
+                        .size(12.0)
+                        .color(INK),
+                    );
+                    ui.label(
+                        RichText::new(format!("ML changed={}", comparison.ml_label_changed))
+                            .size(12.0)
+                            .color(if comparison.ml_label_changed {
+                                ORANGE
+                            } else {
+                                GREEN
+                            }),
+                    );
+                    if !comparison.new_root_causes.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {}",
+                                tr(self.language, Text::RootCauses),
+                                comparison.new_root_causes.join(", ")
+                            ))
+                            .size(12.0)
+                            .color(ORANGE),
+                        );
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+        for entry in history {
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}  {}", short_run_id(&entry.run_id), entry.sample))
+                            .size(13.0)
                             .strong()
                             .color(INK),
                     );
-                    ui.label(RichText::new(&rec.expected_effect).size(13.0).color(MUTED));
-                    ui.label(format!(
-                        "{}={}  {}={:.2}  {}={}",
-                        tr(self.language, Text::Risk),
-                        rec.risk_level,
-                        tr(self.language, Text::Confidence),
-                        rec.confidence,
-                        tr(self.language, Text::Approval),
-                        approval_display(rec.recommendation_need_approval, self.language)
-                    ));
                     ui.label(
                         RichText::new(format!(
-                            "{}={}  ID={}",
-                            tr(self.language, Text::HilStatus),
-                            hil_state_display(rec.hil_state, self.language),
-                            rec.recommendation_id
+                            "{}: {}",
+                            tr(self.language, Text::ReviewState),
+                            entry.status
                         ))
                         .size(12.0)
-                        .color(hil_state_color(rec.hil_state)),
+                        .color(MUTED),
                     );
-                    if let Some(review) = &rec.review {
+                    ui.label(
+                        RichText::new(entry.created_at.format("%Y-%m-%d %H:%M:%S").to_string())
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            tr(self.language, Text::RootCauses),
+                            if entry.root_causes.is_empty() {
+                                "normal".to_string()
+                            } else {
+                                entry.root_causes.join(", ")
+                            }
+                        ))
+                        .size(12.0)
+                        .color(INK),
+                    );
+                    if let Some(label) = &entry.ml_top_label {
                         ui.label(
                             RichText::new(format!(
-                                "{}={}  {}",
-                                tr(self.language, Text::ReviewedBy),
-                                review.reviewer,
-                                review.reviewed_at.format("%H:%M:%S")
+                                "ML: {} ({:.2})",
+                                label,
+                                entry.ml_top_probability.unwrap_or_default()
                             ))
                             .size(12.0)
                             .color(MUTED),
                         );
-                        if !review.notes.is_empty() {
-                            ui.label(RichText::new(&review.notes).size(12.0).color(MUTED));
-                        }
                     }
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    if let Some(kind) = &entry.model_kind {
                         ui.label(
-                            RichText::new(tr(self.language, Text::ReviewNotes))
-                                .size(12.0)
-                                .color(MUTED),
+                            RichText::new(format!(
+                                "{}: {}{}",
+                                tr(self.language, Text::ModelType),
+                                kind,
+                                if entry.synthetic_model {
+                                    format!(" / {}", tr(self.language, Text::SyntheticModel))
+                                } else {
+                                    String::new()
+                                }
+                            ))
+                            .size(12.0)
+                            .color(MUTED),
                         );
-                        let notes = self
-                            .hil_notes
-                            .entry(rec.recommendation_id.clone())
-                            .or_insert_with(|| {
-                                rec.review
-                                    .as_ref()
-                                    .map(|review| review.notes.clone())
-                                    .unwrap_or_default()
-                            });
-                        ui.add(egui::TextEdit::singleline(notes).desired_width(320.0));
-                    });
-                    ui.horizontal(|ui| {
-                        if soft_button(ui, tr(self.language, Text::Accept)).clicked() {
-                            review_action = Some(HilState::Accepted);
-                        }
-                        if soft_button(ui, tr(self.language, Text::Reject)).clicked() {
-                            review_action = Some(HilState::Rejected);
-                        }
-                        if soft_button(ui, tr(self.language, Text::MarkUncertain)).clicked() {
-                            review_action = Some(HilState::Uncertain);
-                        }
-                        if soft_button(ui, tr(self.language, Text::RequireRerun)).clicked() {
-                            review_action = Some(HilState::RequiresRerun);
-                        }
-                    });
+                    }
                 });
-                if let Some(state) = review_action {
-                    self.apply_hil_review(&rec.recommendation_id, state);
-                }
-                ui.add_space(8.0);
-            }
-        });
+                let counts = metric_quality_counts_from_provenance(&entry.measurement_quality);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: measured={} estimated={} fallback={} missing={}",
+                            tr(self.language, Text::MeasurementQuality),
+                            counts.measured,
+                            counts.estimated,
+                            counts.fallback,
+                            counts.missing
+                        ))
+                        .size(12.0)
+                        .color(if counts.fallback + counts.missing == 0 {
+                            GREEN
+                        } else {
+                            ORANGE
+                        }),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            tr(self.language, Text::ArtifactFiles),
+                            entry.artifact_count
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let run_dir = PathBuf::from(&entry.run_dir);
+                    if soft_button(ui, tr(self.language, Text::OpenReport)).clicked()
+                        && let Err(err) = open_path(&run_dir.join("report.json"))
+                    {
+                        self.settings_notice =
+                            Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
+                    }
+                    if soft_button(ui, tr(self.language, Text::OpenRunFolder)).clicked()
+                        && let Err(err) = open_path(&run_dir)
+                    {
+                        self.settings_notice =
+                            Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
     }
 
     fn render_settings_page(&mut self, ui: &mut egui::Ui) {
@@ -3811,6 +4024,13 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::ReviewNeeded) => "需要复核",
         (Language::Zh, Text::SettingsLanguage) => "界面语言",
         (Language::Zh, Text::Artifacts) => "运行产物",
+        (Language::Zh, Text::CurrentRun) => "当前运行",
+        (Language::Zh, Text::RunHistory) => "运行历史",
+        (Language::Zh, Text::LatestComparison) => "最新两次对比",
+        (Language::Zh, Text::ReviewState) => "复核状态",
+        (Language::Zh, Text::RootCauses) => "根因",
+        (Language::Zh, Text::ModelType) => "模型类型",
+        (Language::Zh, Text::SyntheticModel) => "合成 fallback",
         (Language::Zh, Text::Recommendations) => "推荐动作",
         (Language::Zh, Text::Evidence) => "证据",
         (Language::Zh, Text::WhatIfResult) => "What-if 结果",
@@ -3991,6 +4211,13 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::ReviewNeeded) => "Review Needed",
         (Language::En, Text::SettingsLanguage) => "Interface Language",
         (Language::En, Text::Artifacts) => "Run Artifacts",
+        (Language::En, Text::CurrentRun) => "Current Run",
+        (Language::En, Text::RunHistory) => "Run History",
+        (Language::En, Text::LatestComparison) => "Latest Comparison",
+        (Language::En, Text::ReviewState) => "Review State",
+        (Language::En, Text::RootCauses) => "Root Causes",
+        (Language::En, Text::ModelType) => "Model Type",
+        (Language::En, Text::SyntheticModel) => "Synthetic fallback",
         (Language::En, Text::Recommendations) => "Recommendations",
         (Language::En, Text::Evidence) => "Evidence",
         (Language::En, Text::WhatIfResult) => "What-if Result",
@@ -4383,8 +4610,12 @@ struct MetricQualityCounts {
 }
 
 fn metric_quality_counts(snapshot: &SourceSnapshot) -> MetricQualityCounts {
+    metric_quality_counts_from_provenance(&snapshot.ingest.metric_provenance)
+}
+
+fn metric_quality_counts_from_provenance(provenance: &[MetricProvenance]) -> MetricQualityCounts {
     let mut counts = MetricQualityCounts::default();
-    for item in &snapshot.ingest.metric_provenance {
+    for item in provenance {
         match item.quality {
             MetricQuality::Measured => counts.measured += 1,
             MetricQuality::Estimated => counts.estimated += 1,
@@ -4393,6 +4624,16 @@ fn metric_quality_counts(snapshot: &SourceSnapshot) -> MetricQualityCounts {
         }
     }
     counts
+}
+
+fn short_run_id(run_id: &str) -> &str {
+    run_id.get(..8).unwrap_or(run_id)
+}
+
+fn format_delta(label: &str, value: Option<f64>, unit: &str) -> String {
+    value
+        .map(|value| format!("{label} {value:+.1}{unit}"))
+        .unwrap_or_else(|| format!("{label} n/a"))
 }
 
 fn comparison_agreement_text(agreement: bool, lang: Language) -> &'static str {

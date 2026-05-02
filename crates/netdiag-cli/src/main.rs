@@ -6,13 +6,18 @@ use netdiag_core::connectors::{
     default_prometheus_mapping, load_http_json, load_native_pcap, load_otlp_grpc_receiver,
     load_prometheus_exposition, load_prometheus_query_range, load_system_counters,
 };
-use netdiag_core::ml::{export_feedback_training_dataset, train_model_from_jsonl_with_validation};
+use netdiag_core::ml::{
+    TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
+};
 use netdiag_core::models::{FaultLabel, HilState, TelemetrySummary};
 use netdiag_core::perf_budget::{
     build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
     run_perf_measurements_sampled, save_perf_budget,
 };
-use netdiag_core::storage::{read_json, review_recommendation, run_dir, save_json};
+use netdiag_core::storage::{
+    compare_runs, list_run_history, read_json, review_recommendation, run_artifacts, run_dir,
+    save_json,
+};
 use netdiag_core::twin::run_simulated_whatif;
 use netdiag_core::{Result as CoreResult, diagnose_file};
 use std::path::PathBuf;
@@ -46,6 +51,23 @@ enum Command {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+    History {
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    Compare {
+        left_run_id: String,
+        right_run_id: String,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
+    Artifacts {
+        run_id: String,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
     Train {
         #[arg(long)]
         dataset: PathBuf,
@@ -53,6 +75,10 @@ enum Command {
         model_dir: PathBuf,
         #[arg(long, default_value_t = 0.0)]
         validation_split: f64,
+        #[arg(long)]
+        shuffle_seed: Option<u64>,
+        #[arg(long, default_value_t = false)]
+        stratified: bool,
     },
     Feedback {
         #[command(subcommand)]
@@ -154,14 +180,39 @@ fn run(args: Args) -> anyhow::Result<()> {
             let report = read_json(path)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::History { artifacts, limit } => {
+            let history = list_run_history(artifacts, limit)?;
+            println!("{}", serde_json::to_string_pretty(&history)?);
+        }
+        Command::Compare {
+            left_run_id,
+            right_run_id,
+            artifacts,
+        } => {
+            let comparison = compare_runs(artifacts, &left_run_id, &right_run_id)?;
+            println!("{}", serde_json::to_string_pretty(&comparison)?);
+        }
+        Command::Artifacts { run_id, artifacts } => {
+            let artifacts = run_artifacts(artifacts, &run_id)?;
+            println!("{}", serde_json::to_string_pretty(&artifacts)?);
+        }
         Command::Train {
             dataset,
             model_dir,
             validation_split,
+            shuffle_seed,
+            stratified,
         } => {
-            let manifest =
-                train_model_from_jsonl_with_validation(&dataset, &model_dir, validation_split)
-                    .with_context(|| format!("training failed for {}", dataset.display()))?;
+            let manifest = train_model_from_jsonl_with_options(
+                &dataset,
+                &model_dir,
+                TrainingOptions {
+                    validation_split,
+                    shuffle_seed,
+                    stratified,
+                },
+            )
+            .with_context(|| format!("training failed for {}", dataset.display()))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -172,6 +223,8 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "manifest_file": "model_manifest.json",
                     "labels": manifest.labels,
                     "training_examples": manifest.training_examples,
+                    "dataset_hash_sha256": manifest.dataset_hash_sha256,
+                    "training_config": manifest.training_config,
                     "evaluation": manifest.evaluation,
                 }))?
             );
@@ -420,20 +473,22 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let dataset_path = temp.path().join("training.jsonl");
         let mut dataset = fs::File::create(&dataset_path).expect("create dataset");
-        for name in [
-            "normal",
-            "congestion",
-            "random_loss",
-            "dns_failure",
-            "tls_failure",
-            "udp_quic_blocked",
-        ] {
-            let ingest = ingest_trace(sample(name)).expect("sample ingest");
-            let row = serde_json::json!({
-                "label": name,
-                "records": ingest.records,
-            });
-            writeln!(dataset, "{row}").expect("write training row");
+        for _ in 0..2 {
+            for name in [
+                "normal",
+                "congestion",
+                "random_loss",
+                "dns_failure",
+                "tls_failure",
+                "udp_quic_blocked",
+            ] {
+                let ingest = ingest_trace(sample(name)).expect("sample ingest");
+                let row = serde_json::json!({
+                    "label": name,
+                    "records": ingest.records,
+                });
+                writeln!(dataset, "{row}").expect("write training row");
+            }
         }
 
         let model_dir = temp.path().join("model");
@@ -444,6 +499,11 @@ mod tests {
             path_str(&dataset_path),
             "--model-dir",
             path_str(&model_dir),
+            "--validation-split",
+            "0.5",
+            "--shuffle-seed",
+            "2026",
+            "--stratified",
         ]);
         run(args).expect("train command");
 
@@ -454,6 +514,18 @@ mod tests {
         .expect("manifest json");
         assert!(!manifest.synthetic_fallback);
         assert_eq!(manifest.training_examples, 6);
+        assert!(manifest.dataset_hash_sha256.is_some());
+        assert_eq!(
+            manifest
+                .training_config
+                .as_ref()
+                .and_then(|config| config.shuffle_seed),
+            Some(2026)
+        );
+        assert!(manifest.evaluation.is_some());
+        let evaluation = manifest.evaluation.expect("evaluation");
+        assert_eq!(evaluation.validation_examples, 6);
+        assert_eq!(evaluation.per_label.len(), FaultLabel::ALL.len());
     }
 
     #[test]
@@ -499,5 +571,59 @@ mod tests {
         assert!(row["features"]["latency_mean"].is_number());
         assert!(row["rule_labels"].is_array());
         assert_eq!(row["feedback_state"], "accepted");
+    }
+
+    #[test]
+    fn history_compare_and_artifacts_commands_read_run_center_data() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let left = diagnose_file(
+            sample("normal"),
+            temp.path(),
+            Some(("line", "reroute_path_b")),
+        )
+        .expect("left diagnose");
+        let right = diagnose_file(
+            sample("dns_failure"),
+            temp.path(),
+            Some(("line", "reroute_path_b")),
+        )
+        .expect("right diagnose");
+
+        let history_args = Args::parse_from([
+            "netdiag",
+            "history",
+            "--artifacts",
+            path_str(temp.path()),
+            "--limit",
+            "5",
+        ]);
+        run(history_args).expect("history command");
+
+        let compare_args = Args::parse_from([
+            "netdiag",
+            "compare",
+            &left.run_id,
+            &right.run_id,
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(compare_args).expect("compare command");
+
+        let artifact_args = Args::parse_from([
+            "netdiag",
+            "artifacts",
+            &right.run_id,
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(artifact_args).expect("artifacts command");
+
+        let history = list_run_history(temp.path(), 10).expect("history data");
+        assert_eq!(history.len(), 2);
+        let comparison =
+            compare_runs(temp.path(), &left.run_id, &right.run_id).expect("comparison");
+        assert!(!comparison.new_root_causes.is_empty() || comparison.ml_label_changed);
+        let artifact_entries = run_artifacts(temp.path(), &right.run_id).expect("artifacts");
+        assert!(artifact_entries.iter().any(|entry| entry.key == "report"));
     }
 }

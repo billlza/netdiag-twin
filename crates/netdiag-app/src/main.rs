@@ -4,7 +4,7 @@ use eframe::egui::{
 };
 use egui_remixicon::icons;
 use netdiag_app::data_source::{
-    FlowSummary, SimScenario, SourceDescriptor, SourceMode, SourceSnapshot,
+    FlowSummary, SimScenario, SourceDescriptor, SourceMode, SourceSnapshot, native_pcap_source,
 };
 use netdiag_app::layout::{
     HEADER_ACTION_HEIGHT, HEADER_ACTION_WIDTH, OVERVIEW_MIN_CONTENT_HEIGHT, SUMMARY_CARD_HEIGHT,
@@ -21,7 +21,11 @@ use netdiag_app::settings::{
 use netdiag_app::trend::{LatencyMetric, TrendRange, latency_trend_points};
 use netdiag_app::updater::{UpdateCheckOutcome, sparkle_check_for_updates, sparkle_status};
 use netdiag_app::view_model::{DashboardViewModel, format_bytes};
-use netdiag_core::connectors::{ConnectorLoadResult, OtlpGrpcReceiverConfig, OtlpReceiverSession};
+use netdiag_core::connectors::{
+    CaptureControl, CaptureProgress, ConnectorLoadResult, NativePcapConfig, OtlpGrpcReceiverConfig,
+    OtlpReceiverSession, SystemCountersConfig, load_native_pcap_with_control,
+    load_system_counters_with_control,
+};
 use netdiag_core::ml::load_or_train_model;
 use netdiag_core::models::{
     FaultLabel, HilReviewSummary, HilState, MetricQuality, RunManifest, TopologyModel,
@@ -29,9 +33,14 @@ use netdiag_core::models::{
 use netdiag_core::storage::review_recommendation;
 use netdiag_core::twin::{action_names, topology_model, topology_names, validate_topology_model};
 use netdiag_core::{PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::Duration;
 use std::{fs, process::Command, thread};
 
@@ -258,8 +267,16 @@ enum Text {
     CaptureTimeout,
     CaptureSession,
     StartReceiver,
+    StartCapture,
+    CancelCapture,
+    DiagnoseLastSample,
     StopReceiver,
     DiagnoseBuffer,
+    CaptureProgress,
+    CaptureRunning,
+    CaptureCompleted,
+    CaptureCancelled,
+    CaptureFailed,
     SystemInterface,
     SamplingInterval,
     HttpJsonConnectorHint,
@@ -311,8 +328,7 @@ struct NetDiagApp {
     update_notice: Option<String>,
     api_test_status: Option<String>,
     api_test_job: Option<ApiTestJob>,
-    otlp_session: Option<OtlpReceiverSession>,
-    otlp_session_status: Option<String>,
+    capture_session: Option<CaptureSessionState>,
     pending_delete_token: bool,
     pending_clear_runs: bool,
     pending_rebuild_model: bool,
@@ -322,11 +338,49 @@ struct NetDiagApp {
 
 type DiagnosisJob = mpsc::Receiver<anyhow::Result<(PipelineResult, SourceSnapshot)>>;
 type ApiTestJob = mpsc::Receiver<anyhow::Result<ApiTestOutcome>>;
+type CaptureSessionJob = mpsc::Receiver<CaptureSessionEvent>;
 
 #[derive(Debug)]
 struct ApiTestOutcome {
     rows: usize,
     sample: String,
+}
+
+#[derive(Debug)]
+enum CaptureSessionEvent {
+    Progress(CaptureProgress),
+    Finished(Box<anyhow::Result<SourceSnapshot>>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSessionPhase {
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl CaptureSessionPhase {
+    fn is_active(self) -> bool {
+        matches!(
+            self,
+            CaptureSessionPhase::Running | CaptureSessionPhase::Cancelling
+        )
+    }
+}
+
+struct CaptureSessionState {
+    kind: ConnectorKind,
+    phase: CaptureSessionPhase,
+    started_at: chrono::DateTime<chrono::Utc>,
+    timeout: Duration,
+    progress: Option<CaptureProgress>,
+    last_sample: Option<SourceSnapshot>,
+    status: String,
+    job: Option<CaptureSessionJob>,
+    cancel: Option<Arc<AtomicBool>>,
+    otlp: Option<OtlpReceiverSession>,
 }
 
 impl NetDiagApp {
@@ -394,8 +448,7 @@ impl NetDiagApp {
             update_notice: None,
             api_test_status: None,
             api_test_job: None,
-            otlp_session: None,
-            otlp_session_status: None,
+            capture_session: None,
             pending_delete_token: false,
             pending_clear_runs: false,
             pending_rebuild_model: false,
@@ -510,60 +563,258 @@ impl NetDiagApp {
         })
     }
 
-    fn start_otlp_receiver(&mut self) {
-        if self.otlp_session.is_some() {
-            return;
-        }
-        match self.current_otlp_receiver_config().and_then(|config| {
-            let bind_addr = config.bind_addr.clone();
-            OtlpReceiverSession::start(&config)
-                .map(|session| (session, format!("Listening on {bind_addr}")))
-                .map_err(anyhow::Error::from)
-        }) {
-            Ok((session, status)) => {
-                self.otlp_session = Some(session);
-                self.otlp_session_status = Some(status);
-            }
-            Err(err) => {
-                self.otlp_session_status = Some(err.to_string());
-            }
-        }
-    }
-
-    fn stop_otlp_receiver(&mut self) {
-        let Some(session) = self.otlp_session.take() else {
-            return;
-        };
-        match session.stop() {
-            Ok(()) => self.otlp_session_status = Some("Receiver stopped".to_string()),
-            Err(err) => self.otlp_session_status = Some(err.to_string()),
-        }
-    }
-
-    fn diagnose_otlp_buffer(&mut self) {
-        let Some(session) = &self.otlp_session else {
-            self.otlp_session_status = Some("Receiver is not running".to_string());
-            return;
-        };
-        let lookback = self
+    fn current_native_pcap_config(&self) -> anyhow::Result<(NativePcapConfig, String)> {
+        let profile = self
             .settings
             .data_connectors
             .active_profile()
-            .filter(|profile| profile.kind == ConnectorKind::OtlpGrpcReceiver)
-            .map(|profile| Duration::from_secs(profile.otlp_grpc.timeout_secs.max(1)))
-            .unwrap_or_else(|| Duration::from_secs(20));
-        match session.snapshot(lookback) {
-            Ok(loaded) => {
-                let source_snapshot = source_snapshot_from_otlp_session(loaded);
-                self.otlp_session_status = Some(format!(
-                    "Buffered rows: {}",
-                    source_snapshot.ingest.records.len()
-                ));
-                self.start_diagnosis_from_snapshot(source_snapshot);
+            .ok_or_else(|| anyhow::anyhow!("no active source profile"))?;
+        if profile.kind != ConnectorKind::NativePcap {
+            anyhow::bail!("active source profile is not native pcap");
+        }
+        Ok((
+            NativePcapConfig {
+                source: native_pcap_source(&profile.native_pcap.source),
+                timeout: Duration::from_secs(profile.native_pcap.timeout_secs.max(1)),
+                packet_limit: profile.native_pcap.packet_limit.max(1),
+                sample: "native_pcap_session".to_string(),
+            },
+            profile.native_pcap.source.clone(),
+        ))
+    }
+
+    fn current_system_counters_config(&self) -> anyhow::Result<(SystemCountersConfig, String)> {
+        let profile = self
+            .settings
+            .data_connectors
+            .active_profile()
+            .ok_or_else(|| anyhow::anyhow!("no active source profile"))?;
+        if profile.kind != ConnectorKind::SystemCounters {
+            anyhow::bail!("active source profile is not system counters");
+        }
+        let interface = profile.system_counters.interface.trim().to_string();
+        Ok((
+            SystemCountersConfig {
+                interface: (!interface.is_empty() && interface != "all")
+                    .then_some(interface.clone()),
+                interval: Duration::from_secs(profile.system_counters.interval_secs.clamp(1, 10)),
+                sample: "system_counters_session".to_string(),
+            },
+            if interface.is_empty() {
+                "all interfaces".to_string()
+            } else {
+                interface
+            },
+        ))
+    }
+
+    fn start_capture_session(&mut self, kind: ConnectorKind) {
+        if self
+            .capture_session
+            .as_ref()
+            .is_some_and(|session| session.phase.is_active())
+        {
+            self.settings_notice = Some(tr(self.language, Text::CaptureRunning).to_string());
+            return;
+        }
+        match kind {
+            ConnectorKind::OtlpGrpcReceiver => self.start_otlp_capture_session(),
+            ConnectorKind::NativePcap => self.start_native_pcap_capture_session(),
+            ConnectorKind::SystemCounters => self.start_system_counters_capture_session(),
+            _ => {
+                self.settings_notice = Some(
+                    "Capture sessions are only available for OTLP, pcap, and system counters"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    fn start_otlp_capture_session(&mut self) {
+        match self.current_otlp_receiver_config().and_then(|config| {
+            let bind_addr = config.bind_addr.clone();
+            OtlpReceiverSession::start(&config)
+                .map(|session| (session, config.timeout, format!("Listening on {bind_addr}")))
+                .map_err(anyhow::Error::from)
+        }) {
+            Ok((session, timeout, status)) => {
+                self.capture_session = Some(CaptureSessionState {
+                    kind: ConnectorKind::OtlpGrpcReceiver,
+                    phase: CaptureSessionPhase::Running,
+                    started_at: chrono::Utc::now(),
+                    timeout,
+                    progress: None,
+                    last_sample: None,
+                    status,
+                    job: None,
+                    cancel: None,
+                    otlp: Some(session),
+                });
             }
             Err(err) => {
-                self.otlp_session_status = Some(err.to_string());
+                self.capture_session = Some(failed_capture_session(
+                    ConnectorKind::OtlpGrpcReceiver,
+                    err.to_string(),
+                ));
             }
+        }
+    }
+
+    fn start_native_pcap_capture_session(&mut self) {
+        match self.current_native_pcap_config() {
+            Ok((config, source_label)) => {
+                let (sender, receiver) = mpsc::channel();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let progress_sender = sender.clone();
+                let control =
+                    CaptureControl::new(Arc::clone(&cancel)).with_progress(move |progress| {
+                        let _ = progress_sender.send(CaptureSessionEvent::Progress(progress));
+                    });
+                let timeout = config.timeout;
+                thread::spawn(move || {
+                    let result = load_native_pcap_with_control(&config, &control)
+                        .map(|loaded| {
+                            source_snapshot_from_connector_session(
+                                loaded,
+                                ConnectorKind::NativePcap,
+                                "Captured",
+                                source_label,
+                            )
+                        })
+                        .map_err(anyhow::Error::from);
+                    let _ = sender.send(CaptureSessionEvent::Finished(Box::new(result)));
+                });
+                self.capture_session = Some(CaptureSessionState {
+                    kind: ConnectorKind::NativePcap,
+                    phase: CaptureSessionPhase::Running,
+                    started_at: chrono::Utc::now(),
+                    timeout,
+                    progress: None,
+                    last_sample: None,
+                    status: tr(self.language, Text::CaptureRunning).to_string(),
+                    job: Some(receiver),
+                    cancel: Some(cancel),
+                    otlp: None,
+                });
+            }
+            Err(err) => {
+                self.capture_session = Some(failed_capture_session(
+                    ConnectorKind::NativePcap,
+                    err.to_string(),
+                ));
+            }
+        }
+    }
+
+    fn start_system_counters_capture_session(&mut self) {
+        match self.current_system_counters_config() {
+            Ok((config, source_label)) => {
+                let (sender, receiver) = mpsc::channel();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let progress_sender = sender.clone();
+                let control =
+                    CaptureControl::new(Arc::clone(&cancel)).with_progress(move |progress| {
+                        let _ = progress_sender.send(CaptureSessionEvent::Progress(progress));
+                    });
+                let timeout = config.interval;
+                thread::spawn(move || {
+                    let result = load_system_counters_with_control(&config, &control)
+                        .map(|loaded| {
+                            source_snapshot_from_connector_session(
+                                loaded,
+                                ConnectorKind::SystemCounters,
+                                "Sampled",
+                                source_label,
+                            )
+                        })
+                        .map_err(anyhow::Error::from);
+                    let _ = sender.send(CaptureSessionEvent::Finished(Box::new(result)));
+                });
+                self.capture_session = Some(CaptureSessionState {
+                    kind: ConnectorKind::SystemCounters,
+                    phase: CaptureSessionPhase::Running,
+                    started_at: chrono::Utc::now(),
+                    timeout,
+                    progress: None,
+                    last_sample: None,
+                    status: tr(self.language, Text::CaptureRunning).to_string(),
+                    job: Some(receiver),
+                    cancel: Some(cancel),
+                    otlp: None,
+                });
+            }
+            Err(err) => {
+                self.capture_session = Some(failed_capture_session(
+                    ConnectorKind::SystemCounters,
+                    err.to_string(),
+                ));
+            }
+        }
+    }
+
+    fn cancel_capture_session(&mut self) {
+        let Some(session) = &mut self.capture_session else {
+            return;
+        };
+        if let Some(otlp) = session.otlp.take() {
+            session.phase = CaptureSessionPhase::Cancelling;
+            match otlp.stop() {
+                Ok(()) => {
+                    session.phase = CaptureSessionPhase::Cancelled;
+                    session.status = tr(self.language, Text::CaptureCancelled).to_string();
+                }
+                Err(err) => {
+                    session.phase = CaptureSessionPhase::Failed;
+                    session.status = err.to_string();
+                }
+            }
+        } else if let Some(cancel) = &session.cancel {
+            cancel.store(true, Ordering::Relaxed);
+            session.phase = CaptureSessionPhase::Cancelling;
+            session.status = tr(self.language, Text::CaptureCancelled).to_string();
+        }
+    }
+
+    fn diagnose_capture_last_sample(&mut self) {
+        let snapshot = self
+            .capture_session
+            .as_ref()
+            .and_then(|session| session.last_sample.clone());
+        if let Some(snapshot) = snapshot {
+            self.start_diagnosis_from_snapshot(snapshot);
+            return;
+        }
+        let mut diagnose_now = None;
+        let Some(session) = &mut self.capture_session else {
+            return;
+        };
+        let Some(otlp) = &session.otlp else {
+            session.status = tr(self.language, Text::NoSource).to_string();
+            return;
+        };
+        match otlp.snapshot(session.timeout) {
+            Ok(loaded) => {
+                let source_snapshot = source_snapshot_from_connector_session(
+                    loaded,
+                    ConnectorKind::OtlpGrpcReceiver,
+                    "Buffered",
+                    "OTLP receiver".to_string(),
+                );
+                session.status = format!(
+                    "{}: {} {}",
+                    tr(self.language, Text::LastSample),
+                    source_snapshot.ingest.records.len(),
+                    tr(self.language, Text::Rows)
+                );
+                session.last_sample = Some(source_snapshot.clone());
+                diagnose_now = Some(source_snapshot);
+            }
+            Err(err) => {
+                session.status = err.to_string();
+            }
+        }
+        if let Some(source_snapshot) = diagnose_now {
+            self.start_diagnosis_from_snapshot(source_snapshot);
         }
     }
 
@@ -661,6 +912,83 @@ impl NetDiagApp {
         }
     }
 
+    fn poll_capture_session(&mut self, ctx: &egui::Context) {
+        let Some(session) = &mut self.capture_session else {
+            return;
+        };
+        if let Some(otlp) = &session.otlp
+            && session.phase.is_active()
+        {
+            let frames = otlp.buffered_frames();
+            let elapsed = (chrono::Utc::now() - session.started_at)
+                .num_milliseconds()
+                .max(0) as u64;
+            session.progress = Some(CaptureProgress {
+                stage: "listening".to_string(),
+                message: "listening for OTLP metrics".to_string(),
+                packets_seen: 0,
+                bytes_seen: 0,
+                samples_seen: frames,
+                elapsed_ms: elapsed,
+                timeout_ms: session.timeout.as_millis() as u64,
+                packet_limit: None,
+                last_sample_at: otlp.last_received_at(),
+            });
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
+        let mut finished = None;
+        if let Some(receiver) = session.job.as_ref() {
+            loop {
+                match receiver.try_recv() {
+                    Ok(CaptureSessionEvent::Progress(progress)) => {
+                        session.progress = Some(progress);
+                    }
+                    Ok(CaptureSessionEvent::Finished(result)) => {
+                        finished = Some(*result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = Some(Err(anyhow::anyhow!(
+                            "capture worker stopped before returning a result"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(result) = finished {
+            session.job = None;
+            session.cancel = None;
+            match result {
+                Ok(snapshot) => {
+                    let rows = snapshot.ingest.records.len();
+                    session.phase = CaptureSessionPhase::Completed;
+                    session.status = format!(
+                        "{}: {} {}",
+                        tr(self.language, Text::CaptureCompleted),
+                        rows,
+                        tr(self.language, Text::Rows)
+                    );
+                    session.last_sample = Some(snapshot);
+                }
+                Err(err) if err.to_string().contains("cancelled") => {
+                    session.phase = CaptureSessionPhase::Cancelled;
+                    session.status = tr(self.language, Text::CaptureCancelled).to_string();
+                }
+                Err(err) => {
+                    session.phase = CaptureSessionPhase::Failed;
+                    session.status = format!("{}: {err}", tr(self.language, Text::CaptureFailed));
+                }
+            }
+            ctx.request_repaint();
+        } else if session.phase.is_active() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
     fn maybe_start_deferred_diagnosis(&mut self, ctx: &egui::Context) {
         if !self.pending_startup_diagnosis {
             return;
@@ -736,6 +1064,7 @@ impl eframe::App for NetDiagApp {
         self.poll_native_menu();
         self.poll_diagnosis_job(ui.ctx());
         self.poll_api_test_job(ui.ctx());
+        self.poll_capture_session(ui.ctx());
         self.maybe_start_deferred_diagnosis(ui.ctx());
         if !self.did_restore_window_size {
             ui.ctx()
@@ -1931,9 +2260,14 @@ impl NetDiagApp {
         if ui.add_enabled(!testing, test_button).clicked() {
             self.start_api_test_connection();
         }
-        if active_kind == ConnectorKind::OtlpGrpcReceiver {
+        if matches!(
+            active_kind,
+            ConnectorKind::OtlpGrpcReceiver
+                | ConnectorKind::NativePcap
+                | ConnectorKind::SystemCounters
+        ) {
             ui.add_space(8.0);
-            self.render_otlp_capture_session_controls(ui);
+            self.render_capture_session_controls(ui, active_kind);
         }
         ui.add_space(10.0);
         self.render_connector_health_panel(ui);
@@ -1949,50 +2283,113 @@ impl NetDiagApp {
         }
     }
 
-    fn render_otlp_capture_session_controls(&mut self, ui: &mut egui::Ui) {
+    fn render_capture_session_controls(&mut self, ui: &mut egui::Ui, active_kind: ConnectorKind) {
         section_title(ui, tr(self.language, Text::CaptureSession));
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            let running = self.otlp_session.is_some();
-            let start = egui::Button::new(
-                RichText::new(tr(self.language, Text::StartReceiver))
-                    .size(13.0)
-                    .color(INK),
-            )
-            .fill(Color32::from_white_alpha(130))
-            .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
-            .corner_radius(8);
+            let running = self
+                .capture_session
+                .as_ref()
+                .is_some_and(|session| session.phase.is_active());
+            let session_matches = self
+                .capture_session
+                .as_ref()
+                .is_some_and(|session| session.kind == active_kind);
+            let has_last_sample = self.capture_session.as_ref().is_some_and(|session| {
+                session.kind == active_kind && session.last_sample.is_some()
+            });
+            let start_label = if active_kind == ConnectorKind::OtlpGrpcReceiver {
+                tr(self.language, Text::StartReceiver)
+            } else {
+                tr(self.language, Text::StartCapture)
+            };
+            let start = egui::Button::new(RichText::new(start_label).size(13.0).color(INK))
+                .fill(Color32::from_white_alpha(130))
+                .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
+                .corner_radius(8);
             if ui.add_enabled(!running, start).clicked() {
-                self.start_otlp_receiver();
+                self.start_capture_session(active_kind);
             }
             let diagnose = egui::Button::new(
-                RichText::new(tr(self.language, Text::DiagnoseBuffer))
-                    .size(13.0)
-                    .color(INK),
+                RichText::new(
+                    if active_kind == ConnectorKind::OtlpGrpcReceiver && running {
+                        tr(self.language, Text::DiagnoseBuffer)
+                    } else {
+                        tr(self.language, Text::DiagnoseLastSample)
+                    },
+                )
+                .size(13.0)
+                .color(INK),
             )
             .fill(Color32::from_white_alpha(130))
             .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
             .corner_radius(8);
             if ui
-                .add_enabled(running && self.diagnosis_job.is_none(), diagnose)
+                .add_enabled(
+                    session_matches
+                        && self.diagnosis_job.is_none()
+                        && (has_last_sample
+                            || (active_kind == ConnectorKind::OtlpGrpcReceiver && running)),
+                    diagnose,
+                )
                 .clicked()
             {
-                self.diagnose_otlp_buffer();
+                self.diagnose_capture_last_sample();
             }
             let stop = egui::Button::new(
-                RichText::new(tr(self.language, Text::StopReceiver))
-                    .size(13.0)
-                    .color(INK),
+                RichText::new(if active_kind == ConnectorKind::OtlpGrpcReceiver {
+                    tr(self.language, Text::StopReceiver)
+                } else {
+                    tr(self.language, Text::CancelCapture)
+                })
+                .size(13.0)
+                .color(INK),
             )
             .fill(Color32::from_white_alpha(130))
             .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
             .corner_radius(8);
-            if ui.add_enabled(running, stop).clicked() {
-                self.stop_otlp_receiver();
+            if ui.add_enabled(session_matches && running, stop).clicked() {
+                self.cancel_capture_session();
             }
         });
-        if let Some(status) = &self.otlp_session_status {
-            ui.label(RichText::new(status).size(12.0).color(MUTED));
+        if let Some(session) = &self.capture_session {
+            if session.kind == active_kind {
+                ui.label(RichText::new(&session.status).size(12.0).color(MUTED));
+                if let Some(progress) = &session.progress {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            tr(self.language, Text::CaptureProgress),
+                            format_capture_progress(progress)
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
+                if let Some(sample) = &session.last_sample {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {} {} · {}",
+                            tr(self.language, Text::LastSample),
+                            sample.ingest.records.len(),
+                            tr(self.language, Text::Rows),
+                            sample.descriptor.captured_label
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
+            } else if session.phase.is_active() {
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {}",
+                        tr(self.language, Text::CaptureRunning),
+                        connector_kind_label(session.kind, self.language)
+                    ))
+                    .size(12.0)
+                    .color(MUTED),
+                );
+            }
         }
     }
 
@@ -3251,27 +3648,130 @@ fn connector_source_mode_from_profile(
     }
 }
 
-fn source_snapshot_from_otlp_session(loaded: ConnectorLoadResult) -> SourceSnapshot {
+fn failed_capture_session(kind: ConnectorKind, status: String) -> CaptureSessionState {
+    CaptureSessionState {
+        kind,
+        phase: CaptureSessionPhase::Failed,
+        started_at: chrono::Utc::now(),
+        timeout: Duration::from_secs(0),
+        progress: None,
+        last_sample: None,
+        status,
+        job: None,
+        cancel: None,
+        otlp: None,
+    }
+}
+
+fn source_snapshot_from_connector_session(
+    loaded: ConnectorLoadResult,
+    kind: ConnectorKind,
+    captured_verb: &str,
+    data_source_label: String,
+) -> SourceSnapshot {
     let rows = loaded.ingest.records.len();
+    let payload = loaded.payload.unwrap_or(Value::Null);
+    let (kind_label, protocol) = match kind {
+        ConnectorKind::OtlpGrpcReceiver => ("OTLP gRPC Session", "OTLP"),
+        ConnectorKind::NativePcap => ("Native pcap Session", "PCAP"),
+        ConnectorKind::SystemCounters => ("System counters Session", "Interface"),
+        _ => ("Capture Session", "Capture"),
+    };
+    let mut flow_summary = connector_payload_flow_summary(&payload, protocol, rows);
+    if flow_summary.total_bytes.is_none() {
+        flow_summary.total_bytes = estimate_session_bytes(&loaded.ingest.records);
+    }
     SourceSnapshot {
         descriptor: SourceDescriptor {
             name: loaded.sample,
-            kind: "OTLP gRPC Session".to_string(),
-            captured_label: format!("Buffered  •  {}", chrono::Utc::now().format("%H:%M")),
-            data_source_label: loaded
-                .provenance
-                .get("bind_addr")
-                .cloned()
-                .unwrap_or_else(|| "OTLP receiver".to_string()),
+            kind: kind_label.to_string(),
+            captured_label: format!("{captured_verb}  •  {}", chrono::Utc::now().format("%H:%M")),
+            data_source_label,
         },
-        flow_summary: FlowSummary {
-            protocol: Some("OTLP".to_string()),
-            flows: Some(rows),
-            total_bytes: None,
-            top_talkers: Vec::new(),
-        },
+        flow_summary,
         ingest: loaded.ingest,
     }
+}
+
+fn connector_payload_flow_summary(payload: &Value, protocol: &str, rows: usize) -> FlowSummary {
+    let top_talkers = payload
+        .get("top_talkers")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let label = item.get("label").and_then(Value::as_str)?;
+                    let bytes = item.get("bytes").and_then(Value::as_u64)?;
+                    Some(netdiag_app::data_source::TopTalker {
+                        label: label.to_string(),
+                        bytes,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let total_bytes = payload
+        .get("total_bytes")
+        .or_else(|| payload.get("bytes"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            let sum = top_talkers.iter().map(|talker| talker.bytes).sum::<u64>();
+            (sum > 0).then_some(sum)
+        });
+    let flows = if top_talkers.is_empty() {
+        payload
+            .get("flow_count")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .or(Some(rows))
+    } else {
+        Some(top_talkers.len())
+    };
+    FlowSummary {
+        protocol: Some(protocol.to_string()),
+        flows,
+        total_bytes,
+        top_talkers,
+    }
+}
+
+fn estimate_session_bytes(records: &[netdiag_core::models::TraceRecord]) -> Option<u64> {
+    if records.len() < 2 {
+        return None;
+    }
+    let mut bytes = 0.0;
+    for pair in records.windows(2) {
+        let seconds = (pair[1].timestamp - pair[0].timestamp)
+            .num_milliseconds()
+            .max(0) as f64
+            / 1000.0;
+        bytes += pair[0].throughput_mbps.max(0.0) * 1_000_000.0 * seconds / 8.0;
+    }
+    bytes.is_finite().then_some(bytes.round() as u64)
+}
+
+fn format_capture_progress(progress: &CaptureProgress) -> String {
+    let mut parts = vec![
+        format!("{}: {}", progress.stage, progress.message),
+        format!("{}ms/{}ms", progress.elapsed_ms, progress.timeout_ms.max(1)),
+    ];
+    if let Some(limit) = progress.packet_limit {
+        parts.push(format!(
+            "packets {}/{}",
+            progress.packets_seen.min(limit),
+            limit
+        ));
+    } else if progress.samples_seen > 0 {
+        parts.push(format!("samples {}", progress.samples_seen));
+    }
+    if progress.bytes_seen > 0 {
+        parts.push(format_bytes(progress.bytes_seen));
+    }
+    if let Some(last_sample_at) = progress.last_sample_at {
+        parts.push(format!("last {}", last_sample_at.format("%H:%M:%S")));
+    }
+    parts.join(" · ")
 }
 
 fn tr(lang: Language, text: Text) -> &'static str {
@@ -3424,8 +3924,16 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::CaptureTimeout) => "抓包超时",
         (Language::Zh, Text::CaptureSession) => "采集会话",
         (Language::Zh, Text::StartReceiver) => "启动接收器",
+        (Language::Zh, Text::StartCapture) => "开始采集",
+        (Language::Zh, Text::CancelCapture) => "取消采集",
+        (Language::Zh, Text::DiagnoseLastSample) => "诊断最近采样",
         (Language::Zh, Text::StopReceiver) => "停止接收器",
         (Language::Zh, Text::DiagnoseBuffer) => "诊断缓冲区",
+        (Language::Zh, Text::CaptureProgress) => "采集进度",
+        (Language::Zh, Text::CaptureRunning) => "采集中",
+        (Language::Zh, Text::CaptureCompleted) => "采集完成",
+        (Language::Zh, Text::CaptureCancelled) => "采集已取消",
+        (Language::Zh, Text::CaptureFailed) => "采集失败",
         (Language::Zh, Text::SystemInterface) => "接口",
         (Language::Zh, Text::SamplingInterval) => "采样间隔",
         (Language::Zh, Text::HttpJsonConnectorHint) => {
@@ -3600,8 +4108,16 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::CaptureTimeout) => "Capture Timeout",
         (Language::En, Text::CaptureSession) => "Capture Session",
         (Language::En, Text::StartReceiver) => "Start Receiver",
+        (Language::En, Text::StartCapture) => "Start Capture",
+        (Language::En, Text::CancelCapture) => "Cancel Capture",
+        (Language::En, Text::DiagnoseLastSample) => "Diagnose Last Sample",
         (Language::En, Text::StopReceiver) => "Stop Receiver",
         (Language::En, Text::DiagnoseBuffer) => "Diagnose Buffer",
+        (Language::En, Text::CaptureProgress) => "Capture Progress",
+        (Language::En, Text::CaptureRunning) => "Capturing",
+        (Language::En, Text::CaptureCompleted) => "Capture Completed",
+        (Language::En, Text::CaptureCancelled) => "Capture Cancelled",
+        (Language::En, Text::CaptureFailed) => "Capture Failed",
         (Language::En, Text::SystemInterface) => "Interface",
         (Language::En, Text::SamplingInterval) => "Sampling Interval",
         (Language::En, Text::HttpJsonConnectorHint) => {

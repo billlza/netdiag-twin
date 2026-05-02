@@ -51,7 +51,7 @@ ditto "target/release/NetDiag Twin.app" "/Applications/NetDiag Twin.app"
 open "/Applications/NetDiag Twin.app"
 ```
 
-Release packaging also creates `target/release/NetDiag Twin-<version>.dmg`.
+Release packaging also creates `target/release/NetDiag-Twin-<version>.dmg`.
 The bundle embeds Sparkle 2 for GitHub Releases/appcast updates. For local smoke
 builds, set `NETDIAG_SPARKLE_PUBLIC_KEY`; production releases must use the real
 Sparkle EdDSA public/private key pair.
@@ -68,7 +68,9 @@ scripts/package_macos_app.sh release
 If those credentials are missing, the script reports the exact blocker instead
 of claiming a notarized build.
 
-Generate Sparkle appcast metadata after packaging:
+Generate Sparkle appcast metadata after packaging. The script signs the appcast
+with the Sparkle EdDSA private key and defaults the enclosure URL prefix to the
+matching GitHub Release tag:
 
 ```bash
 SPARKLE_PRIVATE_KEY="..." scripts/generate_appcast.sh target/release

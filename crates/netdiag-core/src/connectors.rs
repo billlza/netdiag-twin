@@ -16,7 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
 
@@ -43,6 +46,66 @@ pub struct ConnectorLoadResult {
     pub sample: String,
     pub provenance: BTreeMap<String, String>,
     pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureProgress {
+    pub stage: String,
+    pub message: String,
+    pub packets_seen: usize,
+    pub bytes_seen: u64,
+    pub samples_seen: usize,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    pub packet_limit: Option<usize>,
+    pub last_sample_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Default)]
+pub struct CaptureControl {
+    cancel: Arc<AtomicBool>,
+    progress: Option<Arc<dyn Fn(CaptureProgress) + Send + Sync + 'static>>,
+}
+
+impl std::fmt::Debug for CaptureControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CaptureControl")
+            .field("cancelled", &self.is_cancelled())
+            .field("has_progress_sink", &self.progress.is_some())
+            .finish()
+    }
+}
+
+impl CaptureControl {
+    pub fn new(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            cancel,
+            progress: None,
+        }
+    }
+
+    pub fn with_progress(
+        mut self,
+        progress: impl Fn(CaptureProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress = Some(Arc::new(progress));
+        self
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn report(&self, progress: CaptureProgress) {
+        if let Some(callback) = &self.progress {
+            callback(progress);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +273,20 @@ impl OtlpReceiverSession {
                 "frames_buffered": self.buffer.lock().map(|buffer| buffer.len()).unwrap_or_default(),
             })),
         })
+    }
+
+    pub fn buffered_frames(&self) -> usize {
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.len())
+            .unwrap_or_default()
+    }
+
+    pub fn last_received_at(&self) -> Option<DateTime<Utc>> {
+        self.buffer
+            .lock()
+            .ok()
+            .and_then(|buffer| buffer.back().map(|frame| frame.received_at))
     }
 
     pub fn stop(mut self) -> Result<()> {
@@ -561,7 +638,29 @@ pub fn load_otlp_grpc_receiver(config: &OtlpGrpcReceiverConfig) -> Result<Connec
 }
 
 pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult> {
+    load_native_pcap_with_control(config, &CaptureControl::default())
+}
+
+pub fn load_native_pcap_with_control(
+    config: &NativePcapConfig,
+    control: &CaptureControl,
+) -> Result<ConnectorLoadResult> {
     let mut stats = PacketStats::default();
+    let started = Instant::now();
+    report_pcap_progress(
+        control,
+        &stats,
+        started,
+        config.timeout,
+        config.packet_limit,
+        "starting",
+        "opening capture source",
+    );
+    if control.is_cancelled() {
+        return Err(NetdiagError::Connector(
+            "native pcap capture cancelled".to_string(),
+        ));
+    }
     match &config.source {
         NativePcapSource::File(path) => {
             let mut capture = Capture::from_file(path).map_err(|err| {
@@ -570,7 +669,13 @@ pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult
                     path.display()
                 ))
             })?;
+            let mut last_report = Instant::now();
             while let Ok(packet) = capture.next_packet() {
+                if control.is_cancelled() {
+                    return Err(NetdiagError::Connector(
+                        "native pcap capture cancelled".to_string(),
+                    ));
+                }
                 observe_packet(
                     packet_timestamp_ms(
                         packet.header.ts.tv_sec,
@@ -580,6 +685,18 @@ pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult
                     packet.data,
                     &mut stats,
                 );
+                if should_report_progress(last_report, &stats) {
+                    last_report = Instant::now();
+                    report_pcap_progress(
+                        control,
+                        &stats,
+                        started,
+                        config.timeout,
+                        config.packet_limit,
+                        "capturing",
+                        "reading pcap file",
+                    );
+                }
                 if stats.packet_count >= config.packet_limit.max(1) {
                     break;
                 }
@@ -600,10 +717,15 @@ pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult
                         "failed to activate capture device {interface}: {err}"
                     ))
                 })?;
-            let started = Instant::now();
+            let mut last_report = Instant::now();
             while started.elapsed() < config.timeout
                 && stats.packet_count < config.packet_limit.max(1)
             {
+                if control.is_cancelled() {
+                    return Err(NetdiagError::Connector(
+                        "native pcap capture cancelled".to_string(),
+                    ));
+                }
                 if let Ok(packet) = capture.next_packet() {
                     observe_packet(
                         packet_timestamp_ms(
@@ -615,18 +737,88 @@ pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult
                         &mut stats,
                     );
                 }
+                if should_report_progress(last_report, &stats) {
+                    last_report = Instant::now();
+                    report_pcap_progress(
+                        control,
+                        &stats,
+                        started,
+                        config.timeout,
+                        config.packet_limit,
+                        "capturing",
+                        "capturing live packets",
+                    );
+                }
             }
         }
     }
+    report_pcap_progress(
+        control,
+        &stats,
+        started,
+        config.timeout,
+        config.packet_limit,
+        "finishing",
+        "building capture sample",
+    );
     packet_stats_to_result(stats, &config.sample, &config.source)
 }
 
 pub fn load_system_counters(config: &SystemCountersConfig) -> Result<ConnectorLoadResult> {
+    load_system_counters_with_control(config, &CaptureControl::default())
+}
+
+pub fn load_system_counters_with_control(
+    config: &SystemCountersConfig,
+    control: &CaptureControl,
+) -> Result<ConnectorLoadResult> {
+    let started = Instant::now();
+    let interval = config.interval.min(Duration::from_secs(10));
+    report_counter_progress(
+        control,
+        started,
+        interval,
+        0,
+        None,
+        "starting",
+        "reading initial interface counters",
+    );
+    if control.is_cancelled() {
+        return Err(NetdiagError::Connector(
+            "system counters capture cancelled".to_string(),
+        ));
+    }
     let before = read_netstat_counters()?;
-    std::thread::sleep(config.interval.min(Duration::from_secs(10)));
+    while started.elapsed() < interval {
+        if control.is_cancelled() {
+            return Err(NetdiagError::Connector(
+                "system counters capture cancelled".to_string(),
+            ));
+        }
+        report_counter_progress(
+            control,
+            started,
+            interval,
+            0,
+            None,
+            "sampling",
+            "waiting for counter interval",
+        );
+        let remaining = interval.saturating_sub(started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
     let after = read_netstat_counters()?;
     let delta = diff_counters(&before, &after, config.interface.as_deref())?;
-    let interval_s = config.interval.as_secs_f64().max(1e-6);
+    report_counter_progress(
+        control,
+        started,
+        interval,
+        1,
+        Some(Utc::now()),
+        "finishing",
+        "building counter sample",
+    );
+    let interval_s = interval.as_secs_f64().max(1e-6);
     let throughput_mbps = (delta.bytes as f64 * 8.0) / interval_s / 1_000_000.0;
     let total_packets = delta.packets + delta.errors;
     let drop_rate = if total_packets > 0 {
@@ -999,6 +1191,58 @@ struct PacketStats {
     flows: BTreeMap<String, u64>,
 }
 
+fn should_report_progress(last_report: Instant, stats: &PacketStats) -> bool {
+    stats.packet_count == 1
+        || stats.packet_count.is_multiple_of(64)
+        || last_report.elapsed() >= Duration::from_millis(250)
+}
+
+fn report_pcap_progress(
+    control: &CaptureControl,
+    stats: &PacketStats,
+    started: Instant,
+    timeout: Duration,
+    packet_limit: usize,
+    stage: &str,
+    message: &str,
+) {
+    control.report(CaptureProgress {
+        stage: stage.to_string(),
+        message: message.to_string(),
+        packets_seen: stats.packet_count,
+        bytes_seen: stats.total_bytes,
+        samples_seen: usize::from(stats.packet_count > 0),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        timeout_ms: timeout.as_millis() as u64,
+        packet_limit: Some(packet_limit.max(1)),
+        last_sample_at: stats
+            .last_ts_ms
+            .and_then(|ts| Utc.timestamp_millis_opt(ts).single()),
+    });
+}
+
+fn report_counter_progress(
+    control: &CaptureControl,
+    started: Instant,
+    interval: Duration,
+    samples_seen: usize,
+    last_sample_at: Option<DateTime<Utc>>,
+    stage: &str,
+    message: &str,
+) {
+    control.report(CaptureProgress {
+        stage: stage.to_string(),
+        message: message.to_string(),
+        packets_seen: 0,
+        bytes_seen: 0,
+        samples_seen,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        timeout_ms: interval.as_millis() as u64,
+        packet_limit: None,
+        last_sample_at,
+    });
+}
+
 fn observe_packet(timestamp_ms: i64, packet_len: usize, data: &[u8], stats: &mut PacketStats) {
     stats.packet_count += 1;
     stats.total_bytes += packet_len as u64;
@@ -1266,6 +1510,9 @@ fn parse_netstat_counters(text: &str) -> Result<BTreeMap<String, InterfaceCounte
 }
 
 fn parse_u64_field(value: &str) -> Result<u64> {
+    if value == "-" {
+        return Ok(0);
+    }
     value
         .parse::<u64>()
         .map_err(|_| NetdiagError::Connector(format!("invalid netstat counter: {value}")))
@@ -1706,6 +1953,20 @@ netdiag_throughput_mbps 99
     }
 
     #[test]
+    fn netstat_parser_treats_dash_counters_as_zero() {
+        let counters = parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+             utun0 1380 <Link#9> aa - - - 4 - 800 0\n",
+        )
+        .expect("dash counters");
+
+        let value = counters.get("utun0").expect("utun0");
+        assert_eq!(value.bytes, 800);
+        assert_eq!(value.packets, 4);
+        assert_eq!(value.errors, 0);
+    }
+
+    #[test]
     fn netstat_parser_rejects_malformed_counter_values() {
         let err = parse_netstat_counters(
             "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
@@ -1714,6 +1975,33 @@ netdiag_throughput_mbps 99
         .expect_err("bad counter");
 
         assert!(err.to_string().contains("invalid netstat counter"));
+    }
+
+    #[test]
+    fn capture_control_reports_progress_and_cancels_before_work() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(Mutex::new(Vec::<CaptureProgress>::new()));
+        let observed_sink = Arc::clone(&observed);
+        let control = CaptureControl::new(Arc::clone(&cancel)).with_progress(move |progress| {
+            observed_sink.lock().expect("progress lock").push(progress);
+        });
+
+        report_counter_progress(
+            &control,
+            Instant::now(),
+            Duration::from_secs(1),
+            0,
+            None,
+            "sampling",
+            "test progress",
+        );
+        control.cancel();
+
+        assert!(control.is_cancelled());
+        let progress = observed.lock().expect("progress lock");
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].stage, "sampling");
+        assert_eq!(progress[0].message, "test progress");
     }
 
     fn serve_once(

@@ -840,7 +840,7 @@ fn probe_fallback_warnings(source: &str) -> Vec<IngestWarning> {
     .collect()
 }
 
-fn native_pcap_source(raw: &str) -> NativePcapSource {
+pub fn native_pcap_source(raw: &str) -> NativePcapSource {
     let trimmed = raw.trim();
     if let Some(interface) = trimmed.strip_prefix("iface:") {
         return NativePcapSource::Interface(interface.trim().to_string());

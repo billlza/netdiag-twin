@@ -154,7 +154,16 @@ jobs:
           dmg_path="$RELEASE_DMG_PATH"
           test -f "$dmg_path" || (echo "missing DMG: $dmg_path" >&2 && exit 2)
 
-          hdiutil verify "$dmg_path"
+          sync
+          for attempt in 1 2 3 4 5; do
+            if hdiutil verify "$dmg_path"; then
+              break
+            fi
+            if [[ "$attempt" == "5" ]]; then
+              hdiutil verify "$dmg_path"
+            fi
+            sleep "$attempt"
+          done
           codesign --verify --verbose=2 "$dmg_path"
           xcrun stapler validate "$dmg_path"
           spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"

@@ -94,6 +94,22 @@ sign_dmg() {
   fi
 }
 
+verify_dmg() {
+  local path="$1"
+  local attempt
+  sync
+  for attempt in 1 2 3 4 5; do
+    if hdiutil verify "$path" >/dev/null; then
+      return 0
+    fi
+    if [[ "$attempt" == "5" ]]; then
+      break
+    fi
+    sleep "$attempt"
+  done
+  hdiutil verify "$path"
+}
+
 prepare_sparkle
 
 cat > "$CONTENTS/Info.plist" <<PLIST
@@ -155,7 +171,7 @@ if [[ "$PROFILE" == "release" ]]; then
   rm -f "$TARGET_DIR/$DMG_BASENAME-"*.dmg
   hdiutil create -volname "$APP_NAME" -srcfolder "$APP_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
   sign_dmg "$DMG_PATH"
-  hdiutil verify "$DMG_PATH" >/dev/null
+  verify_dmg "$DMG_PATH"
 
   if [[ "$NOTARIZE" == "1" || -n "$NOTARY_PROFILE" ]]; then
     if [[ "$SIGN_IDENTITY" == "-" ]]; then

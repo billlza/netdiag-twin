@@ -1,0 +1,31 @@
+schema: netdiag-lab-scenario/v1
+id: lab-congestion-001
+name: Bottleneck congestion on router r2
+expected_label: congestion
+
+data_sources:
+  - name: sample-congestion-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/congestion.csv
+
+collection:
+  lookback_secs: 300
+  step_secs: 15
+  packet_limit: 5000
+  timeout_secs: 20
+
+what_if:
+  topology: ../topologies/ring.yaml
+  policy: ../policies/reroute-path-b.yaml
+
+acceptance:
+  expected_root_cause: congestion
+  min_rule_confidence: 0.75
+  min_ml_probability: 0.70
+  allowed_quality:
+    latency_ms: measured
+    throughput_mbps: measured
+    packet_loss_rate: measured
+  require_rule_ml_agreement: true
+  require_what_if_improvement: true

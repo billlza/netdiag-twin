@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.3.1 platform contract: how telemetry becomes
+This guide describes the stable v0.3.2 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -162,7 +162,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.3.1 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.3.2 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -183,7 +183,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.3.1 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.3.2 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -263,6 +263,60 @@ cargo run -p netdiag-cli -- history --artifacts artifacts --quality degraded
 cargo run -p netdiag-cli -- evidence <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- artifacts <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts artifacts
+cargo run -p netdiag-cli -- evidence-bundle <run_id> \
+  --artifacts artifacts \
+  --output target/netdiag-evidence-<run_id>.zip
+```
+
+## Lab Scenarios
+
+Lab scenarios are YAML files with a stable `netdiag-lab-scenario/v1` schema.
+They bind a primary data source, optional corroborating sources, topology,
+policy, collection windows, and acceptance gates.
+
+```bash
+cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
+cargo run -p netdiag-cli -- lab validate <run_id> \
+  --scenario examples/scenarios/lab-congestion-001.yaml \
+  --artifacts artifacts/lab-runs/lab-congestion-001/<timestamp>
+```
+
+Each lab run writes:
+
+| Artifact | Purpose |
+| --- | --- |
+| `scenario.yaml` | Exact scenario input used for the run. |
+| `connector_health.json` | Health and quality for primary and corroborating sources. |
+| `report.json` | Diagnosis report enriched with multi-source evidence. |
+| `multi_source_evidence.json` | Primary, corroborating, and counter-evidence summaries. |
+| `comparison.json` | Expected vs actual labels, ML agreement, and optional previous-run comparison. |
+| `acceptance.json` | Typed pass/fail gate results and concrete failures. |
+| `evidence_bundle.json` | Manifest for the exported zip bundle. |
+| `netdiag-evidence-<run_id>.zip` | Portable evidence package for reviewers. |
+
+Validate topology and policy files before adding them to a scenario:
+
+```bash
+cargo run -p netdiag-cli -- topology validate examples/topologies/ring.yaml
+cargo run -p netdiag-cli -- policy validate examples/policies/reroute-path-b.yaml \
+  --topology examples/topologies/ring.yaml
+cargo run -p netdiag-cli -- whatif-policy <run_id> \
+  --topology examples/topologies/ring.yaml \
+  --policy examples/policies/reroute-path-b.yaml
+```
+
+## Dataset Registry
+
+Feedback and lab datasets should be managed as hash-addressed JSONL artifacts,
+not anonymous files. The dataset commands inspect labels and hashes, validate
+row contracts, and create deterministic train/validation/test splits.
+
+```bash
+cargo run -p netdiag-cli -- dataset inspect artifacts/datasets/feedback.jsonl
+cargo run -p netdiag-cli -- dataset validate artifacts/datasets/feedback.jsonl
+cargo run -p netdiag-cli -- dataset split artifacts/datasets/feedback.jsonl \
+  --stratified \
+  --seed 2026
 ```
 
 ## Human-In-The-Loop Review

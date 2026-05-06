@@ -1,0 +1,14 @@
+schema: netdiag-lab-scenario/v1
+id: lab-tls-failure-001
+name: TLS handshake failure sample
+expected_label: tls_failure
+data_sources:
+  - name: sample-tls-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/tls_failure.csv
+acceptance:
+  expected_root_cause: tls_failure
+  min_rule_confidence: 0.75
+  min_ml_probability: 0.70
+  require_what_if_improvement: false

@@ -1,0 +1,12 @@
+{
+  "latency_ms": "netdiag_latency_ms",
+  "jitter_ms": "netdiag_jitter_ms",
+  "packet_loss_rate": "netdiag_packet_loss_rate",
+  "retransmission_rate": "netdiag_retransmission_rate",
+  "timeout_events": "netdiag_timeout_events_total",
+  "retry_events": "netdiag_retry_events_total",
+  "throughput_mbps": "netdiag_throughput_mbps",
+  "dns_failure_events": "netdiag_dns_failure_events_total",
+  "tls_failure_events": "netdiag_tls_failure_events_total",
+  "quic_blocked_ratio": "netdiag_quic_blocked_ratio"
+}

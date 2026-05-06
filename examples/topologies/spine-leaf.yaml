@@ -1,0 +1,61 @@
+key: lab-spine-leaf
+name: Lab spine-leaf topology
+nodes:
+  - id: client
+    label: Client
+    role: client
+  - id: leaf-a
+    label: Leaf A
+    role: network
+  - id: leaf-b
+    label: Leaf B
+    role: network
+  - id: spine-a
+    label: Spine A
+    role: network
+  - id: spine-b
+    label: Spine B
+    role: network
+  - id: server
+    label: Server
+    role: server
+links:
+  - id: client-leaf-a
+    source: client
+    target: leaf-a
+    latency_ms: 4.0
+    loss_pct: 0.02
+    capacity_mbps: 100.0
+  - id: leaf-a-spine-a
+    source: leaf-a
+    target: spine-a
+    latency_ms: 6.0
+    loss_pct: 0.02
+    capacity_mbps: 200.0
+  - id: leaf-a-spine-b
+    source: leaf-a
+    target: spine-b
+    latency_ms: 7.0
+    loss_pct: 0.03
+    capacity_mbps: 200.0
+  - id: spine-a-leaf-b
+    source: spine-a
+    target: leaf-b
+    latency_ms: 6.0
+    loss_pct: 0.02
+    capacity_mbps: 200.0
+  - id: spine-b-leaf-b
+    source: spine-b
+    target: leaf-b
+    latency_ms: 7.0
+    loss_pct: 0.03
+    capacity_mbps: 200.0
+  - id: leaf-b-server
+    source: leaf-b
+    target: server
+    latency_ms: 4.0
+    loss_pct: 0.02
+    capacity_mbps: 100.0
+metadata:
+  owner: lab
+  topology_kind: spine_leaf

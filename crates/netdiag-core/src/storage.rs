@@ -207,21 +207,28 @@ pub fn run_artifacts(
     let manifest_path = dir.join("manifest.json");
     let file = File::open(&manifest_path).with_path(&manifest_path)?;
     let manifest: RunManifest = serde_json::from_reader(BufReader::new(file))?;
-    let mut entries = manifest
-        .artifact_paths
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if key == "run_id" {
-                return None;
-            }
-            let path = resolve_artifact_path(artifact_root, run_id, &value);
-            Some(RunArtifactEntry {
-                key,
-                exists: path.exists(),
-                path: path.display().to_string(),
+    let mut entries = vec![RunArtifactEntry {
+        key: "manifest".to_string(),
+        path: manifest_path.display().to_string(),
+        exists: manifest_path.exists(),
+    }];
+    entries.extend(
+        manifest
+            .artifact_paths
+            .into_iter()
+            .filter_map(|(key, value)| {
+                if key == "run_id" {
+                    return None;
+                }
+                let path = resolve_artifact_path(artifact_root, run_id, &value);
+                Some(RunArtifactEntry {
+                    key,
+                    exists: path.exists(),
+                    path: path.display().to_string(),
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>(),
+    );
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(entries)
 }

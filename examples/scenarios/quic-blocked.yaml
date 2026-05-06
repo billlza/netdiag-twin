@@ -1,0 +1,14 @@
+schema: netdiag-lab-scenario/v1
+id: lab-quic-blocked-001
+name: UDP QUIC blocked sample
+expected_label: udp_quic_blocked
+data_sources:
+  - name: sample-quic-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/udp_quic_blocked.csv
+acceptance:
+  expected_root_cause: udp_quic_blocked
+  min_rule_confidence: 0.75
+  min_ml_probability: 0.70
+  require_what_if_improvement: false

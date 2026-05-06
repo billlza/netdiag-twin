@@ -1,0 +1,27 @@
+key: lab-line
+name: Lab line topology
+nodes:
+  - id: client
+    label: Client
+    role: client
+  - id: r1
+    label: Router R1
+    role: network
+  - id: server
+    label: Server
+    role: server
+links:
+  - id: link-client-r1
+    source: client
+    target: r1
+    latency_ms: 12.0
+    loss_pct: 0.05
+    capacity_mbps: 100.0
+  - id: link-r1-server
+    source: r1
+    target: server
+    latency_ms: 18.0
+    loss_pct: 0.10
+    capacity_mbps: 80.0
+metadata:
+  owner: lab

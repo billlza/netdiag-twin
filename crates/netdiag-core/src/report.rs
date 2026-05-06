@@ -1,6 +1,6 @@
 use crate::models::{
-    DiagnosisEvent, HilReviewSummary, MetricProvenance, MlResult, ModelManifest, Recommendation,
-    TelemetrySummary, WhatIfResult,
+    DiagnosisEvent, HilReviewSummary, MetricProvenance, MlResult, ModelManifest,
+    MultiSourceEvidenceSummary, Recommendation, TelemetrySummary, WhatIfResult,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,8 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_manifest: Option<ModelManifest>,
     pub what_if: Option<WhatIfResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_source_evidence: Option<MultiSourceEvidenceSummary>,
     pub recommendations: Vec<Recommendation>,
     #[serde(default)]
     pub hil_summary: HilReviewSummary,
@@ -112,6 +114,7 @@ pub fn render_report(
         rule_vs_ml: compare_rule_ml(events, ml),
         model_manifest: ml.model_manifest.clone(),
         what_if,
+        multi_source_evidence: None,
         recommendations: recommendations.to_vec(),
         hil_summary: HilReviewSummary::from_recommendations(recommendations),
     }

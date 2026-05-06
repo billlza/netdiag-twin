@@ -36,7 +36,9 @@ use netdiag_core::storage::{
     compare_runs, connector_health_from_ingest, list_run_timeline, review_recommendation,
     run_artifacts, run_evidence, write_connector_health,
 };
-use netdiag_core::twin::{action_names, topology_model, topology_names, validate_topology_model};
+use netdiag_core::twin::{
+    action_names, policy_action, topology_model, topology_names, validate_topology_model,
+};
 use netdiag_core::{PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -904,10 +906,8 @@ impl NetDiagApp {
         } else {
             topology_model(self.topology.as_str()).ok()?
         };
-        Some(WhatIfRequest {
-            topology,
-            action_id: self.action.clone(),
-        })
+        let action = policy_action(&self.action).ok()?;
+        Some(WhatIfRequest { topology, action })
     }
 
     fn poll_diagnosis_job(&mut self, ctx: &egui::Context) {

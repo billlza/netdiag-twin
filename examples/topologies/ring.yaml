@@ -1,0 +1,52 @@
+key: lab-ring
+name: Lab ring topology
+nodes:
+  - id: client
+    label: Client
+    role: client
+  - id: r1
+    label: Router R1
+    role: network
+  - id: r2
+    label: Router R2
+    role: network
+  - id: r3
+    label: Router R3
+    role: network
+  - id: server
+    label: Server
+    role: server
+links:
+  - id: link-client-r1
+    source: client
+    target: r1
+    latency_ms: 8.0
+    loss_pct: 0.03
+    capacity_mbps: 100.0
+  - id: link-r1-r2
+    source: r1
+    target: r2
+    latency_ms: 16.0
+    loss_pct: 0.12
+    capacity_mbps: 60.0
+  - id: link-r2-r3
+    source: r2
+    target: r3
+    latency_ms: 22.0
+    loss_pct: 0.18
+    capacity_mbps: 40.0
+  - id: link-r3-server
+    source: r3
+    target: server
+    latency_ms: 12.0
+    loss_pct: 0.05
+    capacity_mbps: 100.0
+  - id: link-r1-r3
+    source: r1
+    target: r3
+    latency_ms: 20.0
+    loss_pct: 0.08
+    capacity_mbps: 90.0
+metadata:
+  owner: lab
+  topology_kind: ring

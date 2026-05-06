@@ -1,6 +1,9 @@
 pub mod connectors;
+pub mod dataset;
 pub mod error;
+pub mod evidence_bundle;
 pub mod ingest;
+pub mod lab;
 pub mod ml;
 pub mod models;
 pub mod perf_budget;

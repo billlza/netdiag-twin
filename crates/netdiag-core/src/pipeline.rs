@@ -3,14 +3,15 @@ use crate::ingest::ingest_trace;
 use crate::ml::infer_with_quality;
 use crate::models::{
     ConnectorHealthSnapshot, DiagnosisEvent, HilReviewSummary, IngestResult, MlResult,
-    Recommendation, RunIndexEntry, RunManifest, TelemetrySummary, TopologyModel, WhatIfResult,
+    Recommendation, RunIndexEntry, RunManifest, TelemetrySummary, TopologyModel, TwinPolicyAction,
+    WhatIfResult,
 };
 use crate::recommendation::recommend_actions;
 use crate::report::{Report, RuleMlComparison, compare_rule_ml, render_report};
 use crate::rules::diagnose_rules;
 use crate::storage::{connector_health_from_ingest, read_json, run_dir, save_json_atomic};
 use crate::telemetry::summarize_ingest;
-use crate::twin::{run_simulated_whatif_with_model, topology_model};
+use crate::twin::{policy_action, run_simulated_whatif_with_policy, topology_model};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -35,14 +36,14 @@ pub struct PipelineResult {
 #[derive(Debug, Clone)]
 pub struct WhatIfRequest {
     pub topology: TopologyModel,
-    pub action_id: String,
+    pub action: TwinPolicyAction,
 }
 
 impl WhatIfRequest {
     pub fn built_in(topology_key: &str, action_id: &str) -> Result<Self> {
         Ok(Self {
             topology: topology_model(topology_key)?,
-            action_id: action_id.to_string(),
+            action: policy_action(action_id)?,
         })
     }
 }
@@ -88,11 +89,7 @@ pub fn diagnose_ingest_with_whatif(
     let comparison = compare_rule_ml(&diagnosis_events, &ml_result);
     let what_if = default_what_if
         .map(|request| {
-            run_simulated_whatif_with_model(
-                &telemetry.overall,
-                &request.topology,
-                &request.action_id,
-            )
+            run_simulated_whatif_with_policy(&telemetry.overall, &request.topology, &request.action)
         })
         .transpose()?;
     let recommendations = recommend_actions(&diagnosis_events, what_if.as_ref());

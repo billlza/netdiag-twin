@@ -79,6 +79,9 @@ SPARKLE_PRIVATE_KEY="..." scripts/generate_appcast.sh target/release
 GitHub Actions provide CI and release workflows. The release workflow requires
 `CODESIGN_IDENTITY`, `NETDIAG_SPARKLE_PUBLIC_KEY`, `SPARKLE_PRIVATE_KEY`, and
 `NETDIAG_NOTARY_PROFILE` secrets before it will publish assets.
+Use [docs/release-process.md](docs/release-process.md) as the step-by-step
+release checklist for version bumps, tags, GitHub Releases, Sparkle appcast,
+Homebrew cask updates, and old-version update smoke.
 
 Finder and `open` launches do not inherit shell-only `export` variables. Prefer
 Settings for the Live API URL/token, or set launchd environment variables before
@@ -119,6 +122,9 @@ Run a what-if action against an existing run:
 
 ```bash
 cargo run -p netdiag-cli -- whatif <run_id> line reroute_path_b
+cargo run -p netdiag-cli -- whatif-policy <run_id> \
+  --topology examples/topologies/ring.yaml \
+  --policy examples/policies/reroute-path-b.yaml
 ```
 
 Export a saved report:
@@ -135,12 +141,37 @@ cargo run -p netdiag-cli -- history --artifacts artifacts --quality degraded
 cargo run -p netdiag-cli -- evidence <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- artifacts <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts artifacts
+cargo run -p netdiag-cli -- evidence-bundle <run_id> \
+  --artifacts artifacts \
+  --output target/netdiag-evidence-<run_id>.zip
 ```
 
 Review a recommendation and persist HIL state:
 
 ```bash
 cargo run -p netdiag-cli -- review <run_id> <recommendation_id> --state accepted --notes "approved for lab run"
+```
+
+Run a reproducible lab scenario with typed acceptance gates:
+
+```bash
+cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
+cargo run -p netdiag-cli -- lab validate <run_id> --scenario examples/scenarios/lab-congestion-001.yaml
+```
+
+Validate topology and policy YAML before giving it to a lab run:
+
+```bash
+cargo run -p netdiag-cli -- topology validate examples/topologies/ring.yaml
+cargo run -p netdiag-cli -- policy validate examples/policies/reroute-path-b.yaml --topology examples/topologies/ring.yaml
+```
+
+Register and split supervised datasets with deterministic hashes:
+
+```bash
+cargo run -p netdiag-cli -- dataset inspect artifacts/datasets/feedback.jsonl
+cargo run -p netdiag-cli -- dataset validate artifacts/datasets/feedback.jsonl
+cargo run -p netdiag-cli -- dataset split artifacts/datasets/feedback.jsonl --stratified --seed 2026
 ```
 
 ## Validation
@@ -185,3 +216,11 @@ Runs are written to `artifacts/runs/<run_id>/`:
 - `report.json`
 
 The Rust ML model cache is generated under `artifacts/model/` when needed.
+
+Lab runs are written to `artifacts/lab-runs/<scenario_id>/<timestamp>/` and
+include `scenario.yaml`, `connector_health.json`, `report.json`,
+`multi_source_evidence.json`, `comparison.json`, `acceptance.json`,
+`evidence_bundle.json`, and a reviewable `netdiag-evidence-<run_id>.zip`.
+
+Version bumps are procedural: run `scripts/bump_version.sh <semver>`, then run
+the validation gates above before tagging `v<semver>`.

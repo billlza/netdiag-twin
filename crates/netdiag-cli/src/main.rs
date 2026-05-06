@@ -6,6 +6,9 @@ use netdiag_core::connectors::{
     default_prometheus_mapping, load_http_json, load_native_pcap, load_otlp_grpc_receiver,
     load_prometheus_exposition, load_prometheus_query_range, load_system_counters,
 };
+use netdiag_core::dataset::{inspect_dataset_jsonl, split_dataset_jsonl, validate_dataset_jsonl};
+use netdiag_core::evidence_bundle::export_evidence_bundle;
+use netdiag_core::lab::{LabRunOptions, run_lab_scenario, validate_lab_run};
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
 };
@@ -20,7 +23,11 @@ use netdiag_core::storage::{
     compare_runs, connector_health_from_ingest, list_run_history_filtered, read_json,
     review_recommendation, run_artifacts, run_dir, run_evidence, save_json, write_connector_health,
 };
-use netdiag_core::twin::run_simulated_whatif;
+use netdiag_core::twin::{
+    TopologyFormat, import_policy_action, import_topology, run_simulated_whatif,
+    run_simulated_whatif_with_policy, validate_policy_action_for_topology,
+    validate_policy_action_shape, validate_topology_model,
+};
 use netdiag_core::{Result as CoreResult, diagnose_file};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -47,6 +54,38 @@ enum Command {
         action: String,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+    },
+    WhatifPolicy {
+        run_id: String,
+        #[arg(long)]
+        topology: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
+    Topology {
+        #[command(subcommand)]
+        command: TopologyCommand,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    Lab {
+        #[command(subcommand)]
+        command: LabCommand,
+    },
+    Dataset {
+        #[command(subcommand)]
+        command: DatasetCommand,
+    },
+    EvidenceBundle {
+        run_id: String,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     Export {
         run_id: String,
@@ -171,6 +210,59 @@ enum FeedbackCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum LabCommand {
+    Run {
+        scenario: PathBuf,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
+    Validate {
+        run_id: String,
+        #[arg(long)]
+        scenario: PathBuf,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DatasetCommand {
+    Inspect {
+        dataset: PathBuf,
+    },
+    Validate {
+        dataset: PathBuf,
+    },
+    Split {
+        dataset: PathBuf,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        stratified: bool,
+        #[arg(long, default_value_t = 2026)]
+        seed: u64,
+        #[arg(long, default_value_t = 0.2)]
+        validation_ratio: f64,
+        #[arg(long, default_value_t = 0.0)]
+        test_ratio: f64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TopologyCommand {
+    Validate { topology: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    Validate {
+        policy: PathBuf,
+        #[arg(long)]
+        topology: Option<PathBuf>,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     run(Args::parse())
 }
@@ -188,6 +280,127 @@ fn run(args: Args) -> anyhow::Result<()> {
             action,
             artifacts,
         } => run_whatif(&run_id, &topology, &action, artifacts).context("what-if failed")?,
+        Command::WhatifPolicy {
+            run_id,
+            topology,
+            policy,
+            artifacts,
+        } => run_whatif_policy(&run_id, &topology, &policy, artifacts)
+            .context("policy what-if failed")?,
+        Command::Topology { command } => match command {
+            TopologyCommand::Validate { topology } => {
+                let model = read_topology(&topology)?;
+                validate_topology_model(&model)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "valid",
+                        "topology": topology,
+                        "key": model.key,
+                        "nodes": model.nodes.len(),
+                        "links": model.links.len(),
+                    }))?
+                );
+            }
+        },
+        Command::Policy { command } => match command {
+            PolicyCommand::Validate { policy, topology } => {
+                let action = read_policy(&policy)?;
+                if let Some(topology) = topology {
+                    let model = read_topology(&topology)?;
+                    validate_policy_action_for_topology(&action, &model)?;
+                } else {
+                    validate_policy_action_shape(&action)?;
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "valid",
+                        "policy": policy,
+                        "id": action.id,
+                        "kind": action.kind,
+                    }))?
+                );
+            }
+        },
+        Command::Lab { command } => match command {
+            LabCommand::Run {
+                scenario,
+                artifacts,
+            } => {
+                let result = run_lab_scenario(&scenario, LabRunOptions { artifacts })
+                    .with_context(|| format!("lab run failed for {}", scenario.display()))?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                if !result.acceptance.passed {
+                    anyhow::bail!(
+                        "lab acceptance failed for {}",
+                        result.acceptance.scenario_id
+                    );
+                }
+            }
+            LabCommand::Validate {
+                run_id,
+                scenario,
+                artifacts,
+            } => {
+                let report = validate_lab_run(&artifacts, &run_id, &scenario)
+                    .with_context(|| format!("lab validation failed for {run_id}"))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.passed {
+                    anyhow::bail!("lab acceptance failed for {}", report.scenario_id);
+                }
+            }
+        },
+        Command::Dataset { command } => match command {
+            DatasetCommand::Inspect { dataset } => {
+                let summary = inspect_dataset_jsonl(&dataset)
+                    .with_context(|| format!("dataset inspect failed for {}", dataset.display()))?;
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            }
+            DatasetCommand::Validate { dataset } => {
+                let report = validate_dataset_jsonl(&dataset).with_context(|| {
+                    format!("dataset validation failed for {}", dataset.display())
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.passed {
+                    anyhow::bail!("dataset validation failed");
+                }
+            }
+            DatasetCommand::Split {
+                dataset,
+                output_dir,
+                stratified,
+                seed,
+                validation_ratio,
+                test_ratio,
+            } => {
+                let output_dir = output_dir.unwrap_or_else(|| {
+                    dataset
+                        .parent()
+                        .map(|parent| parent.join("splits"))
+                        .unwrap_or_else(|| PathBuf::from("splits"))
+                });
+                let report = split_dataset_jsonl(
+                    &dataset,
+                    &output_dir,
+                    stratified,
+                    seed,
+                    validation_ratio,
+                    test_ratio,
+                )
+                .with_context(|| format!("dataset split failed for {}", dataset.display()))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        },
+        Command::EvidenceBundle {
+            run_id,
+            artifacts,
+            output,
+        } => {
+            let manifest = export_evidence_bundle(&artifacts, &run_id, &output, &[])
+                .with_context(|| format!("evidence bundle failed for {run_id}"))?;
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
         Command::Export { run_id, artifacts } => {
             let path = run_dir(artifacts, &run_id).join("report.json");
             let report = read_json(path)?;
@@ -472,6 +685,51 @@ fn run_whatif(
     Ok(())
 }
 
+fn run_whatif_policy(
+    run_id: &str,
+    topology: &std::path::Path,
+    policy: &std::path::Path,
+    artifacts: PathBuf,
+) -> anyhow::Result<()> {
+    let dir = run_dir(&artifacts, run_id);
+    let summary_path = dir.join("telemetry_summary.json");
+    let summary_value = read_json(summary_path)?;
+    let summary: TelemetrySummary = serde_json::from_value(summary_value)?;
+    let topology = read_topology(topology)?;
+    let policy = read_policy(policy)?;
+    validate_policy_action_for_topology(&policy, &topology)?;
+    let whatif = run_simulated_whatif_with_policy(&summary.overall, &topology, &policy)?;
+    let saved = save_json(dir.join(format!("whatif_{}.json", policy.id)), &whatif)?;
+    println!("{}", serde_json::to_string_pretty(&whatif)?);
+    eprintln!("saved {}", saved.display());
+    Ok(())
+}
+
+fn read_topology(path: &std::path::Path) -> anyhow::Result<netdiag_core::models::TopologyModel> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read topology {}", path.display()))?;
+    import_topology(&raw, format_for_path(path)).map_err(Into::into)
+}
+
+fn read_policy(path: &std::path::Path) -> anyhow::Result<netdiag_core::models::TwinPolicyAction> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read policy {}", path.display()))?;
+    import_policy_action(&raw, format_for_path(path)).map_err(Into::into)
+}
+
+fn format_for_path(path: &std::path::Path) -> TopologyFormat {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "yaml" | "yml" => TopologyFormat::Yaml,
+        _ => TopologyFormat::Json,
+    }
+}
+
 fn load_mapping(
     path: Option<PathBuf>,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
@@ -508,6 +766,12 @@ mod tests {
 
     fn path_str(path: &std::path::Path) -> &str {
         path.to_str().expect("test path is utf-8")
+    }
+
+    fn repo_file(path: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path)
     }
 
     #[test]
@@ -678,10 +942,89 @@ mod tests {
         assert!(!comparison.new_root_causes.is_empty() || comparison.ml_label_changed);
         let artifact_entries = run_artifacts(temp.path(), &right.run_id).expect("artifacts");
         assert!(artifact_entries.iter().any(|entry| entry.key == "report"));
+        assert!(artifact_entries.iter().any(|entry| entry.key == "manifest"));
         assert!(
             artifact_entries
                 .iter()
                 .any(|entry| entry.key == "connector_health")
         );
+    }
+
+    #[test]
+    fn dataset_commands_inspect_validate_and_split_jsonl() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset_path = temp.path().join("feedback.jsonl");
+        let mut dataset = fs::File::create(&dataset_path).expect("dataset");
+        for label in ["normal", "congestion", "dns_failure", "normal"] {
+            let row = serde_json::json!({
+                "label": label,
+                "features": {
+                    "latency_mean": 20.0,
+                    "latency_p95": 30.0,
+                    "jitter_std": 2.0,
+                    "loss_rate": 0.0,
+                    "retrans_rate": 0.0,
+                    "timeout": 0.0,
+                    "retry": 0.0,
+                    "throughput": 100.0,
+                    "dns_events": 0.0,
+                    "tls_events": 0.0,
+                    "quic": 0.0
+                }
+            });
+            writeln!(dataset, "{row}").expect("write row");
+        }
+
+        for command in ["inspect", "validate"] {
+            let args = Args::parse_from(["netdiag", "dataset", command, path_str(&dataset_path)]);
+            run(args).expect("dataset command");
+        }
+
+        let output_dir = temp.path().join("splits");
+        let args = Args::parse_from([
+            "netdiag",
+            "dataset",
+            "split",
+            path_str(&dataset_path),
+            "--output-dir",
+            path_str(&output_dir),
+            "--stratified",
+            "--seed",
+            "2026",
+        ]);
+        run(args).expect("dataset split");
+
+        assert!(output_dir.join("dataset_manifest.json").exists());
+        assert!(output_dir.join("feedback-train.jsonl").exists());
+        assert!(output_dir.join("feedback-validation.jsonl").exists());
+    }
+
+    #[test]
+    fn lab_run_command_writes_acceptance_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scenario = repo_file("examples/scenarios/lab-congestion-001.yaml");
+        let args = Args::parse_from([
+            "netdiag",
+            "lab",
+            "run",
+            path_str(&scenario),
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(args).expect("lab run");
+
+        let scenario_root = temp.path().join("lab-runs").join("lab-congestion-001");
+        let mut run_dirs = fs::read_dir(&scenario_root)
+            .expect("lab run dirs")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        run_dirs.sort();
+        let latest = run_dirs.pop().expect("latest lab run");
+        let acceptance: serde_json::Value =
+            serde_json::from_slice(&fs::read(latest.join("acceptance.json")).expect("acceptance"))
+                .expect("acceptance json");
+
+        assert_eq!(acceptance["passed"], true);
+        assert!(latest.join("evidence_bundle.json").exists());
     }
 }

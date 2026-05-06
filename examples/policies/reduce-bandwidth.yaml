@@ -1,0 +1,14 @@
+id: reduce_bandwidth
+kind: capacity_change
+target:
+  link_id: link-r2-r3
+parameters:
+  capacity_delta_pct: -0.10
+impact:
+  latency_delta_pct: 0.15
+  loss_delta_pct: 0.35
+  throughput_delta_pct: -0.10
+qoe_risk: high
+notes: Negative-control policy for validation and regression testing.
+metadata:
+  owner: lab

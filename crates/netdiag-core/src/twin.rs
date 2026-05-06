@@ -167,6 +167,49 @@ pub fn import_topology(input: &str, format: TopologyFormat) -> Result<TopologyMo
     }
 }
 
+pub fn import_policy_action(input: &str, format: TopologyFormat) -> Result<TwinPolicyAction> {
+    let action: TwinPolicyAction = match format {
+        TopologyFormat::Json => serde_json::from_str(input)?,
+        TopologyFormat::Yaml => serde_yaml::from_str(input)
+            .map_err(|err| NetdiagError::InvalidTrace(format!("invalid policy YAML: {err}")))?,
+    };
+    validate_policy_action_shape(&action)?;
+    Ok(action)
+}
+
+pub fn validate_policy_action_shape(action: &TwinPolicyAction) -> Result<()> {
+    if action.id.trim().is_empty() {
+        return Err(NetdiagError::InvalidTrace(
+            "policy action id is empty".to_string(),
+        ));
+    }
+    if action.qoe_risk.trim().is_empty() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "policy action {} qoe_risk is empty",
+            action.id
+        )));
+    }
+    for (name, value) in [
+        ("latency_delta_pct", action.impact.latency_delta_pct),
+        ("loss_delta_pct", action.impact.loss_delta_pct),
+        ("throughput_delta_pct", action.impact.throughput_delta_pct),
+    ] {
+        if !value.is_finite() {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "policy action {} has invalid {name}",
+                action.id
+            )));
+        }
+    }
+    if action.kind == TwinPolicyActionKind::LinkDisable && action.target.link_id.is_none() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "policy action {} must target a link",
+            action.id
+        )));
+    }
+    Ok(())
+}
+
 pub fn export_topology(model: &TopologyModel, format: TopologyFormat) -> Result<String> {
     match format {
         TopologyFormat::Json => export_topology_json(model),
@@ -296,7 +339,7 @@ pub fn run_simulated_whatif_with_policy(
     action: &TwinPolicyAction,
 ) -> Result<WhatIfResult> {
     validate_topology_model(topology)?;
-    validate_policy_action(action, topology)?;
+    validate_policy_action_for_topology(action, topology)?;
     let stats = topology_stats(topology)?;
     let modified_topology = apply_policy(topology, action)?;
     let proposed_stats = topology_stats(&modified_topology)?;
@@ -394,31 +437,11 @@ struct ActionDeltas {
     throughput_pct: f64,
 }
 
-fn validate_policy_action(action: &TwinPolicyAction, topology: &TopologyModel) -> Result<()> {
-    if action.id.trim().is_empty() {
-        return Err(NetdiagError::InvalidTrace(
-            "policy action id is empty".to_string(),
-        ));
-    }
-    if action.qoe_risk.trim().is_empty() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "policy action {} qoe_risk is empty",
-            action.id
-        )));
-    }
-    for (name, value) in [
-        ("latency_delta_pct", action.impact.latency_delta_pct),
-        ("loss_delta_pct", action.impact.loss_delta_pct),
-        ("throughput_delta_pct", action.impact.throughput_delta_pct),
-    ] {
-        if !value.is_finite() {
-            return Err(NetdiagError::InvalidTrace(format!(
-                "policy action {} has invalid {name}",
-                action.id
-            )));
-        }
-    }
-
+pub fn validate_policy_action_for_topology(
+    action: &TwinPolicyAction,
+    topology: &TopologyModel,
+) -> Result<()> {
+    validate_policy_action_shape(action)?;
     if let Some(node_id) = &action.target.node_id {
         let known = topology.nodes.iter().any(|node| node.id == *node_id);
         if !known {
@@ -436,12 +459,6 @@ fn validate_policy_action(action: &TwinPolicyAction, topology: &TopologyModel) -
                 action.id, link_id
             )));
         }
-    }
-    if action.kind == TwinPolicyActionKind::LinkDisable && action.target.link_id.is_none() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "policy action {} must target a link",
-            action.id
-        )));
     }
     Ok(())
 }

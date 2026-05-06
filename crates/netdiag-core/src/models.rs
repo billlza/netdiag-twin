@@ -216,7 +216,7 @@ impl MeasurementQualitySummary {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectorHealthStatus {
     #[default]
@@ -278,6 +278,38 @@ pub struct IngestResult {
     pub warnings: Vec<IngestWarning>,
     #[serde(default)]
     pub metric_provenance: Vec<MetricProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceEvidenceSummary {
+    pub role: String,
+    pub source_kind: String,
+    pub profile_name: String,
+    pub sample: String,
+    pub status: ConnectorHealthStatus,
+    pub rows: usize,
+    pub warning_count: usize,
+    #[serde(default)]
+    pub missing_metrics: Vec<String>,
+    #[serde(default)]
+    pub quality: MeasurementQualitySummary,
+    #[serde(default)]
+    pub signals: Vec<String>,
+    #[serde(default)]
+    pub counter_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSourceEvidenceSummary {
+    pub root_cause: String,
+    pub primary_evidence: Vec<String>,
+    #[serde(default)]
+    pub corroborating_evidence: Vec<String>,
+    #[serde(default)]
+    pub counter_evidence: Vec<String>,
+    pub primary: SourceEvidenceSummary,
+    #[serde(default)]
+    pub corroborating_sources: Vec<SourceEvidenceSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

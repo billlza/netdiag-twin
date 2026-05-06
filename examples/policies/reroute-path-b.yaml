@@ -1,0 +1,15 @@
+id: reroute_path_b
+kind: reroute
+target:
+  path_id: path_b
+parameters:
+  candidate_path: path_b
+  candidate_latency_multiplier: 0.82
+impact:
+  latency_delta_pct: -0.25
+  loss_delta_pct: -0.45
+  throughput_delta_pct: 0.25
+qoe_risk: low
+notes: Reroute congestion away from the current bottleneck path.
+metadata:
+  owner: lab

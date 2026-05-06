@@ -1,0 +1,14 @@
+schema: netdiag-lab-scenario/v1
+id: lab-dns-failure-001
+name: DNS resolver failure sample
+expected_label: dns_failure
+data_sources:
+  - name: sample-dns-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/dns_failure.csv
+acceptance:
+  expected_root_cause: dns_failure
+  min_rule_confidence: 0.75
+  min_ml_probability: 0.70
+  require_what_if_improvement: false

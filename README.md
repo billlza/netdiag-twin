@@ -11,7 +11,7 @@ NetDiag Twin is now a pure Rust desktop application and CLI for telemetry-driven
 3. Diagnosis Result
 4. Rule vs ML Comparison
 5. Digital Twin / Topology View
-6. Run Center / Recommendation Report
+6. Evidence Console / Recommendation Report
 
 ## Rust Workspace
 
@@ -93,7 +93,8 @@ The desktop app supports three data source families:
 
 - `Simulate`: deterministic fault scenarios generated in Rust and diagnosed through the real core pipeline.
 - `Import Trace`: local CSV/JSON files using canonical trace ingest.
-- `Live collection`: source profiles for Local Probe, Website Probe, HTTP/JSON lab adapters, Prometheus `query_range`, Prometheus `/metrics` exposition, OTLP gRPC receiver, Rust-native pcap capture/import, and macOS system counters. Tokens use macOS Keychain with environment-variable fallback.
+- `Live collection`: source profiles for Local Probe, Website Probe, HTTP/JSON lab adapters, Prometheus `query_range`, Prometheus `/metrics` exposition, OTLP gRPC receiver, Rust-native pcap capture/import, and macOS system counters. Tokens use macOS Keychain with environment-variable fallback. Every collected run now writes a `connector_health.json` evidence artifact with rows, warnings, measured/fallback/missing quality, and missing metrics.
+- `Evidence Console`: the Reports tab shows current connector health, recent run timeline, selected-run evidence, artifacts, HIL state, and run-to-run quality deltas.
 
 See [docs/api-source.md](docs/api-source.md) for the connector overview and HTTP/JSON lab adapter contract, and [docs/getting-started.md](docs/getting-started.md) for OTLP, native pcap, system counters, artifacts, and HIL review examples.
 
@@ -130,6 +131,8 @@ List recent runs, inspect artifacts, and compare two incidents:
 
 ```bash
 cargo run -p netdiag-cli -- history --artifacts artifacts --limit 20
+cargo run -p netdiag-cli -- history --artifacts artifacts --quality degraded
+cargo run -p netdiag-cli -- evidence <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- artifacts <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts artifacts
 ```

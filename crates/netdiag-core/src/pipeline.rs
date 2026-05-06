@@ -2,13 +2,13 @@ use crate::error::{IoContext, Result};
 use crate::ingest::ingest_trace;
 use crate::ml::infer_with_quality;
 use crate::models::{
-    DiagnosisEvent, HilReviewSummary, IngestResult, MlResult, Recommendation, RunIndexEntry,
-    RunManifest, TelemetrySummary, TopologyModel, WhatIfResult,
+    ConnectorHealthSnapshot, DiagnosisEvent, HilReviewSummary, IngestResult, MlResult,
+    Recommendation, RunIndexEntry, RunManifest, TelemetrySummary, TopologyModel, WhatIfResult,
 };
 use crate::recommendation::recommend_actions;
 use crate::report::{Report, RuleMlComparison, compare_rule_ml, render_report};
 use crate::rules::diagnose_rules;
-use crate::storage::{read_json, run_dir, save_json_atomic};
+use crate::storage::{connector_health_from_ingest, read_json, run_dir, save_json_atomic};
 use crate::telemetry::summarize_ingest;
 use crate::twin::{run_simulated_whatif_with_model, topology_model};
 use chrono::Utc;
@@ -28,6 +28,7 @@ pub struct PipelineResult {
     pub what_if: Option<WhatIfResult>,
     pub recommendations: Vec<Recommendation>,
     pub report: Report,
+    pub connector_health: ConnectorHealthSnapshot,
     pub run_dir: PathBuf,
 }
 
@@ -103,6 +104,12 @@ pub fn diagnose_ingest_with_whatif(
         what_if.clone(),
         &recommendations,
     );
+    let connector_health = connector_health_from_ingest(
+        "ingest",
+        &ingest.schema.sample,
+        &ingest.schema.sample,
+        &ingest,
+    );
     let run_dir_path = run_dir(artifact_root, &run_id);
     let temp_run_dir = runs_root.join(format!(".{run_id}.tmp"));
     if temp_run_dir.exists() {
@@ -120,6 +127,7 @@ pub fn diagnose_ingest_with_whatif(
         what_if: what_if.as_ref(),
         recommendations: &recommendations,
         report: &report,
+        connector_health: &connector_health,
     }
     .persist()?;
     let manifest = RunManifest {
@@ -153,6 +161,7 @@ pub fn diagnose_ingest_with_whatif(
         what_if,
         recommendations,
         report,
+        connector_health,
         run_dir: run_dir_path,
     })
 }
@@ -196,6 +205,7 @@ struct PersistRun<'a> {
     what_if: Option<&'a WhatIfResult>,
     recommendations: &'a [Recommendation],
     report: &'a Report,
+    connector_health: &'a ConnectorHealthSnapshot,
 }
 
 impl PersistRun<'_> {
@@ -239,6 +249,12 @@ impl PersistRun<'_> {
             "recommendations",
             "recommendations.json",
             self.recommendations,
+        )?;
+        self.persist_artifact(
+            &mut paths,
+            "connector_health",
+            "connector_health.json",
+            self.connector_health,
         )?;
         self.persist_artifact(&mut paths, "report", "report.json", self.report)?;
         paths.insert("run_id".to_string(), self.run_id.to_string());

@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.3.0 platform contract: how telemetry becomes
+This guide describes the stable v0.3.1 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -24,6 +24,7 @@ Use a separate artifact directory when comparing runs:
 ```bash
 cargo run -p netdiag-cli -- diagnose data/samples/dns_failure.csv --artifacts /tmp/netdiag-artifacts
 cargo run -p netdiag-cli -- history --artifacts /tmp/netdiag-artifacts --limit 20
+cargo run -p netdiag-cli -- evidence <run_id> --artifacts /tmp/netdiag-artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts /tmp/netdiag-artifacts
 ```
 
@@ -161,7 +162,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.3.0 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.3.1 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -182,7 +183,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.3.0 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.3.1 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -240,6 +241,7 @@ different `--artifacts` root is provided.
 | `telemetry_windows.json` | Five-second windows used by rules and ML. |
 | `diagnosis_events.json` | Evidence-first rule events with supporting metrics. |
 | `ml_result.json` | Rust ML top predictions, features, and feature importance. |
+| `connector_health.json` | Source profile, row count, warnings, missing metrics, and measurement quality summary. |
 | `whatif_<action>.json` | Digital-twin baseline, proposed state, and deltas. |
 | `recommendations.json` | Approval-required recommendation records. |
 | `report.json` | End-user report combining telemetry, rules, ML, what-if, recommendations, and HIL summary. |
@@ -248,12 +250,17 @@ different `--artifacts` root is provided.
 The model cache is stored under `artifacts/model/`. It is deterministic and can
 be regenerated if removed.
 
-`run_index.json` is the Run Center index. The desktop Reports page and CLI
-history commands read it to show recent runs, review state, root causes, model
-kind, measurement quality, artifact count, and the latest run-to-run comparison.
+`run_index.json` is the Evidence Console index. New runs also write
+`connector_health.json`, which records source kind, profile name, rows,
+warnings, missing metrics, and measured/estimated/fallback/missing quality. The
+desktop Reports page and CLI history/evidence commands read these artifacts to
+show recent runs, review state, root causes, model kind, connector health,
+measurement quality, artifact count, and run-to-run comparison.
 
 ```bash
 cargo run -p netdiag-cli -- history --artifacts artifacts --limit 20
+cargo run -p netdiag-cli -- history --artifacts artifacts --quality degraded
+cargo run -p netdiag-cli -- evidence <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- artifacts <run_id> --artifacts artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts artifacts
 ```

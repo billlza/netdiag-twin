@@ -28,10 +28,14 @@ use netdiag_core::connectors::{
 };
 use netdiag_core::ml::load_or_train_model;
 use netdiag_core::models::{
-    FaultLabel, HilReviewSummary, HilState, MetricProvenance, MetricQuality, RunManifest,
+    ConnectorHealthSnapshot, ConnectorHealthStatus, FaultLabel, HilReviewSummary, HilState,
+    MetricProvenance, MetricQuality, RunEvidenceSummary, RunHistoryFilter, RunTimelineEvent,
     TopologyModel,
 };
-use netdiag_core::storage::{compare_runs, list_run_history, review_recommendation};
+use netdiag_core::storage::{
+    compare_runs, connector_health_from_ingest, list_run_timeline, review_recommendation,
+    run_artifacts, run_evidence, write_connector_health,
+};
 use netdiag_core::twin::{action_names, topology_model, topology_names, validate_topology_model};
 use netdiag_core::{PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif};
 use serde_json::Value;
@@ -158,14 +162,20 @@ enum Text {
     SettingsLanguage,
     Artifacts,
     CurrentRun,
-    RunHistory,
-    LatestComparison,
     ReviewState,
     RootCauses,
-    ModelType,
-    SyntheticModel,
     Recommendations,
     Evidence,
+    EvidenceConsole,
+    Timeline,
+    SelectedRun,
+    CompareLeft,
+    CompareRight,
+    CompareRuns,
+    QualityStatus,
+    WarningCount,
+    QualityDelta,
+    NoRunSelected,
     WhatIfResult,
     MlTopPredictions,
     FeatureContribution,
@@ -337,6 +347,12 @@ struct NetDiagApp {
     api_test_status: Option<String>,
     api_test_job: Option<ApiTestJob>,
     capture_session: Option<CaptureSessionState>,
+    evidence_timeline_loaded: bool,
+    evidence_timeline: Vec<RunTimelineEvent>,
+    evidence_timeline_error: Option<String>,
+    selected_evidence: Option<RunEvidenceSummary>,
+    evidence_compare_left: Option<String>,
+    evidence_compare_right: Option<String>,
     pending_delete_token: bool,
     pending_clear_runs: bool,
     pending_rebuild_model: bool,
@@ -457,6 +473,12 @@ impl NetDiagApp {
             api_test_status: None,
             api_test_job: None,
             capture_session: None,
+            evidence_timeline_loaded: false,
+            evidence_timeline: Vec::new(),
+            evidence_timeline_error: None,
+            selected_evidence: None,
+            evidence_compare_left: None,
+            evidence_compare_right: None,
             pending_delete_token: false,
             pending_clear_runs: false,
             pending_rebuild_model: false,
@@ -503,6 +525,7 @@ impl NetDiagApp {
                 self.source_snapshot = Some(source_snapshot);
                 self.result = Some(result);
                 self.hil_notes.clear();
+                self.refresh_evidence_timeline();
                 if restore_startup_warning && let Some(warning) = self.settings_notice.clone() {
                     self.error = Some(warning);
                 }
@@ -510,6 +533,35 @@ impl NetDiagApp {
             Err(err) => {
                 self.status = "Needs attention".to_string();
                 self.error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn refresh_evidence_timeline(&mut self) {
+        match list_run_timeline(&self.artifacts_root, RunHistoryFilter::default(), 20) {
+            Ok(timeline) => {
+                self.evidence_timeline = timeline;
+                self.evidence_timeline_error = None;
+                self.evidence_timeline_loaded = true;
+            }
+            Err(err) => {
+                self.evidence_timeline.clear();
+                self.evidence_timeline_error = Some(err.to_string());
+                self.evidence_timeline_loaded = true;
+            }
+        }
+    }
+
+    fn select_evidence_run(&mut self, run_id: &str) {
+        match run_evidence(&self.artifacts_root, run_id) {
+            Ok(evidence) => {
+                self.selected_evidence = Some(evidence);
+                self.settings_notice = None;
+            }
+            Err(err) => {
+                self.selected_evidence = None;
+                self.settings_notice =
+                    Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
             }
         }
     }
@@ -522,8 +574,9 @@ impl NetDiagApp {
     ) -> anyhow::Result<(PipelineResult, SourceSnapshot)> {
         let source_snapshot = source_mode.load()?;
         let request = what_if.or_else(|| WhatIfRequest::built_in("line", action.as_str()).ok());
-        let result =
+        let mut result =
             diagnose_ingest_with_whatif(source_snapshot.ingest.clone(), &artifacts_root, request)?;
+        Self::persist_source_health(&mut result, &source_snapshot, &artifacts_root)?;
         Ok((result, source_snapshot))
     }
 
@@ -549,9 +602,28 @@ impl NetDiagApp {
                 request,
             )
             .map_err(anyhow::Error::from)
-            .map(|result| (result, source_snapshot));
+            .and_then(|mut result| {
+                Self::persist_source_health(&mut result, &source_snapshot, &artifacts_root)?;
+                Ok((result, source_snapshot))
+            });
             let _ = sender.send(result);
         });
+    }
+
+    fn persist_source_health(
+        result: &mut PipelineResult,
+        source_snapshot: &SourceSnapshot,
+        artifacts_root: &Path,
+    ) -> anyhow::Result<()> {
+        let health = connector_health_from_ingest(
+            &source_snapshot.descriptor.kind,
+            &source_snapshot.descriptor.name,
+            &source_snapshot.descriptor.captured_label,
+            &source_snapshot.ingest,
+        );
+        write_connector_health(artifacts_root, &result.run_id, &health)?;
+        result.connector_health = health;
+        Ok(())
     }
 
     fn current_otlp_receiver_config(&self) -> anyhow::Result<OtlpGrpcReceiverConfig> {
@@ -1605,11 +1677,26 @@ impl NetDiagApp {
 
     fn render_reports_page(&mut self, ui: &mut egui::Ui) {
         glass_frame(ui, |ui| {
+            section_title(ui, tr(self.language, Text::EvidenceConsole));
+            ui.add_space(10.0);
+            if !self.evidence_timeline_loaded {
+                self.refresh_evidence_timeline();
+            }
+            if let Some(health) = self.current_connector_health_snapshot() {
+                self.render_connector_health_snapshot(ui, &health);
+                ui.add_space(14.0);
+            }
+            self.render_run_history(ui);
+            ui.add_space(14.0);
+            self.render_selected_evidence(ui);
+            ui.add_space(18.0);
+
             section_title(ui, tr(self.language, Text::Artifacts));
             ui.add_space(10.0);
             if let Some(result) = &self.result {
                 section_title(ui, tr(self.language, Text::CurrentRun));
                 ui.add_space(6.0);
+                let run_id = result.run_id.clone();
                 let run_dir = result.run_dir.clone();
                 let recommendations = result.recommendations.clone();
                 let warnings = result.ingest.warnings.clone();
@@ -1630,18 +1717,20 @@ impl NetDiagApp {
 
                 ui.add_space(14.0);
                 section_title(ui, tr(self.language, Text::ArtifactFiles));
-                match manifest_artifacts(&run_dir) {
+                match run_artifacts(&self.artifacts_root, &run_id) {
                     Ok(entries) if entries.is_empty() => {
                         ui.label(tr(self.language, Text::NoArtifacts));
                     }
                     Ok(entries) => {
-                        for (key, path) in entries {
+                        for entry in entries {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(key).size(12.0).strong().color(INK));
+                                ui.label(RichText::new(entry.key).size(12.0).strong().color(INK));
                                 ui.label(
-                                    RichText::new(path.display().to_string())
-                                        .size(12.0)
-                                        .color(MUTED),
+                                    RichText::new(entry.path).size(12.0).color(if entry.exists {
+                                        MUTED
+                                    } else {
+                                        RED
+                                    }),
                                 );
                             });
                         }
@@ -1766,37 +1855,139 @@ impl NetDiagApp {
             } else {
                 ui.label(tr(self.language, Text::NoArtifacts));
             }
-
-            ui.add_space(18.0);
-            self.render_run_history(ui);
         });
     }
 
+    fn current_connector_health_snapshot(&self) -> Option<ConnectorHealthSnapshot> {
+        self.result
+            .as_ref()
+            .map(|result| result.connector_health.clone())
+            .or_else(|| {
+                self.source_snapshot.as_ref().map(|snapshot| {
+                    connector_health_from_ingest(
+                        &snapshot.descriptor.kind,
+                        &snapshot.descriptor.name,
+                        &snapshot.descriptor.captured_label,
+                        &snapshot.ingest,
+                    )
+                })
+            })
+    }
+
+    fn render_connector_health_snapshot(
+        &self,
+        ui: &mut egui::Ui,
+        health: &ConnectorHealthSnapshot,
+    ) {
+        section_title(ui, tr(self.language, Text::ConnectorHealth));
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::SourceProfile),
+                    health.profile_name
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::ConnectorKind),
+                    health.source_kind
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::QualityStatus),
+                    health_status_display(health.status, self.language)
+                ))
+                .size(12.0)
+                .color(health_status_color(health.status)),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::Rows),
+                    health.rows
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::WarningCount),
+                    health.warning_count
+                ))
+                .size(12.0)
+                .color(if health.warning_count == 0 {
+                    GREEN
+                } else {
+                    ORANGE
+                }),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::LastSample),
+                    health.captured_at.format("%H:%M:%S")
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+        });
+        ui.label(
+            RichText::new(format!(
+                "{}: measured={} estimated={} fallback={} missing={}",
+                tr(self.language, Text::MeasurementQuality),
+                health.quality.measured,
+                health.quality.estimated,
+                health.quality.fallback,
+                health.quality.missing
+            ))
+            .size(12.0)
+            .color(health_status_color(health.status)),
+        );
+        if !health.missing_metrics.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr(self.language, Text::MissingMetrics),
+                    health.missing_metrics.join(", ")
+                ))
+                .size(12.0)
+                .color(ORANGE),
+            );
+        }
+    }
+
     fn render_run_history(&mut self, ui: &mut egui::Ui) {
-        section_title(ui, tr(self.language, Text::RunHistory));
+        section_title(ui, tr(self.language, Text::Timeline));
         ui.add_space(8.0);
-        let history = match list_run_history(&self.artifacts_root, 10) {
-            Ok(history) => history,
-            Err(err) => {
-                ui.label(
-                    RichText::new(format!("{}: {err}", tr(self.language, Text::OpenFailed)))
-                        .size(12.0)
-                        .color(RED),
-                );
-                return;
-            }
-        };
-        if history.is_empty() {
+        if let Some(err) = &self.evidence_timeline_error {
+            ui.label(
+                RichText::new(format!("{}: {err}", tr(self.language, Text::OpenFailed)))
+                    .size(12.0)
+                    .color(RED),
+            );
+            return;
+        }
+        if self.evidence_timeline.is_empty() {
             ui.label(tr(self.language, Text::NoArtifacts));
             return;
         }
-        if history.len() >= 2
-            && let Ok(comparison) =
-                compare_runs(&self.artifacts_root, &history[1].run_id, &history[0].run_id)
+        if let (Some(left), Some(right)) =
+            (&self.evidence_compare_left, &self.evidence_compare_right)
+            && let Ok(comparison) = compare_runs(&self.artifacts_root, left, right)
         {
             ui.group(|ui| {
                 ui.label(
-                    RichText::new(tr(self.language, Text::LatestComparison))
+                    RichText::new(tr(self.language, Text::CompareRuns))
                         .size(13.0)
                         .strong()
                         .color(INK),
@@ -1839,6 +2030,28 @@ impl NetDiagApp {
                                 GREEN
                             }),
                     );
+                    ui.label(
+                        RichText::new(format!(
+                            "{}={}",
+                            tr(self.language, Text::QualityDelta),
+                            comparison.quality_status_changed
+                        ))
+                        .size(12.0)
+                        .color(if comparison.quality_status_changed {
+                            ORANGE
+                        } else {
+                            GREEN
+                        }),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{} {:+}",
+                            tr(self.language, Text::WarningCount),
+                            comparison.warning_count_delta
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
                     if !comparison.new_root_causes.is_empty() {
                         ui.label(
                             RichText::new(format!(
@@ -1854,11 +2067,11 @@ impl NetDiagApp {
             });
             ui.add_space(8.0);
         }
-        for entry in history {
+        for event in self.evidence_timeline.clone() {
             ui.group(|ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
-                        RichText::new(format!("{}  {}", short_run_id(&entry.run_id), entry.sample))
+                        RichText::new(format!("{}  {}", short_run_id(&event.run_id), event.sample))
                             .size(13.0)
                             .strong()
                             .color(INK),
@@ -1867,15 +2080,24 @@ impl NetDiagApp {
                         RichText::new(format!(
                             "{}: {}",
                             tr(self.language, Text::ReviewState),
-                            entry.status
+                            event.status
                         ))
                         .size(12.0)
                         .color(MUTED),
                     );
                     ui.label(
-                        RichText::new(entry.created_at.format("%Y-%m-%d %H:%M:%S").to_string())
+                        RichText::new(event.created_at.format("%Y-%m-%d %H:%M:%S").to_string())
                             .size(12.0)
                             .color(MUTED),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            tr(self.language, Text::QualityStatus),
+                            health_status_display(event.quality_status, self.language)
+                        ))
+                        .size(12.0)
+                        .color(health_status_color(event.quality_status)),
                     );
                 });
                 ui.horizontal_wrapped(|ui| {
@@ -1883,90 +2105,168 @@ impl NetDiagApp {
                         RichText::new(format!(
                             "{}: {}",
                             tr(self.language, Text::RootCauses),
-                            if entry.root_causes.is_empty() {
+                            if event.root_causes.is_empty() {
                                 "normal".to_string()
                             } else {
-                                entry.root_causes.join(", ")
+                                event.root_causes.join(", ")
                             }
                         ))
                         .size(12.0)
                         .color(INK),
                     );
-                    if let Some(label) = &entry.ml_top_label {
+                    if let Some(label) = &event.ml_top_label {
                         ui.label(
-                            RichText::new(format!(
-                                "ML: {} ({:.2})",
-                                label,
-                                entry.ml_top_probability.unwrap_or_default()
-                            ))
-                            .size(12.0)
-                            .color(MUTED),
+                            RichText::new(format!("ML: {label}"))
+                                .size(12.0)
+                                .color(MUTED),
                         );
                     }
-                    if let Some(kind) = &entry.model_kind {
-                        ui.label(
-                            RichText::new(format!(
-                                "{}: {}{}",
-                                tr(self.language, Text::ModelType),
-                                kind,
-                                if entry.synthetic_model {
-                                    format!(" / {}", tr(self.language, Text::SyntheticModel))
-                                } else {
-                                    String::new()
-                                }
-                            ))
-                            .size(12.0)
-                            .color(MUTED),
-                        );
-                    }
-                });
-                let counts = metric_quality_counts_from_provenance(&entry.measurement_quality);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: measured={} estimated={} fallback={} missing={}",
-                            tr(self.language, Text::MeasurementQuality),
-                            counts.measured,
-                            counts.estimated,
-                            counts.fallback,
-                            counts.missing
-                        ))
-                        .size(12.0)
-                        .color(if counts.fallback + counts.missing == 0 {
-                            GREEN
-                        } else {
-                            ORANGE
-                        }),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: {}",
-                            tr(self.language, Text::ArtifactFiles),
-                            entry.artifact_count
-                        ))
-                        .size(12.0)
-                        .color(MUTED),
-                    );
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let run_dir = PathBuf::from(&entry.run_dir);
-                    if soft_button(ui, tr(self.language, Text::OpenReport)).clicked()
-                        && let Err(err) = open_path(&run_dir.join("report.json"))
-                    {
-                        self.settings_notice =
-                            Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
+                    if soft_button(ui, tr(self.language, Text::ViewDetails)).clicked() {
+                        self.select_evidence_run(&event.run_id);
                     }
-                    if soft_button(ui, tr(self.language, Text::OpenRunFolder)).clicked()
-                        && let Err(err) = open_path(&run_dir)
-                    {
-                        self.settings_notice =
-                            Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
+                    if soft_button(ui, tr(self.language, Text::CompareLeft)).clicked() {
+                        self.evidence_compare_left = Some(event.run_id.clone());
+                    }
+                    if soft_button(ui, tr(self.language, Text::CompareRight)).clicked() {
+                        self.evidence_compare_right = Some(event.run_id.clone());
                     }
                 });
             });
             ui.add_space(8.0);
         }
+    }
+
+    fn render_selected_evidence(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, tr(self.language, Text::SelectedRun));
+        ui.add_space(8.0);
+        let Some(evidence) = self.selected_evidence.clone() else {
+            ui.label(
+                RichText::new(tr(self.language, Text::NoRunSelected))
+                    .size(12.0)
+                    .color(MUTED),
+            );
+            return;
+        };
+
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{}  {}",
+                        short_run_id(&evidence.run.run_id),
+                        evidence.run.sample
+                    ))
+                    .size(13.0)
+                    .strong()
+                    .color(INK),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {}",
+                        tr(self.language, Text::ReviewState),
+                        evidence.run.status
+                    ))
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {}",
+                        tr(self.language, Text::QualityStatus),
+                        health_status_display(evidence.run.quality_status, self.language)
+                    ))
+                    .size(12.0)
+                    .color(health_status_color(evidence.run.quality_status)),
+                );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{}: {}",
+                        tr(self.language, Text::RootCauses),
+                        if evidence.run.root_causes.is_empty() {
+                            "normal".to_string()
+                        } else {
+                            evidence.run.root_causes.join(", ")
+                        }
+                    ))
+                    .size(12.0)
+                    .color(INK),
+                );
+                if let Some(label) = &evidence.run.ml_top_label {
+                    ui.label(
+                        RichText::new(format!(
+                            "ML: {} ({:.2})",
+                            label,
+                            evidence.run.ml_top_probability.unwrap_or_default()
+                        ))
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
+            });
+            ui.label(
+                RichText::new(format!(
+                    "{}: measured={} estimated={} fallback={} missing={}",
+                    tr(self.language, Text::MeasurementQuality),
+                    evidence.run.quality.measured,
+                    evidence.run.quality.estimated,
+                    evidence.run.quality.fallback,
+                    evidence.run.quality.missing
+                ))
+                .size(12.0)
+                .color(health_status_color(evidence.run.quality_status)),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}: total={} pending={} accepted={} rejected={} uncertain={} rerun={}",
+                    tr(self.language, Text::HilReview),
+                    evidence.run.hil_summary.total,
+                    evidence.run.hil_summary.pending,
+                    evidence.run.hil_summary.accepted,
+                    evidence.run.hil_summary.rejected,
+                    evidence.run.hil_summary.uncertain,
+                    evidence.run.hil_summary.requires_rerun
+                ))
+                .size(12.0)
+                .color(MUTED),
+            );
+            if let Some(health) = &evidence.connector_health {
+                ui.add_space(6.0);
+                self.render_connector_health_snapshot(ui, health);
+            }
+            ui.add_space(6.0);
+            section_title(ui, tr(self.language, Text::ArtifactFiles));
+            for artifact in evidence.artifacts.iter().take(10) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&artifact.key).size(12.0).strong().color(INK));
+                    ui.label(
+                        RichText::new(&artifact.path)
+                            .size(12.0)
+                            .color(if artifact.exists { MUTED } else { RED }),
+                    );
+                });
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let run_dir = PathBuf::from(&evidence.run.run_dir);
+                if soft_button(ui, tr(self.language, Text::OpenReport)).clicked()
+                    && let Err(err) = open_path(&run_dir.join("report.json"))
+                {
+                    self.settings_notice =
+                        Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
+                }
+                if soft_button(ui, tr(self.language, Text::OpenRunFolder)).clicked()
+                    && let Err(err) = open_path(&run_dir)
+                {
+                    self.settings_notice =
+                        Some(format!("{}: {err}", tr(self.language, Text::OpenFailed)));
+                }
+            });
+        });
     }
 
     fn render_settings_page(&mut self, ui: &mut egui::Ui) {
@@ -3033,6 +3333,14 @@ impl NetDiagApp {
                     tr(self.language, Text::Saved),
                     hil_state_display(outcome.review.state, self.language)
                 ));
+                self.refresh_evidence_timeline();
+                if self
+                    .selected_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.run.run_id == run_id)
+                {
+                    self.select_evidence_run(&run_id);
+                }
             }
             Err(err) => {
                 self.settings_notice = Some(err.to_string());
@@ -3053,6 +3361,9 @@ impl NetDiagApp {
             Ok(())
         })();
         self.pending_clear_runs = false;
+        self.evidence_timeline.clear();
+        self.evidence_timeline_loaded = true;
+        self.selected_evidence = None;
         self.settings_notice = Some(match result {
             Ok(()) => tr(self.language, Text::Saved).to_string(),
             Err(err) => err.to_string(),
@@ -4025,14 +4336,20 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::SettingsLanguage) => "界面语言",
         (Language::Zh, Text::Artifacts) => "运行产物",
         (Language::Zh, Text::CurrentRun) => "当前运行",
-        (Language::Zh, Text::RunHistory) => "运行历史",
-        (Language::Zh, Text::LatestComparison) => "最新两次对比",
         (Language::Zh, Text::ReviewState) => "复核状态",
         (Language::Zh, Text::RootCauses) => "根因",
-        (Language::Zh, Text::ModelType) => "模型类型",
-        (Language::Zh, Text::SyntheticModel) => "合成 fallback",
         (Language::Zh, Text::Recommendations) => "推荐动作",
         (Language::Zh, Text::Evidence) => "证据",
+        (Language::Zh, Text::EvidenceConsole) => "证据控制台",
+        (Language::Zh, Text::Timeline) => "时间线",
+        (Language::Zh, Text::SelectedRun) => "选中运行",
+        (Language::Zh, Text::CompareLeft) => "设为 A",
+        (Language::Zh, Text::CompareRight) => "设为 B",
+        (Language::Zh, Text::CompareRuns) => "运行对比",
+        (Language::Zh, Text::QualityStatus) => "质量状态",
+        (Language::Zh, Text::WarningCount) => "告警数",
+        (Language::Zh, Text::QualityDelta) => "质量变化",
+        (Language::Zh, Text::NoRunSelected) => "请选择一个历史运行查看证据。",
         (Language::Zh, Text::WhatIfResult) => "What-if 结果",
         (Language::Zh, Text::MlTopPredictions) => "ML Top 预测",
         (Language::Zh, Text::FeatureContribution) => "特征贡献",
@@ -4212,14 +4529,20 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::SettingsLanguage) => "Interface Language",
         (Language::En, Text::Artifacts) => "Run Artifacts",
         (Language::En, Text::CurrentRun) => "Current Run",
-        (Language::En, Text::RunHistory) => "Run History",
-        (Language::En, Text::LatestComparison) => "Latest Comparison",
         (Language::En, Text::ReviewState) => "Review State",
         (Language::En, Text::RootCauses) => "Root Causes",
-        (Language::En, Text::ModelType) => "Model Type",
-        (Language::En, Text::SyntheticModel) => "Synthetic fallback",
         (Language::En, Text::Recommendations) => "Recommendations",
         (Language::En, Text::Evidence) => "Evidence",
+        (Language::En, Text::EvidenceConsole) => "Evidence Console",
+        (Language::En, Text::Timeline) => "Timeline",
+        (Language::En, Text::SelectedRun) => "Selected Run",
+        (Language::En, Text::CompareLeft) => "Set A",
+        (Language::En, Text::CompareRight) => "Set B",
+        (Language::En, Text::CompareRuns) => "Run Compare",
+        (Language::En, Text::QualityStatus) => "Quality Status",
+        (Language::En, Text::WarningCount) => "Warnings",
+        (Language::En, Text::QualityDelta) => "Quality Delta",
+        (Language::En, Text::NoRunSelected) => "Select a historical run to inspect evidence.",
         (Language::En, Text::WhatIfResult) => "What-if Result",
         (Language::En, Text::MlTopPredictions) => "ML Top Predictions",
         (Language::En, Text::FeatureContribution) => "Feature Contribution",
@@ -4439,29 +4762,6 @@ fn open_path(path: &Path) -> std::io::Result<()> {
     Command::new("open").arg(path).spawn().map(|_| ())
 }
 
-fn manifest_artifacts(run_dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
-    let file = fs::File::open(run_dir.join("manifest.json"))?;
-    let manifest: RunManifest = serde_json::from_reader(file)?;
-    let mut entries = manifest
-        .artifact_paths
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if key == "run_id" {
-                return None;
-            }
-            let path = PathBuf::from(value);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                run_dir.join(path)
-            };
-            Some((key, path))
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(entries)
-}
-
 fn model_cache_status(root: &Path, lang: Language) -> String {
     let model = root.join("model").join("rust_logistic_model.json");
     match fs::metadata(&model) {
@@ -4624,6 +4924,25 @@ fn metric_quality_counts_from_provenance(provenance: &[MetricProvenance]) -> Met
         }
     }
     counts
+}
+
+fn health_status_display(status: ConnectorHealthStatus, lang: Language) -> &'static str {
+    match (lang, status) {
+        (Language::Zh, ConnectorHealthStatus::Ok) => "可信",
+        (Language::Zh, ConnectorHealthStatus::Degraded) => "降级",
+        (Language::Zh, ConnectorHealthStatus::Error) => "错误",
+        (Language::En, ConnectorHealthStatus::Ok) => "ok",
+        (Language::En, ConnectorHealthStatus::Degraded) => "degraded",
+        (Language::En, ConnectorHealthStatus::Error) => "error",
+    }
+}
+
+fn health_status_color(status: ConnectorHealthStatus) -> Color32 {
+    match status {
+        ConnectorHealthStatus::Ok => GREEN,
+        ConnectorHealthStatus::Degraded => ORANGE,
+        ConnectorHealthStatus::Error => RED,
+    }
 }
 
 fn short_run_id(run_id: &str) -> &str {

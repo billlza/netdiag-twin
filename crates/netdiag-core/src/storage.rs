@@ -1,8 +1,10 @@
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{
-    FaultLabel, HilFeedbackRecord, HilReview, HilReviewSummary, HilState, MetricProvenance,
+    ConnectorHealthSnapshot, ConnectorHealthStatus, FaultLabel, HilFeedbackRecord, HilReview,
+    HilReviewSummary, HilState, IngestResult, MeasurementQualitySummary, MetricProvenance,
     MetricQuality, MetricQualityChange, Recommendation, RecommendationStateChange,
-    RunArtifactEntry, RunComparison, RunHistoryEntry, RunIndexEntry, RunManifest,
+    RunArtifactEntry, RunComparison, RunEvidenceSummary, RunHistoryEntry, RunHistoryFilter,
+    RunIndexEntry, RunManifest, RunTimelineEvent,
 };
 use crate::report::Report;
 use serde::Serialize;
@@ -72,7 +74,12 @@ pub fn list_run_index(artifact_root: impl AsRef<Path>) -> Result<Vec<RunIndexEnt
     let artifact_root = artifact_root.as_ref();
     let index_path = artifact_root.join("run_index.json");
     let mut entries = if index_path.exists() {
-        serde_json::from_value::<Vec<RunIndexEntry>>(read_json(&index_path)?)?
+        match read_json(&index_path)
+            .and_then(|value| Ok(serde_json::from_value::<Vec<RunIndexEntry>>(value)?))
+        {
+            Ok(entries) => entries,
+            Err(_) => scan_run_manifests(artifact_root)?,
+        }
     } else {
         scan_run_manifests(artifact_root)?
     };
@@ -84,12 +91,46 @@ pub fn list_run_history(
     artifact_root: impl AsRef<Path>,
     limit: usize,
 ) -> Result<Vec<RunHistoryEntry>> {
+    list_run_history_filtered(artifact_root, RunHistoryFilter::default(), limit)
+}
+
+pub fn list_run_history_filtered(
+    artifact_root: impl AsRef<Path>,
+    filter: RunHistoryFilter,
+    limit: usize,
+) -> Result<Vec<RunHistoryEntry>> {
     let artifact_root = artifact_root.as_ref();
     let mut entries = Vec::new();
-    for index in list_run_index(artifact_root)?.into_iter().take(limit) {
-        entries.push(run_history_entry(artifact_root, index)?);
+    for index in list_run_index(artifact_root)? {
+        let entry = run_history_entry(artifact_root, index)?;
+        if !run_history_matches(&entry, &filter) {
+            continue;
+        }
+        entries.push(entry);
+        if entries.len() >= limit {
+            break;
+        }
     }
     Ok(entries)
+}
+
+pub fn list_run_timeline(
+    artifact_root: impl AsRef<Path>,
+    filter: RunHistoryFilter,
+    limit: usize,
+) -> Result<Vec<RunTimelineEvent>> {
+    Ok(list_run_history_filtered(artifact_root, filter, limit)?
+        .into_iter()
+        .map(|entry| RunTimelineEvent {
+            run_id: entry.run_id,
+            created_at: entry.created_at,
+            sample: entry.sample,
+            status: entry.status,
+            root_causes: entry.root_causes,
+            ml_top_label: entry.ml_top_label,
+            quality_status: entry.quality_status,
+        })
+        .collect())
 }
 
 pub fn run_history_entry(
@@ -118,6 +159,21 @@ pub fn run_history_entry(
         .as_ref()
         .map(|report| report.measurement_quality.clone())
         .unwrap_or_default();
+    let connector_health = read_connector_health(artifact_root, &index.run_id)
+        .ok()
+        .flatten();
+    let quality = connector_health
+        .as_ref()
+        .map(|health| health.quality)
+        .unwrap_or_else(|| MeasurementQualitySummary::from_provenance(&measurement_quality));
+    let quality_status = connector_health
+        .as_ref()
+        .map(|health| health.status)
+        .unwrap_or_else(|| health_status_for_summary(quality, measurement_quality.len()));
+    let warning_count = connector_health
+        .as_ref()
+        .map(|health| health.warning_count)
+        .unwrap_or(0);
     let hil_summary = report
         .as_ref()
         .map(|report| report.hil_summary.clone())
@@ -134,6 +190,9 @@ pub fn run_history_entry(
         model_kind,
         synthetic_model,
         measurement_quality,
+        quality,
+        quality_status,
+        warning_count,
         hil_summary,
         artifact_count,
     })
@@ -143,6 +202,7 @@ pub fn run_artifacts(
     artifact_root: impl AsRef<Path>,
     run_id: &str,
 ) -> Result<Vec<RunArtifactEntry>> {
+    let artifact_root = artifact_root.as_ref();
     let dir = run_dir(artifact_root, run_id);
     let manifest_path = dir.join("manifest.json");
     let file = File::open(&manifest_path).with_path(&manifest_path)?;
@@ -154,12 +214,7 @@ pub fn run_artifacts(
             if key == "run_id" {
                 return None;
             }
-            let path = PathBuf::from(value);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                dir.join(path)
-            };
+            let path = resolve_artifact_path(artifact_root, run_id, &value);
             Some(RunArtifactEntry {
                 key,
                 exists: path.exists(),
@@ -169,6 +224,85 @@ pub fn run_artifacts(
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(entries)
+}
+
+pub fn connector_health_from_ingest(
+    source_kind: &str,
+    profile_name: &str,
+    sample: &str,
+    ingest: &IngestResult,
+) -> ConnectorHealthSnapshot {
+    let quality = MeasurementQualitySummary::from_provenance(&ingest.metric_provenance);
+    let missing_metrics = missing_metric_names(&ingest.metric_provenance);
+    let status = if ingest.records.is_empty() {
+        ConnectorHealthStatus::Error
+    } else if !ingest.warnings.is_empty() || quality.degraded() {
+        ConnectorHealthStatus::Degraded
+    } else {
+        ConnectorHealthStatus::Ok
+    };
+    ConnectorHealthSnapshot {
+        status,
+        source_kind: source_kind.to_string(),
+        profile_name: profile_name.to_string(),
+        sample: sample.to_string(),
+        rows: ingest.schema.rows,
+        warning_count: ingest.warnings.len(),
+        missing_metrics,
+        quality,
+        captured_at: ingest.schema.ingested_at,
+    }
+}
+
+pub fn write_connector_health(
+    artifact_root: impl AsRef<Path>,
+    run_id: &str,
+    health: &ConnectorHealthSnapshot,
+) -> Result<PathBuf> {
+    let dir = run_dir(artifact_root.as_ref(), run_id);
+    let path = dir.join("connector_health.json");
+    save_json_atomic(&path, health)?;
+    update_manifest_artifact_path(&dir, "connector_health", &path)?;
+    Ok(path)
+}
+
+pub fn read_connector_health(
+    artifact_root: impl AsRef<Path>,
+    run_id: &str,
+) -> Result<Option<ConnectorHealthSnapshot>> {
+    let artifact_root = artifact_root.as_ref();
+    if let Ok(manifest) = read_manifest(artifact_root, run_id)
+        && let Some(path) = manifest.artifact_paths.get("connector_health")
+    {
+        let path = resolve_artifact_path(artifact_root, run_id, path);
+        if path.exists() {
+            let health = serde_json::from_value(read_json(path)?)?;
+            return Ok(Some(health));
+        }
+    }
+
+    let default_path = run_dir(artifact_root, run_id).join("connector_health.json");
+    if default_path.exists() {
+        let health = serde_json::from_value(read_json(default_path)?)?;
+        return Ok(Some(health));
+    }
+
+    infer_connector_health(artifact_root, run_id)
+}
+
+pub fn run_evidence(artifact_root: impl AsRef<Path>, run_id: &str) -> Result<RunEvidenceSummary> {
+    let artifact_root = artifact_root.as_ref();
+    let index = find_run_index(artifact_root, run_id)?;
+    let run = run_history_entry(artifact_root, index)?;
+    let report = read_report(artifact_root, run_id)?;
+    let connector_health = read_connector_health(artifact_root, run_id)?;
+    let artifacts = run_artifacts(artifact_root, run_id)?;
+    Ok(RunEvidenceSummary {
+        run,
+        report,
+        connector_health,
+        artifacts,
+    })
 }
 
 pub fn compare_runs(
@@ -211,6 +345,8 @@ pub fn compare_runs(
             &left_report.measurement_quality,
             &right_report.measurement_quality,
         ),
+        quality_status_changed: left.quality_status != right.quality_status,
+        warning_count_delta: right.warning_count as isize - left.warning_count as isize,
         left,
         right,
     })
@@ -327,17 +463,7 @@ fn write_feedback_record(dir: &Path, record: HilFeedbackRecord) -> Result<()> {
 }
 
 fn update_manifest_feedback_path(dir: &Path) -> Result<()> {
-    let manifest_path = dir.join("manifest.json");
-    if !manifest_path.exists() {
-        return Ok(());
-    }
-    let mut manifest: RunManifest = serde_json::from_value(read_json(&manifest_path)?)?;
-    manifest.artifact_paths.insert(
-        "hil_feedback".to_string(),
-        dir.join("hil_feedback.json").display().to_string(),
-    );
-    save_json_atomic(manifest_path, &manifest)?;
-    Ok(())
+    update_manifest_artifact_path(dir, "hil_feedback", &dir.join("hil_feedback.json"))
 }
 
 fn update_run_index_status(artifact_root: &Path, run_id: &str, status: &str) -> Result<()> {
@@ -398,6 +524,118 @@ fn find_run_index(artifact_root: &Path, run_id: &str) -> Result<RunIndexEntry> {
         .into_iter()
         .find(|entry| entry.run_id == run_id)
         .ok_or_else(|| NetdiagError::InvalidTrace(format!("unknown run id: {run_id}")))
+}
+
+fn run_history_matches(entry: &RunHistoryEntry, filter: &RunHistoryFilter) -> bool {
+    if let Some(status) = &filter.status
+        && !entry.status.eq_ignore_ascii_case(status)
+    {
+        return false;
+    }
+    if let Some(root_cause) = &filter.root_cause {
+        let root_cause = root_cause.trim().to_ascii_lowercase();
+        let has_root = entry.root_causes.iter().any(|root| {
+            root.eq_ignore_ascii_case(&root_cause)
+                || root.replace('_', "-").eq_ignore_ascii_case(&root_cause)
+        });
+        if !has_root {
+            return false;
+        }
+    }
+    if let Some(quality) = filter.quality
+        && entry.quality_status != quality
+    {
+        return false;
+    }
+    true
+}
+
+fn resolve_artifact_path(artifact_root: &Path, run_id: &str, value: &str) -> PathBuf {
+    let raw = PathBuf::from(value);
+    if raw.is_absolute() {
+        return raw;
+    }
+
+    let dir = run_dir(artifact_root, run_id);
+    let mut candidates = Vec::new();
+    if raw.components().count() == 1 {
+        candidates.push(dir.join(&raw));
+    }
+    candidates.push(artifact_root.join(&raw));
+    candidates.push(raw.clone());
+    candidates.push(dir.join(&raw));
+
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .cloned()
+        .unwrap_or_else(|| candidates.remove(0))
+}
+
+fn update_manifest_artifact_path(dir: &Path, key: &str, path: &Path) -> Result<()> {
+    let manifest_path = dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let mut manifest: RunManifest = serde_json::from_value(read_json(&manifest_path)?)?;
+    manifest
+        .artifact_paths
+        .insert(key.to_string(), path.display().to_string());
+    save_json_atomic(manifest_path, &manifest)?;
+    Ok(())
+}
+
+fn infer_connector_health(
+    artifact_root: &Path,
+    run_id: &str,
+) -> Result<Option<ConnectorHealthSnapshot>> {
+    let Ok(report) = read_report(artifact_root, run_id) else {
+        return Ok(None);
+    };
+    let index = find_run_index(artifact_root, run_id).ok();
+    let quality = MeasurementQualitySummary::from_provenance(&report.measurement_quality);
+    let status = health_status_for_summary(quality, report.measurement_quality.len());
+    Ok(Some(ConnectorHealthSnapshot {
+        status,
+        source_kind: "legacy_artifact".to_string(),
+        profile_name: "legacy_artifact".to_string(),
+        sample: index
+            .as_ref()
+            .map(|index| index.sample.clone())
+            .unwrap_or_else(|| run_id.to_string()),
+        rows: report.trace_summary.overall.samples,
+        warning_count: 0,
+        missing_metrics: missing_metric_names(&report.measurement_quality),
+        quality,
+        captured_at: index
+            .as_ref()
+            .map(|index| index.created_at)
+            .unwrap_or_else(|| report.generated_at),
+    }))
+}
+
+fn health_status_for_summary(
+    summary: MeasurementQualitySummary,
+    provenance_count: usize,
+) -> ConnectorHealthStatus {
+    if provenance_count == 0 || summary.degraded() {
+        ConnectorHealthStatus::Degraded
+    } else {
+        ConnectorHealthStatus::Ok
+    }
+}
+
+fn missing_metric_names(provenance: &[MetricProvenance]) -> Vec<String> {
+    provenance
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.quality,
+                MetricQuality::Fallback | MetricQuality::Missing
+            )
+        })
+        .map(|item| item.field.clone())
+        .collect()
 }
 
 fn report_history_fields(

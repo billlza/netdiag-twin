@@ -6,14 +6,17 @@ use netdiag_core::ml::{
     load_or_train_model, train_model_from_jsonl,
 };
 use netdiag_core::models::{
-    FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState, MetricProvenance, MetricQuality,
-    ModelManifest, Recommendation, RecommendationKind, RunIndexEntry, RunManifest,
-    TwinPolicyActionKind,
+    ConnectorHealthStatus, FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState,
+    MetricProvenance, MetricQuality, ModelManifest, Recommendation, RecommendationKind,
+    RunHistoryFilter, RunIndexEntry, RunManifest, TwinPolicyActionKind,
 };
 use netdiag_core::pipeline::{PipelineResult, diagnose_file};
 use netdiag_core::report::Report;
 use netdiag_core::rules::diagnose_rules;
-use netdiag_core::storage::{review_recommendation, save_json_atomic};
+use netdiag_core::storage::{
+    list_run_history_filtered, read_connector_health, review_recommendation, run_artifacts,
+    run_evidence, save_json_atomic,
+};
 use netdiag_core::telemetry::summarize_telemetry;
 use netdiag_core::twin::run_simulated_whatif;
 use serde::ser::{Error as _, Serialize, Serializer};
@@ -742,6 +745,75 @@ fn save_json_atomic_writes_readable_json_and_avoids_partial_final_file() {
     );
     assert!(!failing_path.exists());
     assert!(!failing_path.with_extension("json.tmp").exists());
+}
+
+#[test]
+fn evidence_console_artifacts_include_connector_health() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = diagnose_file(
+        sample("congestion"),
+        temp.path(),
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("diagnose sample");
+
+    let health = read_connector_health(temp.path(), &result.run_id)
+        .expect("read connector health")
+        .expect("connector health exists");
+    assert_eq!(health.rows, result.ingest.schema.rows);
+    assert_eq!(health.status, ConnectorHealthStatus::Ok);
+
+    let evidence = run_evidence(temp.path(), &result.run_id).expect("evidence summary");
+    assert_eq!(evidence.run.run_id, result.run_id);
+    assert!(
+        evidence
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.key == "connector_health" && artifact.exists)
+    );
+
+    let filtered = list_run_history_filtered(
+        temp.path(),
+        RunHistoryFilter {
+            quality: Some(ConnectorHealthStatus::Ok),
+            ..RunHistoryFilter::default()
+        },
+        10,
+    )
+    .expect("filtered history");
+    assert_eq!(filtered.len(), 1);
+}
+
+#[test]
+fn evidence_console_derives_health_for_legacy_runs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = diagnose_file(
+        sample("normal"),
+        temp.path(),
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("diagnose sample");
+    let run_dir = result.run_dir.clone();
+    fs::remove_file(run_dir.join("connector_health.json")).expect("remove new health artifact");
+    let manifest_path = run_dir.join("manifest.json");
+    let mut manifest: RunManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest.artifact_paths.remove("connector_health");
+    save_json_atomic(&manifest_path, &manifest).expect("rewrite manifest");
+
+    let health = read_connector_health(temp.path(), &result.run_id)
+        .expect("legacy health read")
+        .expect("legacy health inferred");
+    assert_eq!(health.source_kind, "legacy_artifact");
+    assert_eq!(health.rows, result.telemetry.overall.samples);
+
+    let artifacts = run_artifacts(temp.path(), &result.run_id).expect("artifact list");
+    assert!(
+        !artifacts
+            .iter()
+            .any(|artifact| artifact.key == "connector_health")
+    );
 }
 
 struct FailingSerialize;

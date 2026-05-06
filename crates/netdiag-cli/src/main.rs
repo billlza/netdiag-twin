@@ -9,14 +9,16 @@ use netdiag_core::connectors::{
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
 };
-use netdiag_core::models::{FaultLabel, HilState, TelemetrySummary};
+use netdiag_core::models::{
+    ConnectorHealthStatus, FaultLabel, HilState, RunHistoryFilter, TelemetrySummary,
+};
 use netdiag_core::perf_budget::{
     build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
     run_perf_measurements_sampled, save_perf_budget,
 };
 use netdiag_core::storage::{
-    compare_runs, list_run_history, read_json, review_recommendation, run_artifacts, run_dir,
-    save_json,
+    compare_runs, connector_health_from_ingest, list_run_history_filtered, read_json,
+    review_recommendation, run_artifacts, run_dir, run_evidence, save_json, write_connector_health,
 };
 use netdiag_core::twin::run_simulated_whatif;
 use netdiag_core::{Result as CoreResult, diagnose_file};
@@ -56,6 +58,17 @@ enum Command {
         artifacts: PathBuf,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        root_cause: Option<String>,
+        #[arg(long)]
+        quality: Option<String>,
+    },
+    Evidence {
+        run_id: String,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
     },
     Compare {
         left_run_id: String,
@@ -180,9 +193,27 @@ fn run(args: Args) -> anyhow::Result<()> {
             let report = read_json(path)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
-        Command::History { artifacts, limit } => {
-            let history = list_run_history(artifacts, limit)?;
+        Command::History {
+            artifacts,
+            limit,
+            status,
+            root_cause,
+            quality,
+        } => {
+            let history = list_run_history_filtered(
+                artifacts,
+                RunHistoryFilter {
+                    status,
+                    root_cause,
+                    quality: parse_quality_filter(quality.as_deref())?,
+                },
+                limit,
+            )?;
             println!("{}", serde_json::to_string_pretty(&history)?);
+        }
+        Command::Evidence { run_id, artifacts } => {
+            let evidence = run_evidence(artifacts, &run_id)?;
+            println!("{}", serde_json::to_string_pretty(&evidence)?);
         }
         Command::Compare {
             left_run_id,
@@ -331,20 +362,21 @@ fn run(args: Args) -> anyhow::Result<()> {
                 })?,
                 _ => unreachable!("clap restricts connector kind"),
             };
+            let health = connector_health_from_ingest(&kind, &kind, &loaded.sample, &loaded.ingest);
             if diagnose {
-                let result = netdiag_core::diagnose_ingest(
+                let mut result = netdiag_core::diagnose_ingest(
                     loaded.ingest,
-                    artifacts,
+                    &artifacts,
                     Some(("line", "reroute_path_b")),
                 )?;
+                write_connector_health(&artifacts, &result.run_id, &health)?;
+                result.connector_health = health;
                 println!("{}", serde_json::to_string_pretty(&result.report)?);
             } else {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "sample": loaded.sample,
-                        "rows": loaded.ingest.records.len(),
-                        "warnings": loaded.ingest.warnings,
+                        "health": health,
                         "provenance": loaded.provenance,
                     }))?
                 );
@@ -414,6 +446,15 @@ fn native_pcap_source(endpoint: &str) -> NativePcapSource {
     }
 }
 
+fn parse_quality_filter(value: Option<&str>) -> anyhow::Result<Option<ConnectorHealthStatus>> {
+    value
+        .map(|value| {
+            ConnectorHealthStatus::from_str(value)
+                .map_err(|_| anyhow::anyhow!("invalid quality status: {value}"))
+        })
+        .transpose()
+}
+
 fn run_whatif(
     run_id: &str,
     topology: &str,
@@ -455,6 +496,7 @@ mod tests {
     use netdiag_core::ingest::ingest_trace;
     use netdiag_core::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME};
     use netdiag_core::models::{HilState, ModelManifest};
+    use netdiag_core::storage::list_run_history;
     use std::fs;
     use std::io::Write;
 
@@ -596,8 +638,19 @@ mod tests {
             path_str(temp.path()),
             "--limit",
             "5",
+            "--quality",
+            "ok",
         ]);
         run(history_args).expect("history command");
+
+        let evidence_args = Args::parse_from([
+            "netdiag",
+            "evidence",
+            &right.run_id,
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(evidence_args).expect("evidence command");
 
         let compare_args = Args::parse_from([
             "netdiag",
@@ -625,5 +678,10 @@ mod tests {
         assert!(!comparison.new_root_causes.is_empty() || comparison.ml_label_changed);
         let artifact_entries = run_artifacts(temp.path(), &right.run_id).expect("artifacts");
         assert!(artifact_entries.iter().any(|entry| entry.key == "report"));
+        assert!(
+            artifact_entries
+                .iter()
+                .any(|entry| entry.key == "connector_health")
+        );
     }
 }

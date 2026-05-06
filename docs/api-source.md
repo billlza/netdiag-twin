@@ -27,6 +27,11 @@ The desktop app now treats live collection as a connector family:
 For OTLP, native pcap, and system counter examples, see
 [getting-started.md](getting-started.md#otlp-grpc).
 
+All connector collect paths return the same `ConnectorHealthSnapshot` shape in
+the CLI and write `connector_health.json` when run with `--diagnose`, so
+measured, estimated, fallback, and missing metrics stay visible in Evidence
+Console instead of being treated as normal values.
+
 ## Settings And Environment
 
 ```bash

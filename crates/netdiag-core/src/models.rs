@@ -189,6 +189,87 @@ pub struct MetricProvenance {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementQualitySummary {
+    pub measured: usize,
+    pub estimated: usize,
+    pub fallback: usize,
+    pub missing: usize,
+}
+
+impl MeasurementQualitySummary {
+    pub fn from_provenance(provenance: &[MetricProvenance]) -> Self {
+        let mut summary = Self::default();
+        for item in provenance {
+            match item.quality {
+                MetricQuality::Measured => summary.measured += 1,
+                MetricQuality::Estimated => summary.estimated += 1,
+                MetricQuality::Fallback => summary.fallback += 1,
+                MetricQuality::Missing => summary.missing += 1,
+            }
+        }
+        summary
+    }
+
+    pub fn degraded(self) -> bool {
+        self.fallback > 0 || self.missing > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorHealthStatus {
+    #[default]
+    Ok,
+    Degraded,
+    Error,
+}
+
+impl ConnectorHealthStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectorHealthStatus::Ok => "ok",
+            ConnectorHealthStatus::Degraded => "degraded",
+            ConnectorHealthStatus::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for ConnectorHealthStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ConnectorHealthStatus {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ok" | "healthy" => Ok(ConnectorHealthStatus::Ok),
+            "degraded" | "warning" | "warn" => Ok(ConnectorHealthStatus::Degraded),
+            "error" | "failed" | "failure" => Ok(ConnectorHealthStatus::Error),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorHealthSnapshot {
+    #[serde(default)]
+    pub status: ConnectorHealthStatus,
+    pub source_kind: String,
+    pub profile_name: String,
+    pub sample: String,
+    pub rows: usize,
+    pub warning_count: usize,
+    #[serde(default)]
+    pub missing_metrics: Vec<String>,
+    #[serde(default)]
+    pub quality: MeasurementQualitySummary,
+    pub captured_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestResult {
     pub records: Vec<TraceRecord>,
@@ -671,9 +752,49 @@ pub struct RunHistoryEntry {
     #[serde(default)]
     pub measurement_quality: Vec<MetricProvenance>,
     #[serde(default)]
+    pub quality: MeasurementQualitySummary,
+    #[serde(default)]
+    pub quality_status: ConnectorHealthStatus,
+    #[serde(default)]
+    pub warning_count: usize,
+    #[serde(default)]
     pub hil_summary: HilReviewSummary,
     #[serde(default)]
     pub artifact_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunHistoryFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<ConnectorHealthStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunTimelineEvent {
+    pub run_id: String,
+    pub created_at: DateTime<Utc>,
+    pub sample: String,
+    pub status: String,
+    #[serde(default)]
+    pub root_causes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ml_top_label: Option<String>,
+    #[serde(default)]
+    pub quality_status: ConnectorHealthStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunEvidenceSummary {
+    pub run: RunHistoryEntry,
+    pub report: crate::report::Report,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_health: Option<ConnectorHealthSnapshot>,
+    #[serde(default)]
+    pub artifacts: Vec<RunArtifactEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -692,6 +813,8 @@ pub struct RunComparison {
     pub review_status_changed: bool,
     pub recommendation_state_changes: Vec<RecommendationStateChange>,
     pub measurement_quality_changes: Vec<MetricQualityChange>,
+    pub quality_status_changed: bool,
+    pub warning_count_delta: isize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

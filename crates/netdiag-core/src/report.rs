@@ -30,6 +30,10 @@ pub struct RootCause {
     pub severity: String,
     pub confidence: f64,
     pub why: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub method: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +113,8 @@ pub fn render_report(
                 severity: format!("{:?}", event.evidence.severity).to_ascii_lowercase(),
                 confidence: event.evidence.confidence,
                 why: event.evidence.why.clone(),
+                source: event.source.clone(),
+                method: event.evidence.method.clone(),
             })
             .collect(),
         rule_vs_ml: compare_rule_ml(events, ml),

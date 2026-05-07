@@ -4,7 +4,7 @@
   "title": "NetDiag Adapter Payload",
   "type": "object",
   "additionalProperties": true,
-  "required": ["sample", "protocol", "flow_count", "records", "experiment"],
+  "required": ["schema", "sample", "protocol", "flow_count", "records", "experiment"],
   "properties": {
     "schema": {
       "type": "string",

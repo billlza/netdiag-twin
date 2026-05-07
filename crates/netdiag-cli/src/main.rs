@@ -1,5 +1,5 @@
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use netdiag_core::connectors::{
     HttpJsonConfig, NativePcapConfig, NativePcapSource, OtlpGrpcReceiverConfig,
     PrometheusExpositionConfig, PrometheusQueryRangeConfig, SystemCountersConfig,
@@ -13,8 +13,8 @@ use netdiag_core::dataset::{
 };
 use netdiag_core::evidence_bundle::export_evidence_bundle;
 use netdiag_core::lab::{
-    LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_batch, run_lab_scenario,
-    summarize_lab_runs, validate_lab_run,
+    LabPreflightMode, LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_batch,
+    run_lab_scenario, summarize_lab_runs, validate_lab_run,
 };
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
@@ -223,6 +223,8 @@ enum FeedbackCommand {
 enum LabCommand {
     Preflight {
         scenario: PathBuf,
+        #[arg(long, value_enum, default_value_t = CliLabPreflightMode::Static)]
+        mode: CliLabPreflightMode,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
@@ -247,6 +249,21 @@ enum LabCommand {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliLabPreflightMode {
+    Static,
+    Live,
+}
+
+impl From<CliLabPreflightMode> for LabPreflightMode {
+    fn from(value: CliLabPreflightMode) -> Self {
+        match value {
+            CliLabPreflightMode::Static => LabPreflightMode::Static,
+            CliLabPreflightMode::Live => LabPreflightMode::Live,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -374,12 +391,17 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Lab { command } => match command {
             LabCommand::Preflight {
                 scenario,
+                mode,
                 artifacts,
             } => {
-                let report = preflight_lab_scenario(&scenario, LabPreflightOptions { artifacts })
-                    .with_context(|| {
-                    format!("lab preflight failed for {}", scenario.display())
-                })?;
+                let report = preflight_lab_scenario(
+                    &scenario,
+                    LabPreflightOptions {
+                        artifacts,
+                        mode: mode.into(),
+                    },
+                )
+                .with_context(|| format!("lab preflight failed for {}", scenario.display()))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if !report.passed {
                     anyhow::bail!("lab preflight failed for {}", report.scenario_id);

@@ -89,6 +89,8 @@ pub struct DatasetSplitReport {
     pub stratified: bool,
     pub validation_ratio: f64,
     pub test_ratio: f64,
+    #[serde(default)]
+    pub split_warnings: Vec<String>,
     pub train: DatasetPartition,
     pub validation: DatasetPartition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +256,14 @@ pub fn split_dataset_jsonl(
             "dataset split would leave no training rows".to_string(),
         ));
     }
+    let split_warnings = split_warnings(
+        &rows,
+        &validation_rows,
+        &test_rows,
+        stratified,
+        validation_ratio,
+        test_ratio,
+    );
 
     let stem = input
         .file_stem()
@@ -303,6 +313,7 @@ pub fn split_dataset_jsonl(
         stratified,
         validation_ratio,
         test_ratio,
+        split_warnings,
         train,
         validation,
         test,
@@ -698,6 +709,52 @@ fn partition_report(path: &Path, rows: &[DatasetRow]) -> Result<DatasetPartition
     })
 }
 
+fn split_warnings(
+    rows: &[DatasetRow],
+    validation_rows: &[DatasetRow],
+    test_rows: &[DatasetRow],
+    stratified: bool,
+    validation_ratio: f64,
+    test_ratio: f64,
+) -> Vec<String> {
+    if !stratified {
+        return Vec::new();
+    }
+    let input_distribution = label_distribution(rows);
+    let validation_distribution = label_distribution(validation_rows);
+    let test_distribution = label_distribution(test_rows);
+    let mut warnings = Vec::new();
+    for (label, count) in input_distribution {
+        if validation_ratio > 0.0 {
+            match validation_distribution
+                .get(&label)
+                .copied()
+                .unwrap_or_default()
+            {
+                0 => warnings.push(format!(
+                    "label {label} has only {count} row(s); validation set has no {label} examples"
+                )),
+                1 => warnings.push(format!(
+                    "label {label} validation set has only 1 example; evaluation will be noisy"
+                )),
+                _ => {}
+            }
+        }
+        if test_ratio > 0.0 {
+            match test_distribution.get(&label).copied().unwrap_or_default() {
+                0 => warnings.push(format!(
+                    "label {label} has only {count} row(s); test set has no {label} examples"
+                )),
+                1 => warnings.push(format!(
+                    "label {label} test set has only 1 example; test metrics will be noisy"
+                )),
+                _ => {}
+            }
+        }
+    }
+    warnings
+}
+
 fn label_distribution(rows: &[DatasetRow]) -> BTreeMap<String, usize> {
     let mut labels = BTreeMap::new();
     for row in rows {
@@ -850,6 +907,47 @@ mod tests {
             compare_datasets(&dataset, &registration.manifest_path).expect("compare datasets");
         assert!(comparison.same_hash);
         assert_eq!(comparison.row_delta, 0);
+    }
+
+    #[test]
+    fn stratified_split_warns_when_validation_lacks_label() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("small-feedback.jsonl");
+        std::fs::write(
+            &dataset,
+            [
+                serde_json::json!({
+                    "label": "normal",
+                    "features": feature_payload(10.0)
+                })
+                .to_string(),
+                serde_json::json!({
+                    "label": "normal",
+                    "features": feature_payload(11.0)
+                })
+                .to_string(),
+                serde_json::json!({
+                    "label": "tls_failure",
+                    "features": feature_payload(80.0)
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write dataset");
+
+        let report =
+            split_dataset_jsonl(&dataset, temp.path().join("splits"), true, 2026, 0.5, 0.0)
+                .expect("split");
+
+        assert!(
+            report
+                .split_warnings
+                .iter()
+                .any(|warning| warning.contains("tls_failure") && warning.contains("validation")),
+            "{:?}",
+            report.split_warnings
+        );
     }
 
     fn feature_payload(seed: f64) -> serde_json::Value {

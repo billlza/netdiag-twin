@@ -27,9 +27,9 @@ use netdiag_core::connectors::{
     load_system_counters_with_control,
 };
 use netdiag_core::lab::{
-    LabAcceptanceReport, LabPreflightOptions, LabPreflightReport, LabRunIndex, LabRunIndexEntry,
-    LabRunOptions, LabRunResult, LabSummaryReport, preflight_lab_scenario, run_lab_scenario,
-    summarize_lab_runs,
+    LabAcceptanceReport, LabPreflightMode, LabPreflightOptions, LabPreflightReport, LabRunIndex,
+    LabRunIndexEntry, LabRunOptions, LabRunResult, LabSummaryReport, preflight_lab_scenario,
+    run_lab_scenario, summarize_lab_runs,
 };
 use netdiag_core::ml::{
     FeedbackExportSummary, export_feedback_training_dataset, load_or_train_model,
@@ -1054,9 +1054,15 @@ impl NetDiagApp {
         self.lab_status = Some("Preflight running".to_string());
         self.lab_job = Some(receiver);
         thread::spawn(move || {
-            let result = preflight_lab_scenario(&scenario, LabPreflightOptions { artifacts })
-                .map(LabJobOutcome::Preflight)
-                .map_err(anyhow::Error::from);
+            let result = preflight_lab_scenario(
+                &scenario,
+                LabPreflightOptions {
+                    artifacts,
+                    mode: LabPreflightMode::Static,
+                },
+            )
+            .map(LabJobOutcome::Preflight)
+            .map_err(anyhow::Error::from);
             let _ = sender.send(result);
         });
     }

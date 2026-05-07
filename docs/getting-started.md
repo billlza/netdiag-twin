@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.3.4 platform contract: how telemetry becomes
+This guide describes the stable v0.3.5 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -164,7 +164,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.3.4 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.3.5 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -185,7 +185,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.3.4 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.3.5 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -278,15 +278,26 @@ policy, collection windows, and acceptance gates.
 
 ```bash
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
+cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml --mode live
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab validate <run_id> \
   --artifacts artifacts
 ```
 
+Preflight defaults to `--mode static`, which validates scenario schema,
+topology/policy shape, mapping files, paths, endpoint syntax, and artifact
+writability without querying live data sources. Use `--mode live` when you want
+the check to actually call HTTP/JSON, Prometheus, pcap interfaces/files, OTLP
+bind probes, or system counters.
+
 `lab validate` first reads `artifacts/lab_run_index.json`, then falls back to a
 bounded scan under `artifacts/lab-runs/*/*/runs/<run_id>`. Passing `--scenario`
 is still supported, but indexed lab runs can validate from the global artifact
 root.
+
+Lab acceptance rejects synthetic fallback ML models by default. Prototype or
+smoke scenarios can opt in with `allow_synthetic_model: true`; production lab
+scenarios can pin a trained model by setting `required_model_dataset_hash`.
 
 Each lab run writes:
 

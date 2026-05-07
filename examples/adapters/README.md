@@ -22,6 +22,16 @@ These adapters convert lab tools into the canonical NetDiag JSON payload:
 at `schema/netdiag-adapter-payload.schema.json` is intentionally strict for
 records and permissive for lab-specific metadata under `experiment`.
 
+Every Python adapter supports deterministic offline sample generation:
+
+```sh
+python3 examples/adapters/dns-probe/adapter.py --emit-sample
+python3 scripts/validate_adapter_samples.py
+```
+
+The CI validator uses `--emit-sample`, so adapter schema checks do not require
+network access, `tc`, an `iperf3` server, or long-running HTTP exporters.
+
 Templates:
 
 - `http-json-python`: expose a CSV/JSON trace as `GET /trace`.

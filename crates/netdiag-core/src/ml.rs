@@ -362,12 +362,13 @@ pub fn train_model_from_jsonl_with_options(
     }
     let rows = read_training_jsonl(dataset_path)?;
     let dataset_hash = sha256_file(dataset_path)?;
+    let dataset_labels = rows.iter().map(|row| row.label).collect::<BTreeSet<_>>();
     let (training_rows, validation_rows) = partition_training_rows(&rows, options);
     let model = train_model_from_feature_rows(&training_rows)?;
     let evaluation = if validation_rows.is_empty() {
         None
     } else {
-        Some(evaluate_model(&model, &validation_rows)?)
+        Some(evaluate_model(&model, &validation_rows, &dataset_labels)?)
     };
     let mut manifest = build_model_manifest(
         format!("jsonl:{}", dataset_path.display()),
@@ -609,7 +610,11 @@ fn validation_count(len: usize, split: f64) -> usize {
     validation.max(1).min(len.saturating_sub(1))
 }
 
-fn evaluate_model(model: &RustMlModel, rows: &[FeatureTrainingRow]) -> Result<ModelEvaluation> {
+fn evaluate_model(
+    model: &RustMlModel,
+    rows: &[FeatureTrainingRow],
+    expected_labels: &BTreeSet<FaultLabel>,
+) -> Result<ModelEvaluation> {
     let mut correct = 0usize;
     let mut confusion = dense_confusion_matrix();
     for row in rows {
@@ -635,10 +640,47 @@ fn evaluate_model(model: &RustMlModel, rows: &[FeatureTrainingRow]) -> Result<Mo
         .collect::<BTreeMap<_, _>>();
     let macro_f1 =
         per_label.values().map(|metrics| metrics.f1).sum::<f64>() / FaultLabel::ALL.len() as f64;
+    let validation_distribution =
+        rows.iter()
+            .fold(BTreeMap::<FaultLabel, usize>::new(), |mut counts, row| {
+                *counts.entry(row.label).or_default() += 1;
+                counts
+            });
+    let missing_validation_labels = expected_labels
+        .iter()
+        .filter(|label| {
+            validation_distribution
+                .get(label)
+                .copied()
+                .unwrap_or_default()
+                == 0
+        })
+        .map(|label| label.as_str().to_string())
+        .collect::<Vec<_>>();
+    let mut warnings = missing_validation_labels
+        .iter()
+        .map(|label| format!("validation set has no {label} examples"))
+        .collect::<Vec<_>>();
+    for label in expected_labels {
+        if validation_distribution
+            .get(label)
+            .copied()
+            .unwrap_or_default()
+            == 1
+        {
+            warnings.push(format!(
+                "validation set has only 1 {} example; evaluation is noisy",
+                label.as_str()
+            ));
+        }
+    }
     Ok(ModelEvaluation {
         validation_examples: rows.len(),
         accuracy: round4(accuracy),
         macro_f1: round4(macro_f1),
+        degraded: !warnings.is_empty(),
+        warnings,
+        missing_validation_labels,
         per_label,
         confusion_matrix: confusion,
     })
@@ -1136,5 +1178,31 @@ mod tests {
         assert_eq!(metrics.precision, 1.0);
         assert_eq!(metrics.recall, 0.6667);
         assert_eq!(metrics.f1, 0.8);
+    }
+
+    #[test]
+    fn evaluation_marks_missing_validation_labels_degraded() {
+        let training = vec![
+            row(FaultLabel::Normal, 10.0),
+            row(FaultLabel::Congestion, 200.0),
+        ];
+        let model = train_model_from_feature_rows(&training).expect("model");
+        let expected = [FaultLabel::Normal, FaultLabel::Congestion]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        let evaluation =
+            evaluate_model(&model, &[row(FaultLabel::Normal, 12.0)], &expected).expect("eval");
+
+        assert!(evaluation.degraded, "{:?}", evaluation.warnings);
+        assert_eq!(evaluation.missing_validation_labels, vec!["congestion"]);
+        assert!(
+            evaluation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("validation set has no congestion examples")),
+            "{:?}",
+            evaluation.warnings
+        );
     }
 }

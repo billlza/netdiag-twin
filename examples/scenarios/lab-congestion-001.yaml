@@ -29,3 +29,4 @@ acceptance:
     packet_loss_rate: measured
   require_rule_ml_agreement: true
   require_what_if_improvement: true
+  allow_synthetic_model: true

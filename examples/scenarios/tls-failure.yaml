@@ -12,3 +12,4 @@ acceptance:
   min_rule_confidence: 0.75
   min_ml_probability: 0.70
   require_what_if_improvement: false
+  allow_synthetic_model: true

@@ -329,6 +329,15 @@ pub struct CorroborationSignal {
     pub confidence_delta: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorroborationDecision {
+    #[default]
+    BoostExisting,
+    AddCounterEvidence,
+    RaisesSuspectedFault,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerfBudget {
     pub schema_version: u32,
@@ -558,6 +567,12 @@ pub struct ModelEvaluation {
     pub validation_examples: usize,
     pub accuracy: f64,
     pub macro_f1: f64,
+    #[serde(default)]
+    pub degraded: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub missing_validation_labels: Vec<String>,
     #[serde(default)]
     pub per_label: BTreeMap<String, LabelMetrics>,
     pub confusion_matrix: BTreeMap<String, BTreeMap<String, usize>>,

@@ -21,6 +21,23 @@ FIELDS = [
 ]
 
 
+SAMPLE_RECORDS = [
+    {
+        "timestamp": "2026-05-07T09:00:00+00:00",
+        "latency_ms": 42.0,
+        "jitter_ms": 3.5,
+        "packet_loss_rate": 0.5,
+        "retransmission_rate": 1.0,
+        "timeout_events": 0.0,
+        "retry_events": 1.0,
+        "throughput_mbps": 88.0,
+        "dns_failure_events": 0.0,
+        "tls_failure_events": 0.0,
+        "quic_blocked_ratio": 0.0,
+    }
+]
+
+
 def load_values(path: Path) -> dict[str, float]:
     with path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -43,6 +60,17 @@ def canonical_record(row: dict[str, str]) -> dict:
     return record
 
 
+def build_payload(sample: str, records: list[dict], experiment: dict[str, str]) -> dict:
+    return {
+        "schema": "netdiag-adapter-payload/v1",
+        "sample": sample,
+        "protocol": "TCP",
+        "flow_count": 1,
+        "records": records,
+        "experiment": experiment,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     values: dict[str, float] = {}
     records: list[dict] = []
@@ -63,14 +91,7 @@ class Handler(BaseHTTPRequestHandler):
             content_type = "text/plain; version=0.0.4"
         elif self.path == "/trace":
             body = json.dumps(
-                {
-                    "schema": "netdiag-adapter-payload/v1",
-                    "sample": self.sample,
-                    "protocol": "TCP",
-                    "flow_count": 1,
-                    "records": self.records,
-                    "experiment": self.experiment,
-                }
+                build_payload(self.sample, self.records, self.experiment)
             ).encode("utf-8")
             content_type = "application/json"
         else:
@@ -100,16 +121,31 @@ def prometheus_name(field: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", required=True, type=Path)
+    parser.add_argument("--csv", type=Path)
     parser.add_argument("--port", default=9107, type=int)
+    parser.add_argument("--emit-sample", action="store_true")
+    parser.add_argument("--sample")
     parser.add_argument("--scenario-id", default=None)
     parser.add_argument("--fault-start", default="")
     parser.add_argument("--fault-end", default="")
     parser.add_argument("--ground-truth", default="normal")
     args = parser.parse_args()
+    if args.emit_sample:
+        sample = args.sample or "prometheus-exporter-python"
+        experiment = {
+            "scenario_id": args.scenario_id or sample,
+            "fault_start": args.fault_start,
+            "fault_end": args.fault_end,
+            "ground_truth": args.ground_truth,
+        }
+        print(json.dumps(build_payload(sample, SAMPLE_RECORDS, experiment), indent=2))
+        return
+    if not args.csv:
+        parser.error("--csv is required unless --emit-sample is used")
+
     Handler.values = load_values(args.csv)
     Handler.records = load_records(args.csv)
-    Handler.sample = args.csv.stem
+    Handler.sample = args.sample or args.csv.stem
     Handler.experiment = {
         "scenario_id": args.scenario_id or args.csv.stem,
         "fault_start": args.fault_start,

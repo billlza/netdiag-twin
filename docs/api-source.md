@@ -132,6 +132,9 @@ Validate lab adapter output against
 `examples/adapters/schema/netdiag-adapter-payload.schema.json`; NetDiag uses the
 canonical `records` for diagnosis and preserves experiment metadata in lab
 evidence files.
+Every example Python adapter also supports `--emit-sample`, and CI runs
+`python3 scripts/validate_adapter_samples.py` so schema drift is caught without
+touching live lab infrastructure.
 
 ## Prometheus Mapping
 

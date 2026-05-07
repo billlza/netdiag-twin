@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+SAMPLE_TIME = "2026-05-07T09:00:00+00:00"
+
+
 def record_from_iperf(payload: dict) -> dict:
     end = payload.get("end", {})
     timestamp = (
@@ -44,12 +47,41 @@ def load_iperf_json(args: argparse.Namespace) -> dict:
     return json.loads(completed.stdout)
 
 
+def sample_iperf_json(udp: bool) -> dict:
+    if udp:
+        stream_summary = {
+            "udp": {
+                "bits_per_second": 48_500_000.0,
+                "jitter_ms": 8.5,
+                "lost_percent": 1.25,
+            }
+        }
+        end_summary = stream_summary["udp"]
+    else:
+        stream_summary = {
+            "sender": {
+                "bits_per_second": 94_200_000.0,
+                "retransmits": 2.0,
+            }
+        }
+        end_summary = stream_summary["sender"]
+    return {
+        "start": {"timestamp": {"time": SAMPLE_TIME}},
+        "end": {
+            "streams": [stream_summary],
+            "sum": end_summary,
+            "sum_sent": end_summary,
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--iperf-json", type=Path)
     parser.add_argument("--server", default="127.0.0.1")
     parser.add_argument("--duration-secs", default=10, type=int)
     parser.add_argument("--udp", action="store_true")
+    parser.add_argument("--emit-sample", action="store_true")
     parser.add_argument("--sample", default="iperf3-http-json")
     parser.add_argument("--scenario-id", default="manual-iperf3")
     parser.add_argument("--fault-start", default="")
@@ -57,7 +89,7 @@ def main() -> None:
     parser.add_argument("--ground-truth", default="normal")
     args = parser.parse_args()
 
-    payload = load_iperf_json(args)
+    payload = sample_iperf_json(args.udp) if args.emit_sample else load_iperf_json(args)
     record = record_from_iperf(payload)
     print(
         json.dumps(

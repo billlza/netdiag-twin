@@ -478,18 +478,20 @@ pub enum StartupTab {
     RuleMl,
     DigitalTwin,
     WhatIf,
+    Lab,
     Reports,
     Settings,
 }
 
 impl StartupTab {
-    pub const ALL: [StartupTab; 8] = [
+    pub const ALL: [StartupTab; 9] = [
         StartupTab::Overview,
         StartupTab::Telemetry,
         StartupTab::Diagnosis,
         StartupTab::RuleMl,
         StartupTab::DigitalTwin,
         StartupTab::WhatIf,
+        StartupTab::Lab,
         StartupTab::Reports,
         StartupTab::Settings,
     ];

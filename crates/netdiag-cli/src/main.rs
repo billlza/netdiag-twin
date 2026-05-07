@@ -6,10 +6,15 @@ use netdiag_core::connectors::{
     default_prometheus_mapping, load_http_json, load_native_pcap, load_otlp_grpc_receiver,
     load_prometheus_exposition, load_prometheus_query_range, load_system_counters,
 };
-use netdiag_core::dataset::{inspect_dataset_jsonl, split_dataset_jsonl, validate_dataset_jsonl};
+use netdiag_core::dataset::{
+    DatasetManifestMetadata, DatasetRegisterOptions, DatasetValidationOptions, compare_datasets,
+    inspect_dataset_jsonl, register_dataset_jsonl, split_dataset_jsonl, validate_dataset_jsonl,
+    validate_dataset_jsonl_with_options,
+};
 use netdiag_core::evidence_bundle::export_evidence_bundle;
 use netdiag_core::lab::{
-    LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_scenario, validate_lab_run,
+    LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_batch, run_lab_scenario,
+    summarize_lab_runs, validate_lab_run,
 };
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
@@ -133,6 +138,8 @@ enum Command {
         shuffle_seed: Option<u64>,
         #[arg(long, default_value_t = false)]
         stratified: bool,
+        #[arg(long, default_value_t = 0)]
+        min_rows_per_label: usize,
     },
     Feedback {
         #[command(subcommand)]
@@ -231,6 +238,15 @@ enum LabCommand {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+    Batch {
+        scenarios: Vec<PathBuf>,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
+    Summary {
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -240,6 +256,8 @@ enum DatasetCommand {
     },
     Validate {
         dataset: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        min_rows_per_label: usize,
     },
     Split {
         dataset: PathBuf,
@@ -253,6 +271,29 @@ enum DatasetCommand {
         validation_ratio: f64,
         #[arg(long, default_value_t = 0.0)]
         test_ratio: f64,
+    },
+    Register {
+        dataset: PathBuf,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        #[arg(long)]
+        dataset_id: Option<String>,
+        #[arg(long)]
+        source_run: Vec<String>,
+        #[arg(long)]
+        scenario_id: Vec<String>,
+        #[arg(long)]
+        operator: Option<String>,
+        #[arg(long, default_value = "hil_final_label_required")]
+        label_policy: String,
+        #[arg(long, default_value_t = 0)]
+        min_rows_per_label: usize,
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    Compare {
+        left: PathBuf,
+        right: PathBuf,
     },
 }
 
@@ -370,6 +411,25 @@ fn run(args: Args) -> anyhow::Result<()> {
                     anyhow::bail!("lab acceptance failed for {}", report.scenario_id);
                 }
             }
+            LabCommand::Batch {
+                scenarios,
+                artifacts,
+            } => {
+                if scenarios.is_empty() {
+                    anyhow::bail!("lab batch requires at least one scenario");
+                }
+                let report = run_lab_batch(&scenarios, LabRunOptions { artifacts })
+                    .context("lab batch failed")?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if report.failed > 0 {
+                    anyhow::bail!("lab batch failed for {} scenario(s)", report.failed);
+                }
+            }
+            LabCommand::Summary { artifacts } => {
+                let report = summarize_lab_runs(&artifacts)
+                    .with_context(|| format!("lab summary failed for {}", artifacts.display()))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         },
         Command::Dataset { command } => match command {
             DatasetCommand::Inspect { dataset } => {
@@ -377,10 +437,19 @@ fn run(args: Args) -> anyhow::Result<()> {
                     .with_context(|| format!("dataset inspect failed for {}", dataset.display()))?;
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             }
-            DatasetCommand::Validate { dataset } => {
-                let report = validate_dataset_jsonl(&dataset).with_context(|| {
-                    format!("dataset validation failed for {}", dataset.display())
-                })?;
+            DatasetCommand::Validate {
+                dataset,
+                min_rows_per_label,
+            } => {
+                let report = if min_rows_per_label == 0 {
+                    validate_dataset_jsonl(&dataset)
+                } else {
+                    validate_dataset_jsonl_with_options(
+                        &dataset,
+                        DatasetValidationOptions { min_rows_per_label },
+                    )
+                }
+                .with_context(|| format!("dataset validation failed for {}", dataset.display()))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if !report.passed {
                     anyhow::bail!("dataset validation failed");
@@ -410,6 +479,50 @@ fn run(args: Args) -> anyhow::Result<()> {
                 )
                 .with_context(|| format!("dataset split failed for {}", dataset.display()))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            DatasetCommand::Register {
+                dataset,
+                artifacts,
+                dataset_id,
+                source_run,
+                scenario_id,
+                operator,
+                label_policy,
+                min_rows_per_label,
+                notes,
+            } => {
+                let registration = register_dataset_jsonl(
+                    &dataset,
+                    DatasetRegisterOptions {
+                        artifacts,
+                        metadata: DatasetManifestMetadata {
+                            dataset_id,
+                            sources: vec![
+                                "registered_jsonl".to_string(),
+                                dataset.display().to_string(),
+                            ],
+                            source_runs: source_run,
+                            scenario_ids: scenario_id,
+                            operator,
+                            label_policy: Some(label_policy),
+                            min_rows_per_label: (min_rows_per_label > 0)
+                                .then_some(min_rows_per_label),
+                            notes,
+                        },
+                    },
+                )
+                .with_context(|| format!("dataset register failed for {}", dataset.display()))?;
+                println!("{}", serde_json::to_string_pretty(&registration)?);
+            }
+            DatasetCommand::Compare { left, right } => {
+                let comparison = compare_datasets(&left, &right).with_context(|| {
+                    format!(
+                        "dataset compare failed for {} and {}",
+                        left.display(),
+                        right.display()
+                    )
+                })?;
+                println!("{}", serde_json::to_string_pretty(&comparison)?);
             }
         },
         Command::EvidenceBundle {
@@ -466,6 +579,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             validation_split,
             shuffle_seed,
             stratified,
+            min_rows_per_label,
         } => {
             let manifest = train_model_from_jsonl_with_options(
                 &dataset,
@@ -474,6 +588,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                     validation_split,
                     shuffle_seed,
                     stratified,
+                    min_rows_per_label,
                 },
             )
             .with_context(|| format!("training failed for {}", dataset.display()))?;
@@ -489,6 +604,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "training_examples": manifest.training_examples,
                     "dataset_hash_sha256": manifest.dataset_hash_sha256,
                     "training_config": manifest.training_config,
+                    "training_gate": manifest.training_gate,
                     "evaluation": manifest.evaluation,
                 }))?
             );
@@ -1017,6 +1133,42 @@ mod tests {
         assert!(output_dir.join("dataset_manifest.json").exists());
         assert!(output_dir.join("feedback-train.jsonl").exists());
         assert!(output_dir.join("feedback-validation.jsonl").exists());
+
+        let register_args = Args::parse_from([
+            "netdiag",
+            "dataset",
+            "register",
+            path_str(&dataset_path),
+            "--artifacts",
+            path_str(temp.path()),
+            "--dataset-id",
+            "feedback-test",
+            "--source-run",
+            "run-a",
+            "--scenario-id",
+            "lab-congestion-001",
+            "--operator",
+            "cli-test",
+        ]);
+        run(register_args).expect("dataset register");
+
+        let registered_manifest = fs::read_dir(temp.path().join("datasets/feedback-test"))
+            .expect("registered dataset dir")
+            .map(|entry| entry.expect("entry").path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-manifest.json"))
+            })
+            .expect("registered manifest");
+        let compare_args = Args::parse_from([
+            "netdiag",
+            "dataset",
+            "compare",
+            path_str(&dataset_path),
+            path_str(&registered_manifest),
+        ]);
+        run(compare_args).expect("dataset compare");
     }
 
     #[test]
@@ -1068,5 +1220,14 @@ mod tests {
             path_str(temp.path()),
         ]);
         run(validate_args).expect("lab validate resolves index");
+
+        let summary_args = Args::parse_from([
+            "netdiag",
+            "lab",
+            "summary",
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(summary_args).expect("lab summary");
     }
 }

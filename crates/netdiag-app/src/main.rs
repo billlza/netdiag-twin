@@ -26,7 +26,14 @@ use netdiag_core::connectors::{
     OtlpReceiverSession, SystemCountersConfig, load_native_pcap_with_control,
     load_system_counters_with_control,
 };
-use netdiag_core::ml::load_or_train_model;
+use netdiag_core::lab::{
+    LabAcceptanceReport, LabPreflightOptions, LabPreflightReport, LabRunIndex, LabRunIndexEntry,
+    LabRunOptions, LabRunResult, LabSummaryReport, preflight_lab_scenario, run_lab_scenario,
+    summarize_lab_runs,
+};
+use netdiag_core::ml::{
+    FeedbackExportSummary, export_feedback_training_dataset, load_or_train_model,
+};
 use netdiag_core::models::{
     ConnectorHealthSnapshot, ConnectorHealthStatus, FaultLabel, HilReviewSummary, HilState,
     MetricProvenance, MetricQuality, RunEvidenceSummary, RunHistoryFilter, RunTimelineEvent,
@@ -100,6 +107,7 @@ enum Tab {
     RuleMl,
     DigitalTwin,
     WhatIf,
+    Lab,
     Reports,
     Settings,
 }
@@ -313,6 +321,7 @@ enum Text {
     StartupRuleMl,
     StartupDigitalTwin,
     StartupWhatIf,
+    StartupLab,
     StartupReports,
     StartupSettings,
 }
@@ -355,6 +364,13 @@ struct NetDiagApp {
     selected_evidence: Option<RunEvidenceSummary>,
     evidence_compare_left: Option<String>,
     evidence_compare_right: Option<String>,
+    lab_scenario_path: String,
+    lab_preflight: Option<LabPreflightReport>,
+    lab_last_run: Option<LabRunResult>,
+    lab_runs: Vec<LabRunIndexEntry>,
+    lab_summary: Option<LabSummaryReport>,
+    lab_job: Option<LabJob>,
+    lab_status: Option<String>,
     pending_delete_token: bool,
     pending_clear_runs: bool,
     pending_rebuild_model: bool,
@@ -365,11 +381,20 @@ struct NetDiagApp {
 type DiagnosisJob = mpsc::Receiver<anyhow::Result<(PipelineResult, SourceSnapshot)>>;
 type ApiTestJob = mpsc::Receiver<anyhow::Result<ApiTestOutcome>>;
 type CaptureSessionJob = mpsc::Receiver<CaptureSessionEvent>;
+type LabJob = mpsc::Receiver<anyhow::Result<LabJobOutcome>>;
 
 #[derive(Debug)]
 struct ApiTestOutcome {
     rows: usize,
     sample: String,
+}
+
+#[derive(Debug)]
+enum LabJobOutcome {
+    Preflight(LabPreflightReport),
+    Run(Box<LabRunResult>),
+    Summary(LabSummaryReport),
+    DatasetExport(FeedbackExportSummary),
 }
 
 #[derive(Debug)]
@@ -481,6 +506,13 @@ impl NetDiagApp {
             selected_evidence: None,
             evidence_compare_left: None,
             evidence_compare_right: None,
+            lab_scenario_path: "examples/scenarios/lab-congestion-001.yaml".to_string(),
+            lab_preflight: None,
+            lab_last_run: None,
+            lab_runs: load_lab_runs_from_index(&settings.artifacts_root).unwrap_or_default(),
+            lab_summary: None,
+            lab_job: None,
+            lab_status: None,
             pending_delete_token: false,
             pending_clear_runs: false,
             pending_rebuild_model: false,
@@ -936,6 +968,152 @@ impl NetDiagApp {
         }
     }
 
+    fn poll_lab_job(&mut self, ctx: &egui::Context) {
+        let message = match self.lab_job.as_ref().map(|receiver| receiver.try_recv()) {
+            Some(Ok(message)) => Some(message),
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Some(Err(anyhow::anyhow!(
+                "lab worker stopped before returning a result"
+            ))),
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                None
+            }
+            None => None,
+        };
+
+        if let Some(message) = message {
+            self.lab_job = None;
+            match message {
+                Ok(LabJobOutcome::Preflight(report)) => {
+                    self.lab_status = Some(if report.passed {
+                        format!("Preflight passed for {}", report.scenario_id)
+                    } else {
+                        format!("Preflight failed for {}", report.scenario_id)
+                    });
+                    self.lab_preflight = Some(report);
+                }
+                Ok(LabJobOutcome::Run(result)) => {
+                    self.lab_status = Some(format!(
+                        "Lab run {} {}",
+                        result.run_id,
+                        if result.acceptance.passed {
+                            "passed"
+                        } else {
+                            "failed"
+                        }
+                    ));
+                    self.lab_last_run = Some(*result);
+                    self.refresh_lab_runs();
+                    self.refresh_evidence_timeline();
+                }
+                Ok(LabJobOutcome::Summary(summary)) => {
+                    self.lab_status = Some(format!(
+                        "Lab summary: {} passed / {} failed",
+                        summary.passed, summary.failed
+                    ));
+                    self.lab_summary = Some(summary);
+                    self.refresh_lab_runs();
+                }
+                Ok(LabJobOutcome::DatasetExport(summary)) => {
+                    self.lab_status = Some(format!(
+                        "Dataset export wrote {} rows to {}",
+                        summary.rows, summary.output
+                    ));
+                }
+                Err(err) => {
+                    self.lab_status = Some(err.to_string());
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn refresh_lab_runs(&mut self) {
+        self.lab_runs = load_lab_runs_from_index(&self.artifacts_root).unwrap_or_default();
+    }
+
+    fn choose_lab_scenario(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Lab scenario", &["yaml", "yml"])
+            .set_directory("examples/scenarios")
+            .pick_file()
+        else {
+            return;
+        };
+        self.lab_scenario_path = path.display().to_string();
+    }
+
+    fn start_lab_preflight(&mut self) {
+        if self.lab_job.is_some() {
+            self.lab_status = Some("Lab job is already running".to_string());
+            return;
+        }
+        let scenario = PathBuf::from(self.lab_scenario_path.trim());
+        let artifacts = self.artifacts_root.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.lab_status = Some("Preflight running".to_string());
+        self.lab_job = Some(receiver);
+        thread::spawn(move || {
+            let result = preflight_lab_scenario(&scenario, LabPreflightOptions { artifacts })
+                .map(LabJobOutcome::Preflight)
+                .map_err(anyhow::Error::from);
+            let _ = sender.send(result);
+        });
+    }
+
+    fn start_lab_run(&mut self) {
+        if self.lab_job.is_some() {
+            self.lab_status = Some("Lab job is already running".to_string());
+            return;
+        }
+        let scenario = PathBuf::from(self.lab_scenario_path.trim());
+        let artifacts = self.artifacts_root.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.lab_status = Some("Lab run started".to_string());
+        self.lab_job = Some(receiver);
+        thread::spawn(move || {
+            let result = run_lab_scenario(&scenario, LabRunOptions { artifacts })
+                .map(|result| LabJobOutcome::Run(Box::new(result)))
+                .map_err(anyhow::Error::from);
+            let _ = sender.send(result);
+        });
+    }
+
+    fn start_lab_summary(&mut self) {
+        if self.lab_job.is_some() {
+            self.lab_status = Some("Lab job is already running".to_string());
+            return;
+        }
+        let artifacts = self.artifacts_root.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.lab_status = Some("Lab summary running".to_string());
+        self.lab_job = Some(receiver);
+        thread::spawn(move || {
+            let result = summarize_lab_runs(&artifacts)
+                .map(LabJobOutcome::Summary)
+                .map_err(anyhow::Error::from);
+            let _ = sender.send(result);
+        });
+    }
+
+    fn start_lab_dataset_export(&mut self) {
+        if self.lab_job.is_some() {
+            self.lab_status = Some("Lab job is already running".to_string());
+            return;
+        }
+        let artifacts = self.artifacts_root.clone();
+        let output = artifacts.join("datasets").join("lab-feedback.jsonl");
+        let (sender, receiver) = mpsc::channel();
+        self.lab_status = Some("Dataset export running".to_string());
+        self.lab_job = Some(receiver);
+        thread::spawn(move || {
+            let result = export_feedback_training_dataset(&artifacts, &output)
+                .map(LabJobOutcome::DatasetExport)
+                .map_err(anyhow::Error::from);
+            let _ = sender.send(result);
+        });
+    }
+
     fn start_api_test_connection(&mut self) {
         if self.api_test_job.is_some() {
             return;
@@ -1143,6 +1321,7 @@ impl eframe::App for NetDiagApp {
         #[cfg(target_os = "macos")]
         self.poll_native_menu();
         self.poll_diagnosis_job(ui.ctx());
+        self.poll_lab_job(ui.ctx());
         self.poll_api_test_job(ui.ctx());
         self.poll_capture_session(ui.ctx());
         self.maybe_start_deferred_diagnosis(ui.ctx());
@@ -1276,6 +1455,7 @@ impl NetDiagApp {
             (Tab::RuleMl, icons::SCALES_3_LINE),
             (Tab::DigitalTwin, icons::NODE_TREE),
             (Tab::WhatIf, icons::ROUTE_LINE),
+            (Tab::Lab, icons::FLASK_LINE),
             (Tab::Reports, icons::FILE_TEXT_LINE),
             (Tab::Settings, icons::SETTINGS_3_LINE),
         ] {
@@ -1413,6 +1593,7 @@ impl NetDiagApp {
                         Tab::RuleMl => self.render_rule_ml_page(ui),
                         Tab::DigitalTwin => self.render_digital_twin_page(ui),
                         Tab::WhatIf => self.render_whatif_page(ui),
+                        Tab::Lab => self.render_lab_page(ui),
                         Tab::Reports => self.render_reports_page(ui),
                         Tab::Settings => self.render_settings_page(ui),
                         Tab::Overview => {}
@@ -1673,6 +1854,147 @@ impl NetDiagApp {
                     }
                 });
         });
+    }
+
+    fn render_lab_page(&mut self, ui: &mut egui::Ui) {
+        glass_frame(ui, |ui| {
+            section_title(ui, title_for_tab(Tab::Lab, self.language));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Scenario").size(12.0).color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.lab_scenario_path)
+                        .desired_width((ui.available_width() - 380.0).max(280.0)),
+                );
+                if soft_button(ui, "Load").clicked() {
+                    self.choose_lab_scenario();
+                }
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let job_ready = self.lab_job.is_none();
+                if soft_button_enabled(ui, "Preflight", job_ready).clicked() {
+                    self.start_lab_preflight();
+                }
+                if soft_button_enabled(ui, "Run", job_ready).clicked() {
+                    self.start_lab_run();
+                }
+                if soft_button_enabled(ui, "Summary", job_ready).clicked() {
+                    self.start_lab_summary();
+                }
+                if soft_button_enabled(ui, "Dataset export", job_ready).clicked() {
+                    self.start_lab_dataset_export();
+                }
+            });
+            if let Some(status) = &self.lab_status {
+                ui.add_space(8.0);
+                ui.label(RichText::new(status).size(13.0).color(INK));
+            }
+        });
+
+        ui.add_space(16.0);
+        glass_frame(ui, |ui| {
+            section_title(ui, "Acceptance result");
+            ui.add_space(10.0);
+            if let Some(result) = &self.lab_last_run {
+                let acceptance = result.acceptance.clone();
+                let lab_run_dir = result.lab_run_dir.clone();
+                let evidence_bundle = result.evidence_bundle.output.clone();
+                render_lab_acceptance(ui, &acceptance);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if soft_button(ui, "Open lab run").clicked() {
+                        self.open_path_with_notice(Path::new(&lab_run_dir));
+                    }
+                    if soft_button(ui, "Evidence bundle").clicked() {
+                        self.open_path_with_notice(Path::new(&evidence_bundle));
+                    }
+                });
+            } else {
+                ui.label(RichText::new("No lab run yet.").size(13.0).color(MUTED));
+            }
+        });
+
+        ui.add_space(16.0);
+        glass_frame(ui, |ui| {
+            section_title(ui, "Preflight");
+            ui.add_space(10.0);
+            if let Some(report) = &self.lab_preflight {
+                for check in &report.checks {
+                    let color = match check.status {
+                        netdiag_core::lab::LabPreflightCheckStatus::Passed => GREEN,
+                        netdiag_core::lab::LabPreflightCheckStatus::Failed => RED,
+                        netdiag_core::lab::LabPreflightCheckStatus::Skipped => ORANGE,
+                    };
+                    bullet(ui, &format!("{}: {}", check.name, check.message), color);
+                }
+            } else {
+                ui.label(
+                    RichText::new("Run preflight before the experiment.")
+                        .size(13.0)
+                        .color(MUTED),
+                );
+            }
+        });
+
+        ui.add_space(16.0);
+        glass_frame(ui, |ui| {
+            section_title(ui, "Previous lab runs");
+            ui.add_space(10.0);
+            if self.lab_runs.is_empty() {
+                self.refresh_lab_runs();
+            }
+            if self.lab_runs.is_empty() {
+                ui.label(
+                    RichText::new("No indexed lab runs.")
+                        .size(13.0)
+                        .color(MUTED),
+                );
+            } else {
+                for run in self.lab_runs.iter().take(8).cloned().collect::<Vec<_>>() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(if run.passed { "pass" } else { "fail" })
+                                .size(12.0)
+                                .strong()
+                                .color(if run.passed { GREEN } else { RED }),
+                        );
+                        ui.label(RichText::new(&run.scenario_id).size(12.0).color(INK));
+                        ui.label(RichText::new(&run.run_id).size(12.0).color(MUTED));
+                        if soft_button(ui, "Open").clicked() {
+                            self.open_path_with_notice(Path::new(&run.lab_run_dir));
+                        }
+                    });
+                }
+            }
+        });
+
+        if let Some(summary) = &self.lab_summary {
+            ui.add_space(16.0);
+            glass_frame(ui, |ui| {
+                section_title(ui, "Lab summary");
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} runs · {} passed · {} failed",
+                        summary.total_runs, summary.passed, summary.failed
+                    ))
+                    .size(14.0)
+                    .color(INK),
+                );
+                ui.add_space(8.0);
+                for (label, stats) in &summary.by_label {
+                    bullet(
+                        ui,
+                        &format!(
+                            "{}: runs {}, pass {}, rule {:.2}, ml {:.2}",
+                            label, stats.runs, stats.passed, stats.rule_accuracy, stats.ml_accuracy
+                        ),
+                        BLUE,
+                    );
+                }
+            });
+        }
     }
 
     fn render_reports_page(&mut self, ui: &mut egui::Ui) {
@@ -3997,6 +4319,7 @@ fn title_for_tab(tab: Tab, lang: Language) -> &'static str {
         (Language::Zh, Tab::RuleMl) => "规则 vs ML",
         (Language::Zh, Tab::DigitalTwin) => "数字孪生",
         (Language::Zh, Tab::WhatIf) => "What-if",
+        (Language::Zh, Tab::Lab) => "实验室",
         (Language::Zh, Tab::Reports) => "报告",
         (Language::Zh, Tab::Settings) => "设置",
         (Language::En, Tab::Overview) => "Overview",
@@ -4005,6 +4328,7 @@ fn title_for_tab(tab: Tab, lang: Language) -> &'static str {
         (Language::En, Tab::RuleMl) => "Rule vs ML",
         (Language::En, Tab::DigitalTwin) => "Digital Twin",
         (Language::En, Tab::WhatIf) => "What-if",
+        (Language::En, Tab::Lab) => "Lab",
         (Language::En, Tab::Reports) => "Reports",
         (Language::En, Tab::Settings) => "Settings",
     }
@@ -4037,6 +4361,7 @@ impl From<StartupTab> for Tab {
             StartupTab::RuleMl => Tab::RuleMl,
             StartupTab::DigitalTwin => Tab::DigitalTwin,
             StartupTab::WhatIf => Tab::WhatIf,
+            StartupTab::Lab => Tab::Lab,
             StartupTab::Reports => Tab::Reports,
             StartupTab::Settings => Tab::Settings,
         }
@@ -4052,6 +4377,7 @@ impl From<Tab> for StartupTab {
             Tab::RuleMl => StartupTab::RuleMl,
             Tab::DigitalTwin => StartupTab::DigitalTwin,
             Tab::WhatIf => StartupTab::WhatIf,
+            Tab::Lab => StartupTab::Lab,
             Tab::Reports => StartupTab::Reports,
             Tab::Settings => StartupTab::Settings,
         }
@@ -4298,6 +4624,48 @@ fn format_capture_progress(progress: &CaptureProgress) -> String {
     parts.join(" · ")
 }
 
+fn load_lab_runs_from_index(artifact_root: &Path) -> anyhow::Result<Vec<LabRunIndexEntry>> {
+    let index_path = artifact_root.join("lab_run_index.json");
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&index_path)?;
+    let index: LabRunIndex = serde_json::from_str(&raw)?;
+    Ok(index.runs)
+}
+
+fn render_lab_acceptance(ui: &mut egui::Ui, acceptance: &LabAcceptanceReport) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(if acceptance.passed {
+                "passed"
+            } else {
+                "failed"
+            })
+            .size(16.0)
+            .strong()
+            .color(if acceptance.passed { GREEN } else { RED }),
+        );
+        ui.label(
+            RichText::new(format!(
+                "{} · ML {} {:.2}",
+                acceptance.expected_label.as_str(),
+                acceptance.actual_ml_top,
+                acceptance.actual_ml_probability
+            ))
+            .size(13.0)
+            .color(INK),
+        );
+    });
+    if acceptance.failures.is_empty() {
+        bullet(ui, "acceptance gate passed", GREEN);
+    } else {
+        for failure in &acceptance.failures {
+            bullet(ui, failure, RED);
+        }
+    }
+}
+
 fn tr(lang: Language, text: Text) -> &'static str {
     match (lang, text) {
         (Language::Zh, Text::Subtitle) => "实时网络诊断与分析",
@@ -4489,6 +4857,7 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::Zh, Text::StartupRuleMl) => "规则 vs ML",
         (Language::Zh, Text::StartupDigitalTwin) => "数字孪生",
         (Language::Zh, Text::StartupWhatIf) => "What-if",
+        (Language::Zh, Text::StartupLab) => "实验室",
         (Language::Zh, Text::StartupReports) => "报告",
         (Language::Zh, Text::StartupSettings) => "设置",
         (Language::En, Text::Subtitle) => "Real-time network diagnosis and analysis",
@@ -4686,6 +5055,7 @@ fn tr(lang: Language, text: Text) -> &'static str {
         (Language::En, Text::StartupRuleMl) => "Rule vs ML",
         (Language::En, Text::StartupDigitalTwin) => "Digital Twin",
         (Language::En, Text::StartupWhatIf) => "What-if",
+        (Language::En, Text::StartupLab) => "Lab",
         (Language::En, Text::StartupReports) => "Reports",
         (Language::En, Text::StartupSettings) => "Settings",
     }
@@ -4731,6 +5101,7 @@ fn startup_tab_label(tab: StartupTab, lang: Language) -> &'static str {
         StartupTab::RuleMl => tr(lang, Text::StartupRuleMl),
         StartupTab::DigitalTwin => tr(lang, Text::StartupDigitalTwin),
         StartupTab::WhatIf => tr(lang, Text::StartupWhatIf),
+        StartupTab::Lab => tr(lang, Text::StartupLab),
         StartupTab::Reports => tr(lang, Text::StartupReports),
         StartupTab::Settings => tr(lang, Text::StartupSettings),
     }
@@ -5364,6 +5735,16 @@ fn soft_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).size(13.0).color(INK))
             .fill(Color32::from_white_alpha(130))
+            .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
+            .corner_radius(8),
+    )
+}
+
+fn soft_button_enabled(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(text).size(13.0).color(INK))
+            .fill(Color32::from_white_alpha(if enabled { 130 } else { 70 }))
             .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
             .corner_radius(8),
     )
@@ -6117,7 +6498,7 @@ mod tests {
     fn bundled_cjk_font_contains_required_chinese_glyphs() {
         let face = ttf_parser::Face::parse(CJK_FONT_BYTES, 0).expect("bundled CJK font parses");
 
-        for ch in "概览诊断规则数字孪生设置导入仿真真实拥塞".chars() {
+        for ch in "概览诊断规则数字孪生设置导入仿真真实拥塞实验室".chars() {
             assert!(
                 face.glyph_index(ch).is_some(),
                 "bundled CJK font is missing {ch}"
@@ -6148,5 +6529,13 @@ mod tests {
         assert_eq!(rows.caption_y, Some(106.0));
         let group_center = (rows.label_y + rows.caption_y.unwrap()) / 2.0;
         assert!((group_center - 80.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn startup_tab_round_trip_includes_lab() {
+        assert!(StartupTab::ALL.contains(&StartupTab::Lab));
+        assert_eq!(Tab::from(StartupTab::Lab), Tab::Lab);
+        assert_eq!(StartupTab::from(Tab::Lab), StartupTab::Lab);
+        assert_eq!(title_for_tab(Tab::Lab, Language::En), "Lab");
     }
 }

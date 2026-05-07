@@ -21,6 +21,7 @@ const ID_VIEW_DIAGNOSIS: &str = "netdiag.view.diagnosis";
 const ID_VIEW_RULE_ML: &str = "netdiag.view.rule-ml";
 const ID_VIEW_DIGITAL_TWIN: &str = "netdiag.view.digital-twin";
 const ID_VIEW_WHAT_IF: &str = "netdiag.view.what-if";
+const ID_VIEW_LAB: &str = "netdiag.view.lab";
 const ID_VIEW_REPORTS: &str = "netdiag.view.reports";
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +56,7 @@ impl NativeMenuCommand {
             ID_VIEW_RULE_ML => Self::SwitchTab(Tab::RuleMl),
             ID_VIEW_DIGITAL_TWIN => Self::SwitchTab(Tab::DigitalTwin),
             ID_VIEW_WHAT_IF => Self::SwitchTab(Tab::WhatIf),
+            ID_VIEW_LAB => Self::SwitchTab(Tab::Lab),
             ID_VIEW_REPORTS => Self::SwitchTab(Tab::Reports),
             _ => return None,
         })
@@ -249,7 +251,8 @@ impl NativeMenu {
                 Code::Digit5,
             ),
             view_item(ID_VIEW_WHAT_IF, Tab::WhatIf, lang, false, Code::Digit6),
-            view_item(ID_VIEW_REPORTS, Tab::Reports, lang, false, Code::Digit7),
+            view_item(ID_VIEW_LAB, Tab::Lab, lang, false, Code::Digit7),
+            view_item(ID_VIEW_REPORTS, Tab::Reports, lang, false, Code::Digit8),
         ];
         for (_, item) in &view_items {
             view_menu.append(item)?;

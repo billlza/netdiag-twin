@@ -1,8 +1,10 @@
+use crate::dataset::{DatasetValidationOptions, validate_dataset_jsonl_with_options};
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{
     FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, LabelMetrics, MetricProvenance,
-    MetricQuality, MlResult, ModelEvaluation, ModelManifest, ModelTrainingConfig, Prediction,
-    Recommendation, RecommendationKind, TelemetryWindow, TraceRecord,
+    MetricQuality, MlResult, ModelEvaluation, ModelManifest, ModelTrainingConfig,
+    ModelTrainingGate, Prediction, Recommendation, RecommendationKind, TelemetryWindow,
+    TraceRecord,
 };
 use crate::report::Report;
 use crate::storage::{read_json, save_json_atomic};
@@ -60,6 +62,7 @@ pub struct TrainingOptions {
     pub validation_split: f64,
     pub shuffle_seed: Option<u64>,
     pub stratified: bool,
+    pub min_rows_per_label: usize,
 }
 
 impl Default for TrainingOptions {
@@ -68,6 +71,7 @@ impl Default for TrainingOptions {
             validation_split: 0.0,
             shuffle_seed: None,
             stratified: false,
+            min_rows_per_label: 0,
         }
     }
 }
@@ -292,6 +296,7 @@ pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
             validation_split: 0.0,
             shuffle_seed: Some(2026),
             stratified: false,
+            min_rows_per_label: 0,
         }),
     );
     write_model_bundle(model_dir, &model, &manifest)?;
@@ -327,9 +332,36 @@ pub fn train_model_from_jsonl_with_options(
 ) -> Result<ModelManifest> {
     let dataset_path = dataset_path.as_ref();
     let model_dir = model_dir.as_ref();
+    let options = normalize_training_options(options);
+    let validation = validate_dataset_jsonl_with_options(
+        dataset_path,
+        DatasetValidationOptions {
+            min_rows_per_label: options.min_rows_per_label,
+        },
+    )?;
+    let mut gate_failures = validation.failures.clone();
+    if options.validation_split > 0.0 && !options.stratified {
+        gate_failures.push(
+            "training gate requires stratified validation when --validation-split is greater than 0"
+                .to_string(),
+        );
+    }
+    let gate = ModelTrainingGate {
+        passed: gate_failures.is_empty(),
+        rows: validation.rows,
+        min_rows_per_label: options.min_rows_per_label,
+        validation_split: options.validation_split,
+        stratified: options.stratified,
+        failures: gate_failures,
+    };
+    if !gate.passed {
+        return Err(NetdiagError::Ml(format!(
+            "dataset training gate failed: {}",
+            gate.failures.join("; ")
+        )));
+    }
     let rows = read_training_jsonl(dataset_path)?;
     let dataset_hash = sha256_file(dataset_path)?;
-    let options = normalize_training_options(options);
     let (training_rows, validation_rows) = partition_training_rows(&rows, options);
     let model = train_model_from_feature_rows(&training_rows)?;
     let evaluation = if validation_rows.is_empty() {
@@ -348,9 +380,11 @@ pub fn train_model_from_jsonl_with_options(
             validation_split: options.validation_split,
             shuffle_seed: options.shuffle_seed,
             stratified: options.stratified,
+            min_rows_per_label: options.min_rows_per_label,
         }),
     );
     manifest.evaluation = evaluation;
+    manifest.training_gate = Some(gate);
     write_model_bundle(model_dir, &model, &manifest)?;
     Ok(manifest)
 }
@@ -477,6 +511,7 @@ fn normalize_training_options(options: TrainingOptions) -> TrainingOptions {
         },
         shuffle_seed: options.shuffle_seed,
         stratified: options.stratified,
+        min_rows_per_label: options.min_rows_per_label,
     }
 }
 
@@ -844,6 +879,8 @@ fn build_model_manifest(
         created_at: Utc::now(),
         training_source: training_source.into(),
         dataset_hash_sha256,
+        dataset_id: None,
+        dataset_manifest_hash_sha256: None,
         model_file: MODEL_FILE_NAME.to_string(),
         feature_names: FEATURES.iter().map(|name| (*name).to_string()).collect(),
         labels: model
@@ -858,6 +895,7 @@ fn build_model_manifest(
         synthetic_fallback,
         training_config,
         evaluation: None,
+        training_gate: None,
     }
 }
 
@@ -1065,6 +1103,7 @@ mod tests {
                 validation_split: 0.5,
                 shuffle_seed: Some(2026),
                 stratified: true,
+                min_rows_per_label: 0,
             },
         );
 

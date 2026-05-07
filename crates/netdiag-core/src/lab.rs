@@ -11,11 +11,14 @@ use crate::evidence_bundle::{
 };
 use crate::ingest::{CANONICAL_COLUMNS, ingest_trace};
 use crate::models::{
-    ConnectorHealthSnapshot, ConnectorHealthStatus, FaultLabel, IngestResult, MetricQuality,
-    MultiSourceEvidenceSummary, RunComparison, SourceEvidenceSummary,
+    ConnectorHealthSnapshot, ConnectorHealthStatus, CorroborationSignal, DiagnosisEvent,
+    EvidenceRef, FaultLabel, IngestResult, MetricQuality, MultiSourceEvidenceSummary,
+    RunComparison, SourceEvidenceSummary,
 };
 use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif};
+use crate::recommendation::recommend_actions;
 use crate::report::Report;
+use crate::report::{compare_rule_ml, render_report};
 use crate::storage::{
     connector_health_from_ingest, read_connector_health, read_json, run_artifacts, run_dir,
     save_json, write_connector_health,
@@ -277,6 +280,65 @@ pub struct LabRunComparison {
     pub quality_status: ConnectorHealthStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_run_comparison: Option<RunComparison>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabBatchReport {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    pub total_scenarios: usize,
+    pub passed: usize,
+    pub failed: usize,
+    #[serde(default)]
+    pub results: Vec<LabBatchScenarioResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabBatchScenarioResult {
+    pub scenario_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_run_dir: Option<String>,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<LabAcceptanceReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabSummaryReport {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    pub artifact_root: String,
+    pub total_runs: usize,
+    pub passed: usize,
+    pub failed: usize,
+    #[serde(default)]
+    pub by_label: BTreeMap<String, LabSummaryLabelStats>,
+    #[serde(default)]
+    pub quality: BTreeMap<String, usize>,
+    #[serde(default)]
+    pub failures: Vec<LabSummaryFailure>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabSummaryLabelStats {
+    pub runs: usize,
+    pub passed: usize,
+    pub rule_accuracy: f64,
+    pub ml_accuracy: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabSummaryFailure {
+    pub run_id: String,
+    pub scenario_id: String,
+    #[serde(default)]
+    pub failures: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -792,13 +854,35 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         .iter()
         .map(|source| source.health.clone())
         .collect::<Vec<_>>();
+    let corroboration_signals = collect_corroboration_signals(&loaded_sources);
     let multi_source_evidence = multi_source_evidence(
         &scenario,
         &pipeline.report,
         &loaded_sources,
         &primary_health,
+        &corroboration_signals,
+    );
+    apply_corroboration_signals(&mut pipeline.diagnosis_events, &corroboration_signals);
+    pipeline.comparison = compare_rule_ml(&pipeline.diagnosis_events, &pipeline.ml_result);
+    pipeline.recommendations =
+        recommend_actions(&pipeline.diagnosis_events, pipeline.what_if.as_ref());
+    pipeline.report = render_report(
+        &pipeline.run_id,
+        &pipeline.telemetry,
+        &pipeline.diagnosis_events,
+        &pipeline.ml_result,
+        pipeline.what_if.clone(),
+        &pipeline.recommendations,
     );
     pipeline.report.multi_source_evidence = Some(multi_source_evidence.clone());
+    save_json(
+        run_dir(&lab_run_dir, &pipeline.run_id).join("diagnosis_events.json"),
+        &pipeline.diagnosis_events,
+    )?;
+    save_json(
+        run_dir(&lab_run_dir, &pipeline.run_id).join("recommendations.json"),
+        &pipeline.recommendations,
+    )?;
     save_json(
         run_dir(&lab_run_dir, &pipeline.run_id).join("report.json"),
         &pipeline.report,
@@ -860,6 +944,146 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         comparison,
         evidence_bundle,
     })
+}
+
+pub fn run_lab_batch(scenarios: &[PathBuf], options: LabRunOptions) -> Result<LabBatchReport> {
+    let mut results = Vec::new();
+    for scenario_path in scenarios {
+        let scenario_id = load_lab_scenario(scenario_path)
+            .ok()
+            .map(|scenario| scenario.id);
+        match run_lab_scenario(
+            scenario_path,
+            LabRunOptions {
+                artifacts: options.artifacts.clone(),
+            },
+        ) {
+            Ok(result) => results.push(LabBatchScenarioResult {
+                scenario_path: scenario_path.display().to_string(),
+                scenario_id: Some(result.scenario_id.clone()),
+                run_id: Some(result.run_id.clone()),
+                lab_run_dir: Some(result.lab_run_dir.clone()),
+                passed: result.acceptance.passed,
+                error: None,
+                acceptance: Some(result.acceptance),
+            }),
+            Err(err) => results.push(LabBatchScenarioResult {
+                scenario_path: scenario_path.display().to_string(),
+                scenario_id,
+                run_id: None,
+                lab_run_dir: None,
+                passed: false,
+                error: Some(err.to_string()),
+                acceptance: None,
+            }),
+        }
+    }
+    let passed = results.iter().filter(|result| result.passed).count();
+    Ok(LabBatchReport {
+        schema: "netdiag-lab-batch/v1".to_string(),
+        generated_at: Utc::now(),
+        total_scenarios: scenarios.len(),
+        passed,
+        failed: results.len().saturating_sub(passed),
+        results,
+    })
+}
+
+pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryReport> {
+    let artifact_root = artifact_root.as_ref();
+    let index = read_lab_run_index(artifact_root)?.unwrap_or(LabRunIndex {
+        schema: "netdiag-lab-run-index/v1".to_string(),
+        generated_at: Utc::now(),
+        runs: Vec::new(),
+    });
+    let mut by_label = BTreeMap::<String, LabSummaryAccumulator>::new();
+    let mut quality = BTreeMap::<String, usize>::new();
+    let mut failures = Vec::new();
+    let mut passed = 0usize;
+
+    for entry in &index.runs {
+        let acceptance_path = PathBuf::from(&entry.acceptance_path);
+        let acceptance = match read_json(&acceptance_path).and_then(|value| {
+            serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
+        }) {
+            Ok(acceptance) => acceptance,
+            Err(err) => {
+                failures.push(LabSummaryFailure {
+                    run_id: entry.run_id.clone(),
+                    scenario_id: entry.scenario_id.clone(),
+                    failures: vec![format!("acceptance unavailable: {err}")],
+                });
+                continue;
+            }
+        };
+        if acceptance.passed {
+            passed += 1;
+        } else {
+            failures.push(LabSummaryFailure {
+                run_id: entry.run_id.clone(),
+                scenario_id: entry.scenario_id.clone(),
+                failures: acceptance.failures.clone(),
+            });
+        }
+        *quality
+            .entry(acceptance.quality_status.as_str().to_string())
+            .or_default() += 1;
+        let expected = acceptance.expected_label.as_str().to_string();
+        let label_stats = by_label.entry(expected.clone()).or_default();
+        label_stats.runs += 1;
+        if acceptance.passed {
+            label_stats.passed += 1;
+        }
+        if acceptance
+            .actual_rule_labels
+            .iter()
+            .any(|label| label == &expected)
+        {
+            label_stats.rule_correct += 1;
+        }
+        if acceptance.actual_ml_top == expected {
+            label_stats.ml_correct += 1;
+        }
+    }
+
+    Ok(LabSummaryReport {
+        schema: "netdiag-lab-summary/v1".to_string(),
+        generated_at: Utc::now(),
+        artifact_root: artifact_root.display().to_string(),
+        total_runs: index.runs.len(),
+        passed,
+        failed: index.runs.len().saturating_sub(passed),
+        by_label: by_label
+            .into_iter()
+            .map(|(label, stats)| (label, stats.into_summary()))
+            .collect(),
+        quality,
+        failures,
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct LabSummaryAccumulator {
+    runs: usize,
+    passed: usize,
+    rule_correct: usize,
+    ml_correct: usize,
+}
+
+impl LabSummaryAccumulator {
+    fn into_summary(self) -> LabSummaryLabelStats {
+        let denominator = self.runs.max(1) as f64;
+        LabSummaryLabelStats {
+            runs: self.runs,
+            passed: self.passed,
+            rule_accuracy: round4(self.rule_correct as f64 / denominator),
+            ml_accuracy: round4(self.ml_correct as f64 / denominator),
+        }
+    }
+}
+
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
 }
 
 pub fn validate_lab_run(
@@ -1349,11 +1573,290 @@ fn load_lab_policy(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceSignalMetrics {
+    latency_mean: f64,
+    packet_loss_rate: f64,
+    retransmission_rate: f64,
+    throughput_mbps: f64,
+    dns_failure_events: f64,
+    tls_failure_events: f64,
+    quic_blocked_ratio: f64,
+}
+
+fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<CorroborationSignal> {
+    let mut signals = Vec::new();
+    for source in loaded_sources
+        .iter()
+        .filter(|source| source.source.role == LabDataSourceRole::Corroborating)
+    {
+        let source_kind = source.health.source_kind.clone();
+        let Some(metrics) = source_signal_metrics(&source.loaded.ingest) else {
+            continue;
+        };
+        if metrics.latency_mean > 120.0 && metrics.throughput_mbps < 35.0 {
+            signals.push(support_signal(
+                &source_kind,
+                "latency high and throughput low",
+                FaultLabel::Congestion,
+                0.05,
+            ));
+        }
+        if metrics.dns_failure_events > 0.0 {
+            signals.push(support_signal(
+                &source_kind,
+                "dns failure counter is non-zero",
+                FaultLabel::DnsFailure,
+                0.05,
+            ));
+        }
+        if metrics.tls_failure_events > 0.0 {
+            signals.push(support_signal(
+                &source_kind,
+                "tls failure counter is non-zero",
+                FaultLabel::TlsFailure,
+                0.05,
+            ));
+        }
+        if source.source.kind != LabDataSourceKind::NativePcap && metrics.quic_blocked_ratio > 0.5 {
+            signals.push(support_signal(
+                &source_kind,
+                "QUIC blocked ratio is elevated",
+                FaultLabel::UdpQuicBlocked,
+                0.05,
+            ));
+        }
+        if metrics.packet_loss_rate > 1.0 && metrics.retransmission_rate > 1.0 {
+            signals.push(support_signal(
+                &source_kind,
+                "loss and retransmission counters are elevated",
+                FaultLabel::RandomLoss,
+                0.04,
+            ));
+        }
+        if source.source.kind == LabDataSourceKind::NativePcap {
+            collect_pcap_corroboration_signals(source, &metrics, &mut signals);
+        }
+    }
+    signals
+}
+
+fn collect_pcap_corroboration_signals(
+    source: &LoadedLabSource,
+    metrics: &SourceSignalMetrics,
+    signals: &mut Vec<CorroborationSignal>,
+) {
+    let source_kind = source.health.source_kind.as_str();
+    if metrics.retransmission_rate > 1.0 {
+        signals.push(support_signal(
+            source_kind,
+            "TCP retransmission hint observed in pcap",
+            FaultLabel::Congestion,
+            0.04,
+        ));
+        signals.push(support_signal(
+            source_kind,
+            "TCP retransmission hint can also fit random loss",
+            FaultLabel::RandomLoss,
+            0.02,
+        ));
+    }
+    let Some(payload) = source.loaded.payload.as_ref() else {
+        return;
+    };
+    let udp_packets = payload
+        .get("udp_packets")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let dns_packets = payload
+        .get("dns_packets")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let quic_packets = payload
+        .get("quic_packets")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    if udp_packets > 0 && dns_packets == 0 {
+        signals.push(contradict_signal(
+            source_kind,
+            "pcap observed UDP traffic but no DNS/53 packets",
+            FaultLabel::DnsFailure,
+            -0.03,
+        ));
+    }
+    if udp_packets > 0 && quic_packets == 0 {
+        signals.push(support_signal(
+            source_kind,
+            "UDP/443 traffic absent in pcap; weak QUIC block hint",
+            FaultLabel::UdpQuicBlocked,
+            0.02,
+        ));
+    } else if quic_packets > 0 {
+        signals.push(contradict_signal(
+            source_kind,
+            "pcap observed UDP/443 traffic, so QUIC policy blocking is not proven",
+            FaultLabel::UdpQuicBlocked,
+            -0.03,
+        ));
+    }
+}
+
+fn source_signal_metrics(ingest: &IngestResult) -> Option<SourceSignalMetrics> {
+    let count = ingest.records.len() as f64;
+    if count == 0.0 {
+        return None;
+    }
+    let mut metrics = SourceSignalMetrics::default();
+    for record in &ingest.records {
+        metrics.latency_mean += record.latency_ms;
+        metrics.packet_loss_rate += record.packet_loss_rate;
+        metrics.retransmission_rate += record.retransmission_rate;
+        metrics.throughput_mbps += record.throughput_mbps;
+        metrics.dns_failure_events += record.dns_failure_events;
+        metrics.tls_failure_events += record.tls_failure_events;
+        metrics.quic_blocked_ratio += record.quic_blocked_ratio;
+    }
+    metrics.latency_mean /= count;
+    metrics.packet_loss_rate /= count;
+    metrics.retransmission_rate /= count;
+    metrics.throughput_mbps /= count;
+    metrics.dns_failure_events /= count;
+    metrics.tls_failure_events /= count;
+    metrics.quic_blocked_ratio /= count;
+    Some(metrics)
+}
+
+fn support_signal(
+    source_kind: &str,
+    signal: &str,
+    label: FaultLabel,
+    confidence_delta: f64,
+) -> CorroborationSignal {
+    CorroborationSignal {
+        source_kind: source_kind.to_string(),
+        signal: signal.to_string(),
+        supports: Some(label),
+        contradicts: None,
+        confidence_delta: confidence_delta.abs(),
+    }
+}
+
+fn contradict_signal(
+    source_kind: &str,
+    signal: &str,
+    label: FaultLabel,
+    confidence_delta: f64,
+) -> CorroborationSignal {
+    CorroborationSignal {
+        source_kind: source_kind.to_string(),
+        signal: signal.to_string(),
+        supports: None,
+        contradicts: Some(label),
+        confidence_delta: -confidence_delta.abs(),
+    }
+}
+
+fn apply_corroboration_signals(
+    diagnosis_events: &mut [DiagnosisEvent],
+    signals: &[CorroborationSignal],
+) {
+    if signals.is_empty() {
+        return;
+    }
+    for event in diagnosis_events {
+        let label = event.evidence.symptom;
+        let mut confidence_delta = 0.0;
+        for signal in signals
+            .iter()
+            .filter(|signal| signal_affects(signal, label))
+        {
+            confidence_delta += signal.confidence_delta;
+            event
+                .evidence
+                .raw_evidence_refs
+                .push(signal_evidence_ref(signal));
+            if signal.contradicts == Some(label) {
+                event
+                    .evidence
+                    .counter_evidence
+                    .push(format!("{}: {}", signal.source_kind, signal.signal));
+            }
+        }
+        if confidence_delta.abs() > f64::EPSILON {
+            event.evidence.confidence =
+                (event.evidence.confidence + confidence_delta).clamp(0.0, 1.0);
+            event.evidence.why = format!(
+                "{} Multi-source evidence adjusted confidence by {confidence_delta:+.3}.",
+                event.evidence.why
+            );
+        }
+    }
+}
+
+fn signal_affects(signal: &CorroborationSignal, label: FaultLabel) -> bool {
+    signal.supports == Some(label) || signal.contradicts == Some(label)
+}
+
+fn signal_evidence_ref(signal: &CorroborationSignal) -> EvidenceRef {
+    let mut details = BTreeMap::new();
+    details.insert(
+        "signal".to_string(),
+        serde_json::Value::String(signal.signal.clone()),
+    );
+    details.insert(
+        "confidence_delta".to_string(),
+        serde_json::json!(signal.confidence_delta),
+    );
+    if let Some(label) = signal.supports {
+        details.insert(
+            "supports".to_string(),
+            serde_json::Value::String(label.as_str().to_string()),
+        );
+    }
+    if let Some(label) = signal.contradicts {
+        details.insert(
+            "contradicts".to_string(),
+            serde_json::Value::String(label.as_str().to_string()),
+        );
+    }
+    EvidenceRef {
+        source: signal.source_kind.clone(),
+        artifact: "multi_source_evidence.json".to_string(),
+        offset: None,
+        details,
+    }
+}
+
+fn signal_summary(signal: &CorroborationSignal) -> String {
+    let relation = if let Some(label) = signal.supports {
+        format!("supports {}", label.as_str())
+    } else if let Some(label) = signal.contradicts {
+        format!("contradicts {}", label.as_str())
+    } else {
+        "observed".to_string()
+    };
+    format!(
+        "{}: {} ({relation}, {:+.3})",
+        signal.source_kind, signal.signal, signal.confidence_delta
+    )
+}
+
+fn confidence_delta_by_label(signals: &[CorroborationSignal]) -> BTreeMap<String, f64> {
+    let mut deltas = BTreeMap::new();
+    for signal in signals {
+        if let Some(label) = signal.supports.or(signal.contradicts) {
+            *deltas.entry(label.as_str().to_string()).or_default() += signal.confidence_delta;
+        }
+    }
+    deltas
+}
+
 fn multi_source_evidence(
     scenario: &LabScenario,
     report: &Report,
     loaded_sources: &[LoadedLabSource],
     primary_health: &ConnectorHealthSnapshot,
+    corroboration_signals: &[CorroborationSignal],
 ) -> MultiSourceEvidenceSummary {
     let expected = scenario
         .acceptance
@@ -1375,15 +1878,33 @@ fn multi_source_evidence(
         .find(|source| source.source.role == LabDataSourceRole::Primary)
         .map(|source| &source.loaded.ingest)
         .unwrap_or(&loaded_sources[0].loaded.ingest);
-    let primary = source_summary("primary", primary_health, primary_ingest);
+    let primary = source_summary(
+        "primary",
+        primary_health,
+        primary_ingest,
+        corroboration_signals,
+    );
     let corroborating_sources = loaded_sources
         .iter()
         .filter(|source| source.source.role == LabDataSourceRole::Corroborating)
-        .map(|source| source_summary("corroborating", &source.health, &source.loaded.ingest))
+        .map(|source| {
+            source_summary(
+                "corroborating",
+                &source.health,
+                &source.loaded.ingest,
+                corroboration_signals,
+            )
+        })
         .collect::<Vec<_>>();
     let corroborating_evidence = corroborating_sources
         .iter()
         .flat_map(|source| source.signals.clone())
+        .chain(
+            corroboration_signals
+                .iter()
+                .filter(|signal| signal.supports.is_some())
+                .map(signal_summary),
+        )
         .collect::<Vec<_>>();
     let counter_evidence = loaded_sources
         .iter()
@@ -1396,12 +1917,21 @@ fn multi_source_evidence(
                 .map(|warning| format!("{}: {}", source.health.source_kind, warning.reason))
                 .collect::<Vec<_>>()
         })
+        .chain(
+            corroboration_signals
+                .iter()
+                .filter(|signal| signal.contradicts.is_some())
+                .map(signal_summary),
+        )
         .collect::<Vec<_>>();
+    let confidence_delta_by_label = confidence_delta_by_label(corroboration_signals);
     MultiSourceEvidenceSummary {
         root_cause: expected,
         primary_evidence,
         corroborating_evidence,
         counter_evidence,
+        signals: corroboration_signals.to_vec(),
+        confidence_delta_by_label,
         primary,
         corroborating_sources,
     }
@@ -1411,6 +1941,7 @@ fn source_summary(
     role: &str,
     health: &ConnectorHealthSnapshot,
     ingest: &IngestResult,
+    corroboration_signals: &[CorroborationSignal],
 ) -> SourceEvidenceSummary {
     let signals = ingest
         .metric_provenance
@@ -1436,6 +1967,11 @@ fn source_summary(
         quality: health.quality,
         signals,
         counter_evidence,
+        corroboration_signals: corroboration_signals
+            .iter()
+            .filter(|signal| signal.source_kind == health.source_kind)
+            .cloned()
+            .collect(),
     }
 }
 
@@ -1843,5 +2379,109 @@ mod tests {
         assert_ne!(left, right);
         assert!(left.contains('.'), "{left}");
         assert!(left.rsplit_once('-').is_some(), "{left}");
+    }
+
+    #[test]
+    fn lab_multisource_signals_enrich_diagnosis_artifacts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let trace = repo_root()
+            .join("data")
+            .join("samples")
+            .join("congestion.csv");
+        let scenario_path = temp.path().join("scenario.yaml");
+        std::fs::write(
+            &scenario_path,
+            format!(
+                r#"schema: netdiag-lab-scenario/v1
+id: lab-multisource-test
+name: Multi source test
+expected_label: congestion
+data_sources:
+  - name: primary
+    role: primary
+    kind: trace-file
+    endpoint: "{}"
+  - name: prometheus-like-corroborator
+    role: corroborating
+    kind: trace-file
+    endpoint: "{}"
+acceptance:
+  expected_root_cause: congestion
+  min_rule_confidence: 0.75
+  min_ml_probability: 0.70
+  require_rule_ml_agreement: true
+  require_what_if_improvement: false
+"#,
+                trace.display(),
+                trace.display()
+            ),
+        )
+        .expect("write scenario");
+
+        let result = run_lab_scenario(
+            &scenario_path,
+            LabRunOptions {
+                artifacts: temp.path().join("artifacts"),
+            },
+        )
+        .expect("lab run");
+
+        assert!(result.acceptance.passed, "{:?}", result.acceptance.failures);
+        let report: Report = serde_json::from_value(
+            read_json(PathBuf::from(&result.pipeline_run_dir).join("report.json"))
+                .expect("report json"),
+        )
+        .expect("report");
+        let multi = report.multi_source_evidence.expect("multi source evidence");
+        assert!(
+            multi
+                .signals
+                .iter()
+                .any(|signal| signal.supports == Some(FaultLabel::Congestion)),
+            "{:?}",
+            multi.signals
+        );
+        let events: Vec<DiagnosisEvent> = serde_json::from_value(
+            read_json(PathBuf::from(&result.pipeline_run_dir).join("diagnosis_events.json"))
+                .expect("events json"),
+        )
+        .expect("events");
+        let congestion = events
+            .iter()
+            .find(|event| event.evidence.symptom == FaultLabel::Congestion)
+            .expect("congestion event");
+        assert!(
+            congestion
+                .evidence
+                .raw_evidence_refs
+                .iter()
+                .any(|reference| reference.artifact == "multi_source_evidence.json")
+        );
+        assert!(congestion.evidence.why.contains("Multi-source evidence"));
+    }
+
+    #[test]
+    fn lab_batch_and_summary_use_lab_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scenario_path = repo_root()
+            .join("examples")
+            .join("scenarios")
+            .join("lab-congestion-001.yaml");
+
+        let batch = run_lab_batch(
+            &[scenario_path],
+            LabRunOptions {
+                artifacts: temp.path().to_path_buf(),
+            },
+        )
+        .expect("batch");
+
+        assert_eq!(batch.total_scenarios, 1);
+        assert_eq!(batch.failed, 0, "{:?}", batch.results);
+        let summary = summarize_lab_runs(temp.path()).expect("summary");
+        assert_eq!(summary.total_runs, 1);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.by_label["congestion"].runs, 1);
+        assert_eq!(summary.by_label["congestion"].rule_accuracy, 1.0);
     }
 }

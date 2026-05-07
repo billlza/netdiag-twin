@@ -20,8 +20,30 @@ pub struct DatasetManifest {
     pub label_distribution: BTreeMap<String, usize>,
     #[serde(default)]
     pub sources: Vec<String>,
+    #[serde(default)]
+    pub source_runs: Vec<String>,
+    #[serde(default)]
+    pub scenario_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows_per_label: Option<usize>,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DatasetManifestMetadata {
+    pub dataset_id: Option<String>,
+    pub sources: Vec<String>,
+    pub source_runs: Vec<String>,
+    pub scenario_ids: Vec<String>,
+    pub operator: Option<String>,
+    pub label_policy: Option<String>,
+    pub min_rows_per_label: Option<usize>,
     pub notes: Option<String>,
 }
 
@@ -38,9 +60,16 @@ pub struct DatasetValidationReport {
     pub rows: usize,
     pub passed: bool,
     #[serde(default)]
+    pub min_rows_per_label: usize,
+    #[serde(default)]
     pub failures: Vec<String>,
     #[serde(default)]
     pub label_distribution: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DatasetValidationOptions {
+    pub min_rows_per_label: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +98,70 @@ pub struct DatasetSplitReport {
 }
 
 #[derive(Debug, Clone)]
+pub struct DatasetRegisterOptions {
+    pub artifacts: PathBuf,
+    pub metadata: DatasetManifestMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetRegistration {
+    pub schema: String,
+    pub registered_at: DateTime<Utc>,
+    pub dataset_path: String,
+    pub manifest_path: String,
+    pub registry_path: String,
+    pub manifest: DatasetManifest,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetRegistry {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub datasets: Vec<DatasetRegistryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetRegistryEntry {
+    pub dataset_id: String,
+    pub hash_sha256: String,
+    pub rows: usize,
+    pub label_distribution: BTreeMap<String, usize>,
+    pub dataset_path: String,
+    pub manifest_path: String,
+    pub registered_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source_runs: Vec<String>,
+    #[serde(default)]
+    pub scenario_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_rows_per_label: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetComparison {
+    pub schema: String,
+    pub left: DatasetManifest,
+    pub right: DatasetManifest,
+    pub same_hash: bool,
+    pub row_delta: isize,
+    #[serde(default)]
+    pub label_delta: BTreeMap<String, isize>,
+    #[serde(default)]
+    pub source_runs_added: Vec<String>,
+    #[serde(default)]
+    pub source_runs_removed: Vec<String>,
+    #[serde(default)]
+    pub scenario_ids_added: Vec<String>,
+    #[serde(default)]
+    pub scenario_ids_removed: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct DatasetRow {
     line_number: usize,
     line: String,
@@ -78,16 +171,7 @@ struct DatasetRow {
 pub fn inspect_dataset_jsonl(path: impl AsRef<Path>) -> Result<DatasetInspection> {
     let path = path.as_ref();
     let rows = read_dataset_rows(path)?;
-    let manifest = DatasetManifest {
-        schema: "netdiag-dataset/v1".to_string(),
-        dataset_id: dataset_id(path),
-        hash_sha256: sha256_file(path)?,
-        rows: rows.len(),
-        label_distribution: label_distribution(&rows),
-        sources: vec![path.display().to_string()],
-        created_at: Utc::now(),
-        notes: None,
-    };
+    let manifest = manifest_for_rows(path, &rows, DatasetManifestMetadata::default())?;
     Ok(DatasetInspection {
         manifest,
         path: path.display().to_string(),
@@ -95,6 +179,13 @@ pub fn inspect_dataset_jsonl(path: impl AsRef<Path>) -> Result<DatasetInspection
 }
 
 pub fn validate_dataset_jsonl(path: impl AsRef<Path>) -> Result<DatasetValidationReport> {
+    validate_dataset_jsonl_with_options(path, DatasetValidationOptions::default())
+}
+
+pub fn validate_dataset_jsonl_with_options(
+    path: impl AsRef<Path>,
+    options: DatasetValidationOptions,
+) -> Result<DatasetValidationReport> {
     let path = path.as_ref();
     let mut failures = Vec::new();
     let rows = match read_dataset_rows(path) {
@@ -108,11 +199,29 @@ pub fn validate_dataset_jsonl(path: impl AsRef<Path>) -> Result<DatasetValidatio
     if rows.is_empty() && failures.is_empty() {
         failures.push("dataset contains no rows".to_string());
     }
+    if options.min_rows_per_label > 0 {
+        let distribution = label_distribution(&rows);
+        for label in FaultLabel::ALL {
+            let count = distribution
+                .get(label.as_str())
+                .copied()
+                .unwrap_or_default();
+            if count < options.min_rows_per_label {
+                failures.push(format!(
+                    "label {} has {} rows, below required {}",
+                    label.as_str(),
+                    count,
+                    options.min_rows_per_label
+                ));
+            }
+        }
+    }
     Ok(DatasetValidationReport {
         path: path.display().to_string(),
         hash_sha256,
         rows: rows.len(),
         passed: failures.is_empty(),
+        min_rows_per_label: options.min_rows_per_label,
         failures,
         label_distribution: label_distribution(&rows),
     })
@@ -176,6 +285,11 @@ pub fn split_dataset_jsonl(
             input.display().to_string(),
             format!("split_seed:{seed}"),
         ],
+        source_runs: Vec::new(),
+        scenario_ids: Vec::new(),
+        operator: None,
+        label_policy: None,
+        min_rows_per_label: None,
         created_at: Utc::now(),
         notes: Some("Deterministic split manifest generated by netdiag dataset split".to_string()),
     };
@@ -195,6 +309,161 @@ pub fn split_dataset_jsonl(
         manifest,
         manifest_path: manifest_path.display().to_string(),
     })
+}
+
+pub fn register_dataset_jsonl(
+    dataset: impl AsRef<Path>,
+    options: DatasetRegisterOptions,
+) -> Result<DatasetRegistration> {
+    let dataset = dataset.as_ref();
+    let rows = read_dataset_rows(dataset)?;
+    let manifest = manifest_for_rows(dataset, &rows, options.metadata.clone())?;
+    let datasets_root = options
+        .artifacts
+        .join("datasets")
+        .join(&manifest.dataset_id);
+    std::fs::create_dir_all(&datasets_root).with_path(&datasets_root)?;
+    let hash_prefix = manifest.hash_sha256.chars().take(12).collect::<String>();
+    let dataset_path = datasets_root.join(format!("{}.jsonl", hash_prefix));
+    if !dataset_path.exists() {
+        std::fs::copy(dataset, &dataset_path).with_path(&dataset_path)?;
+    }
+    let manifest_path = datasets_root.join(format!("{}-manifest.json", hash_prefix));
+    crate::storage::save_json(&manifest_path, &manifest)?;
+    let registry_path = options.artifacts.join("datasets").join("registry.json");
+    let mut registry = read_dataset_registry(&registry_path)?;
+    let registered_at = Utc::now();
+    registry.schema = "netdiag-dataset-registry/v1".to_string();
+    registry.generated_at = registered_at;
+    registry
+        .datasets
+        .retain(|entry| entry.hash_sha256 != manifest.hash_sha256);
+    registry.datasets.insert(
+        0,
+        DatasetRegistryEntry {
+            dataset_id: manifest.dataset_id.clone(),
+            hash_sha256: manifest.hash_sha256.clone(),
+            rows: manifest.rows,
+            label_distribution: manifest.label_distribution.clone(),
+            dataset_path: dataset_path.display().to_string(),
+            manifest_path: manifest_path.display().to_string(),
+            registered_at,
+            source_runs: manifest.source_runs.clone(),
+            scenario_ids: manifest.scenario_ids.clone(),
+            operator: manifest.operator.clone(),
+            label_policy: manifest.label_policy.clone(),
+            min_rows_per_label: manifest.min_rows_per_label,
+        },
+    );
+    registry.datasets.truncate(200);
+    crate::storage::save_json(&registry_path, &registry)?;
+    Ok(DatasetRegistration {
+        schema: "netdiag-dataset-registration/v1".to_string(),
+        registered_at,
+        dataset_path: dataset_path.display().to_string(),
+        manifest_path: manifest_path.display().to_string(),
+        registry_path: registry_path.display().to_string(),
+        manifest,
+    })
+}
+
+pub fn compare_datasets(
+    left: impl AsRef<Path>,
+    right: impl AsRef<Path>,
+) -> Result<DatasetComparison> {
+    let left = dataset_manifest_or_inspect(left.as_ref())?;
+    let right = dataset_manifest_or_inspect(right.as_ref())?;
+    let labels = left
+        .label_distribution
+        .keys()
+        .chain(right.label_distribution.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let label_delta = labels
+        .into_iter()
+        .map(|label| {
+            let right_count = right
+                .label_distribution
+                .get(&label)
+                .copied()
+                .unwrap_or_default();
+            let left_count = left
+                .label_distribution
+                .get(&label)
+                .copied()
+                .unwrap_or_default();
+            (label, right_count as isize - left_count as isize)
+        })
+        .filter(|(_, delta)| *delta != 0)
+        .collect::<BTreeMap<_, _>>();
+    Ok(DatasetComparison {
+        schema: "netdiag-dataset-comparison/v1".to_string(),
+        same_hash: left.hash_sha256 == right.hash_sha256,
+        row_delta: right.rows as isize - left.rows as isize,
+        source_runs_added: string_set_difference(&right.source_runs, &left.source_runs),
+        source_runs_removed: string_set_difference(&left.source_runs, &right.source_runs),
+        scenario_ids_added: string_set_difference(&right.scenario_ids, &left.scenario_ids),
+        scenario_ids_removed: string_set_difference(&left.scenario_ids, &right.scenario_ids),
+        left,
+        right,
+        label_delta,
+    })
+}
+
+fn manifest_for_rows(
+    path: &Path,
+    rows: &[DatasetRow],
+    mut metadata: DatasetManifestMetadata,
+) -> Result<DatasetManifest> {
+    if metadata.sources.is_empty() {
+        metadata.sources.push(path.display().to_string());
+    }
+    Ok(DatasetManifest {
+        schema: "netdiag-dataset/v1".to_string(),
+        dataset_id: metadata
+            .dataset_id
+            .unwrap_or_else(|| dataset_id(path))
+            .replace('_', "-"),
+        hash_sha256: sha256_file(path)?,
+        rows: rows.len(),
+        label_distribution: label_distribution(rows),
+        sources: metadata.sources,
+        source_runs: metadata.source_runs,
+        scenario_ids: metadata.scenario_ids,
+        operator: metadata.operator,
+        label_policy: metadata.label_policy,
+        min_rows_per_label: metadata.min_rows_per_label,
+        created_at: Utc::now(),
+        notes: metadata.notes,
+    })
+}
+
+fn read_dataset_registry(path: &Path) -> Result<DatasetRegistry> {
+    if !path.exists() {
+        return Ok(DatasetRegistry {
+            schema: "netdiag-dataset-registry/v1".to_string(),
+            generated_at: Utc::now(),
+            datasets: Vec::new(),
+        });
+    }
+    serde_json::from_value(crate::storage::read_json(path)?).map_err(NetdiagError::from)
+}
+
+fn dataset_manifest_or_inspect(path: &Path) -> Result<DatasetManifest> {
+    if let Ok(raw) = std::fs::read_to_string(path)
+        && let Ok(manifest) = serde_json::from_str::<DatasetManifest>(&raw)
+        && manifest.schema == "netdiag-dataset/v1"
+    {
+        return Ok(manifest);
+    }
+    Ok(inspect_dataset_jsonl(path)?.manifest)
+}
+
+fn string_set_difference(left: &[String], right: &[String]) -> Vec<String> {
+    left.iter()
+        .filter(|value| !right.iter().any(|existing| existing == *value))
+        .cloned()
+        .collect()
 }
 
 fn read_dataset_rows(path: &Path) -> Result<Vec<DatasetRow>> {
@@ -515,5 +784,87 @@ mod tests {
             "{:?}",
             report.failures
         );
+    }
+
+    #[test]
+    fn dataset_register_compare_and_min_label_gate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("feedback.jsonl");
+        std::fs::write(
+            &dataset,
+            [
+                serde_json::json!({
+                    "label": "normal",
+                    "features": feature_payload(10.0)
+                })
+                .to_string(),
+                serde_json::json!({
+                    "label": "congestion",
+                    "features": feature_payload(200.0)
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write dataset");
+
+        let report = validate_dataset_jsonl_with_options(
+            &dataset,
+            DatasetValidationOptions {
+                min_rows_per_label: 1,
+            },
+        )
+        .expect("validation report");
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("random_loss")),
+            "{:?}",
+            report.failures
+        );
+
+        let registration = register_dataset_jsonl(
+            &dataset,
+            DatasetRegisterOptions {
+                artifacts: temp.path().join("artifacts"),
+                metadata: DatasetManifestMetadata {
+                    dataset_id: Some("lab-feedback-test".to_string()),
+                    source_runs: vec!["run-a".to_string()],
+                    scenario_ids: vec!["lab-congestion-001".to_string()],
+                    operator: Some("lab-operator".to_string()),
+                    label_policy: Some("hil_final_label_required".to_string()),
+                    min_rows_per_label: Some(1),
+                    notes: Some("test dataset".to_string()),
+                    ..DatasetManifestMetadata::default()
+                },
+            },
+        )
+        .expect("register dataset");
+        assert!(PathBuf::from(&registration.dataset_path).exists());
+        assert!(PathBuf::from(&registration.registry_path).exists());
+        assert_eq!(registration.manifest.source_runs, vec!["run-a"]);
+
+        let comparison =
+            compare_datasets(&dataset, &registration.manifest_path).expect("compare datasets");
+        assert!(comparison.same_hash);
+        assert_eq!(comparison.row_delta, 0);
+    }
+
+    fn feature_payload(seed: f64) -> serde_json::Value {
+        serde_json::json!({
+            "latency_mean": seed,
+            "latency_p95": seed + 10.0,
+            "jitter_std": 1.0,
+            "loss_rate": 0.0,
+            "retrans_rate": 0.0,
+            "timeout": 0.0,
+            "retry": 0.0,
+            "throughput": 100.0,
+            "dns_events": 0.0,
+            "tls_events": 0.0,
+            "quic": 0.0
+        })
     }
 }

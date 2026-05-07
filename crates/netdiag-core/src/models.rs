@@ -297,6 +297,8 @@ pub struct SourceEvidenceSummary {
     pub signals: Vec<String>,
     #[serde(default)]
     pub counter_evidence: Vec<String>,
+    #[serde(default)]
+    pub corroboration_signals: Vec<CorroborationSignal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,9 +309,24 @@ pub struct MultiSourceEvidenceSummary {
     pub corroborating_evidence: Vec<String>,
     #[serde(default)]
     pub counter_evidence: Vec<String>,
+    #[serde(default)]
+    pub signals: Vec<CorroborationSignal>,
+    #[serde(default)]
+    pub confidence_delta_by_label: BTreeMap<String, f64>,
     pub primary: SourceEvidenceSummary,
     #[serde(default)]
     pub corroborating_sources: Vec<SourceEvidenceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorroborationSignal {
+    pub source_kind: String,
+    pub signal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports: Option<FaultLabel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradicts: Option<FaultLabel>,
+    pub confidence_delta: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +512,10 @@ pub struct ModelManifest {
     pub training_source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset_hash_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_manifest_hash_sha256: Option<String>,
     pub model_file: String,
     pub feature_names: Vec<String>,
     pub labels: Vec<String>,
@@ -507,6 +528,8 @@ pub struct ModelManifest {
     pub training_config: Option<ModelTrainingConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<ModelEvaluation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_gate: Option<ModelTrainingGate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +538,19 @@ pub struct ModelTrainingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shuffle_seed: Option<u64>,
     pub stratified: bool,
+    #[serde(default)]
+    pub min_rows_per_label: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTrainingGate {
+    pub passed: bool,
+    pub rows: usize,
+    pub min_rows_per_label: usize,
+    pub validation_split: f64,
+    pub stratified: bool,
+    #[serde(default)]
+    pub failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

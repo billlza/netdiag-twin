@@ -94,6 +94,7 @@ counters into canonical fields:
 
 ```json
 {
+  "schema": "netdiag-adapter-payload/v1",
   "sample": "lab-otn-ring-1",
   "protocol": "TCP",
   "flow_count": 2,
@@ -114,13 +115,23 @@ counters into canonical fields:
       "tls_failure_events": 0.0,
       "quic_blocked_ratio": 0.0
     }
-  ]
+  ],
+  "experiment": {
+    "scenario_id": "lab-congestion-001",
+    "fault_start": "2026-04-30T12:00:00Z",
+    "fault_end": "2026-04-30T12:05:00Z",
+    "ground_truth": "congestion"
+  }
 }
 ```
 
 If the instrument cannot provide a metric, the gateway should either omit only
 optional event counters or provide a documented zero with an external note. The
 app-side Local/Website probes add warnings whenever they use such fallbacks.
+Validate lab adapter output against
+`examples/adapters/schema/netdiag-adapter-payload.schema.json`; NetDiag uses the
+canonical `records` for diagnosis and preserves experiment metadata in lab
+evidence files.
 
 ## Prometheus Mapping
 

@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.3.2 platform contract: how telemetry becomes
+This guide describes the stable v0.3.3 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -113,9 +113,11 @@ cargo run -p netdiag-cli -- collect \
   --diagnose
 ```
 
-The response can include UI metadata such as `sample`, `protocol`, `flow_count`,
-`flows`, or `top_talkers`; diagnosis uses only the canonical records. Tokens are
-read from `NETDIAG_API_TOKEN` in CLI mode and from Settings/Keychain in the app.
+The response should include `sample`, `protocol`, `flow_count`, canonical
+`records`, and an `experiment` object with `scenario_id`, `fault_start`,
+`fault_end`, and `ground_truth`. Diagnosis uses only the canonical records;
+lab evidence keeps the metadata for reproducibility. Tokens are read from
+`NETDIAG_API_TOKEN` in CLI mode and from Settings/Keychain in the app.
 
 ## Prometheus Mapping
 
@@ -162,7 +164,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.3.2 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.3.3 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -183,7 +185,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.3.2 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.3.3 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -275,11 +277,16 @@ They bind a primary data source, optional corroborating sources, topology,
 policy, collection windows, and acceptance gates.
 
 ```bash
+cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab validate <run_id> \
-  --scenario examples/scenarios/lab-congestion-001.yaml \
-  --artifacts artifacts/lab-runs/lab-congestion-001/<timestamp>
+  --artifacts artifacts
 ```
+
+`lab validate` first reads `artifacts/lab_run_index.json`, then falls back to a
+bounded scan under `artifacts/lab-runs/*/*/runs/<run_id>`. Passing `--scenario`
+is still supported, but indexed lab runs can validate from the global artifact
+root.
 
 Each lab run writes:
 
@@ -293,6 +300,10 @@ Each lab run writes:
 | `acceptance.json` | Typed pass/fail gate results and concrete failures. |
 | `evidence_bundle.json` | Manifest for the exported zip bundle. |
 | `netdiag-evidence-<run_id>.zip` | Portable evidence package for reviewers. |
+
+The zip bundle includes the nested pipeline artifacts plus top-level lab
+`acceptance.json`, `comparison.json`, `multi_source_evidence.json`, aggregate
+`connector_health.json`, and `scenario.yaml`.
 
 Validate topology and policy files before adding them to a scenario:
 

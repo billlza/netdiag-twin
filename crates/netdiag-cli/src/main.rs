@@ -8,7 +8,9 @@ use netdiag_core::connectors::{
 };
 use netdiag_core::dataset::{inspect_dataset_jsonl, split_dataset_jsonl, validate_dataset_jsonl};
 use netdiag_core::evidence_bundle::export_evidence_bundle;
-use netdiag_core::lab::{LabRunOptions, run_lab_scenario, validate_lab_run};
+use netdiag_core::lab::{
+    LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_scenario, validate_lab_run,
+};
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
 };
@@ -212,6 +214,11 @@ enum FeedbackCommand {
 
 #[derive(Debug, Subcommand)]
 enum LabCommand {
+    Preflight {
+        scenario: PathBuf,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+    },
     Run {
         scenario: PathBuf,
         #[arg(long, default_value = "artifacts")]
@@ -220,7 +227,7 @@ enum LabCommand {
     Validate {
         run_id: String,
         #[arg(long)]
-        scenario: PathBuf,
+        scenario: Option<PathBuf>,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
@@ -324,6 +331,19 @@ fn run(args: Args) -> anyhow::Result<()> {
             }
         },
         Command::Lab { command } => match command {
+            LabCommand::Preflight {
+                scenario,
+                artifacts,
+            } => {
+                let report = preflight_lab_scenario(&scenario, LabPreflightOptions { artifacts })
+                    .with_context(|| {
+                    format!("lab preflight failed for {}", scenario.display())
+                })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if !report.passed {
+                    anyhow::bail!("lab preflight failed for {}", report.scenario_id);
+                }
+            }
             LabCommand::Run {
                 scenario,
                 artifacts,
@@ -343,7 +363,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                 scenario,
                 artifacts,
             } => {
-                let report = validate_lab_run(&artifacts, &run_id, &scenario)
+                let report = validate_lab_run(&artifacts, &run_id, scenario.as_deref())
                     .with_context(|| format!("lab validation failed for {run_id}"))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if !report.passed {
@@ -1003,6 +1023,16 @@ mod tests {
     fn lab_run_command_writes_acceptance_artifact() {
         let temp = tempfile::tempdir().expect("tempdir");
         let scenario = repo_file("examples/scenarios/lab-congestion-001.yaml");
+        let preflight_args = Args::parse_from([
+            "netdiag",
+            "lab",
+            "preflight",
+            path_str(&scenario),
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(preflight_args).expect("lab preflight");
+
         let args = Args::parse_from([
             "netdiag",
             "lab",
@@ -1023,8 +1053,20 @@ mod tests {
         let acceptance: serde_json::Value =
             serde_json::from_slice(&fs::read(latest.join("acceptance.json")).expect("acceptance"))
                 .expect("acceptance json");
+        let run_id = acceptance["run_id"].as_str().expect("run id");
 
         assert_eq!(acceptance["passed"], true);
         assert!(latest.join("evidence_bundle.json").exists());
+        assert!(temp.path().join("lab_run_index.json").exists());
+
+        let validate_args = Args::parse_from([
+            "netdiag",
+            "lab",
+            "validate",
+            run_id,
+            "--artifacts",
+            path_str(temp.path()),
+        ]);
+        run(validate_args).expect("lab validate resolves index");
     }
 }

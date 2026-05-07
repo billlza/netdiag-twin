@@ -1,6 +1,7 @@
 use crate::error::{IoContext, NetdiagError, Result};
+use crate::ingest::build_ingest_result;
 use crate::ml::FEATURES;
-use crate::models::FaultLabel;
+use crate::models::{FaultLabel, TraceRecord};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -252,12 +253,26 @@ fn row_label(path: &Path, line_number: usize, value: &serde_json::Value) -> Resu
 }
 
 fn validate_row_payload(path: &Path, line_number: usize, value: &serde_json::Value) -> Result<()> {
-    let has_records = value
-        .get("records")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|records| !records.is_empty());
+    let records = value.get("records");
     let features = value.get("features").and_then(serde_json::Value::as_object);
-    if has_records {
+    if let Some(records) = records {
+        let records =
+            serde_json::from_value::<Vec<TraceRecord>>(records.clone()).map_err(|err| {
+                NetdiagError::Ml(format!(
+                    "{} line {} records are not valid TraceRecord[]: {err}",
+                    path.display(),
+                    line_number
+                ))
+            })?;
+        build_ingest_result(records, format!("{}:line-{line_number}", path.display())).map_err(
+            |err| {
+                NetdiagError::Ml(format!(
+                    "{} line {} records failed canonical validation: {err}",
+                    path.display(),
+                    line_number
+                ))
+            },
+        )?;
         return Ok(());
     }
     let Some(features) = features else {
@@ -455,4 +470,50 @@ fn sha256_file(path: &Path) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dataset_validate_rejects_malformed_records_payload() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("feedback.jsonl");
+        std::fs::write(
+            &dataset,
+            serde_json::json!({
+                "label": "normal",
+                "records": [
+                    {
+                        "timestamp": "not-a-timestamp",
+                        "latency_ms": -1.0,
+                        "jitter_ms": 1.0,
+                        "packet_loss_rate": 0.0,
+                        "retransmission_rate": 0.0,
+                        "timeout_events": 0.0,
+                        "retry_events": 0.0,
+                        "throughput_mbps": 100.0,
+                        "dns_failure_events": 0.0,
+                        "tls_failure_events": 0.0,
+                        "quic_blocked_ratio": 0.0
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write dataset");
+
+        let report = validate_dataset_jsonl(&dataset).expect("validation report");
+
+        assert!(!report.passed);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("records are not valid TraceRecord[]")),
+            "{:?}",
+            report.failures
+        );
+    }
 }

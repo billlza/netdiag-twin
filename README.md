@@ -96,7 +96,7 @@ The desktop app supports three data source families:
 
 - `Simulate`: deterministic fault scenarios generated in Rust and diagnosed through the real core pipeline.
 - `Import Trace`: local CSV/JSON files using canonical trace ingest.
-- `Live collection`: source profiles for Local Probe, Website Probe, HTTP/JSON lab adapters, Prometheus `query_range`, Prometheus `/metrics` exposition, OTLP gRPC receiver, Rust-native pcap capture/import, and macOS system counters. Tokens use macOS Keychain with environment-variable fallback. Every collected run now writes a `connector_health.json` evidence artifact with rows, warnings, measured/fallback/missing quality, and missing metrics.
+- `Live collection`: source profiles for Local Probe, Website Probe, HTTP/JSON lab adapters, Prometheus `query_range`, Prometheus `/metrics` exposition, OTLP gRPC receiver, Rust-native pcap capture/import, and macOS system counters. Tokens use macOS Keychain with environment-variable fallback. Every collected run now writes a `connector_health.json` evidence artifact with rows, warnings, measured/fallback/missing quality, and missing metrics. Lab adapter templates live under `examples/adapters/` and include `experiment` metadata for scenario ID, fault window, and ground truth.
 - `Evidence Console`: the Reports tab shows current connector health, recent run timeline, selected-run evidence, artifacts, HIL state, and run-to-run quality deltas.
 
 See [docs/api-source.md](docs/api-source.md) for the connector overview and HTTP/JSON lab adapter contract, and [docs/getting-started.md](docs/getting-started.md) for OTLP, native pcap, system counters, artifacts, and HIL review examples.
@@ -155,8 +155,9 @@ cargo run -p netdiag-cli -- review <run_id> <recommendation_id> --state accepted
 Run a reproducible lab scenario with typed acceptance gates:
 
 ```bash
+cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
-cargo run -p netdiag-cli -- lab validate <run_id> --scenario examples/scenarios/lab-congestion-001.yaml
+cargo run -p netdiag-cli -- lab validate <run_id> --artifacts artifacts
 ```
 
 Validate topology and policy YAML before giving it to a lab run:
@@ -218,7 +219,8 @@ Runs are written to `artifacts/runs/<run_id>/`:
 The Rust ML model cache is generated under `artifacts/model/` when needed.
 
 Lab runs are written to `artifacts/lab-runs/<scenario_id>/<timestamp>/` and
-include `scenario.yaml`, `connector_health.json`, `report.json`,
+indexed in `artifacts/lab_run_index.json`. They include `scenario.yaml`,
+`connector_health.json`, `report.json`,
 `multi_source_evidence.json`, `comparison.json`, `acceptance.json`,
 `evidence_bundle.json`, and a reviewable `netdiag-evidence-<run_id>.zip`.
 

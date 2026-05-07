@@ -12,3 +12,8 @@ cargo run -p netdiag-cli -- collect --kind otlp-grpc --endpoint 127.0.0.1:4317 -
 
 3. Configure the gateway or Collector to export OTLP metrics to
 `http://127.0.0.1:4317`.
+
+When the same gateway also writes a JSON evidence sidecar, use
+`../schema/netdiag-adapter-payload.schema.json` and include the `experiment`
+block so lab runs can tie OTLP metrics back to the scenario window and ground
+truth.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from statistics import mean
@@ -30,20 +31,54 @@ def load_values(path: Path) -> dict[str, float]:
     return values
 
 
+def load_records(path: Path) -> list[dict]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return [canonical_record(row) for row in csv.DictReader(handle)]
+
+
+def canonical_record(row: dict[str, str]) -> dict:
+    record = {"timestamp": row["timestamp"]}
+    for field in FIELDS:
+        record[field] = float(row.get(field, 0.0) or 0.0)
+    return record
+
+
 class Handler(BaseHTTPRequestHandler):
     values: dict[str, float] = {}
+    records: list[dict] = []
+    sample: str = "prometheus-exporter-python"
+    experiment: dict[str, str] = {
+        "scenario_id": "manual-prometheus",
+        "fault_start": "",
+        "fault_end": "",
+        "ground_truth": "normal",
+    }
 
     def do_GET(self) -> None:
-        if self.path != "/metrics":
+        if self.path == "/metrics":
+            body = "\n".join(
+                f"{prometheus_name(name)} {value}" for name, value in self.values.items()
+            )
+            body = f"{body}\n".encode("utf-8")
+            content_type = "text/plain; version=0.0.4"
+        elif self.path == "/trace":
+            body = json.dumps(
+                {
+                    "schema": "netdiag-adapter-payload/v1",
+                    "sample": self.sample,
+                    "protocol": "TCP",
+                    "flow_count": 1,
+                    "records": self.records,
+                    "experiment": self.experiment,
+                }
+            ).encode("utf-8")
+            content_type = "application/json"
+        else:
             self.send_response(404)
             self.end_headers()
             return
-        body = "\n".join(
-            f"{prometheus_name(name)} {value}" for name, value in self.values.items()
-        )
-        body = f"{body}\n".encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -67,8 +102,20 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", required=True, type=Path)
     parser.add_argument("--port", default=9107, type=int)
+    parser.add_argument("--scenario-id", default=None)
+    parser.add_argument("--fault-start", default="")
+    parser.add_argument("--fault-end", default="")
+    parser.add_argument("--ground-truth", default="normal")
     args = parser.parse_args()
     Handler.values = load_values(args.csv)
+    Handler.records = load_records(args.csv)
+    Handler.sample = args.csv.stem
+    Handler.experiment = {
+        "scenario_id": args.scenario_id or args.csv.stem,
+        "fault_start": args.fault_start,
+        "fault_end": args.fault_end,
+        "ground_truth": args.ground_truth,
+    }
     HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 

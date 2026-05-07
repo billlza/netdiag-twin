@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netdiag.local/schemas/netdiag-adapter-payload/v1",
+  "title": "NetDiag Adapter Payload",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["sample", "protocol", "flow_count", "records", "experiment"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "netdiag-adapter-payload/v1"
+    },
+    "sample": {
+      "type": "string",
+      "minLength": 1
+    },
+    "protocol": {
+      "type": "string",
+      "minLength": 1
+    },
+    "flow_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "timestamp",
+          "latency_ms",
+          "jitter_ms",
+          "packet_loss_rate",
+          "retransmission_rate",
+          "timeout_events",
+          "retry_events",
+          "throughput_mbps",
+          "dns_failure_events",
+          "tls_failure_events",
+          "quic_blocked_ratio"
+        ],
+        "properties": {
+          "timestamp": {
+            "type": "string",
+            "minLength": 1
+          },
+          "latency_ms": { "type": "number", "minimum": 0 },
+          "jitter_ms": { "type": "number", "minimum": 0 },
+          "packet_loss_rate": { "type": "number", "minimum": 0 },
+          "retransmission_rate": { "type": "number", "minimum": 0 },
+          "timeout_events": { "type": "number", "minimum": 0 },
+          "retry_events": { "type": "number", "minimum": 0 },
+          "throughput_mbps": { "type": "number", "minimum": 0 },
+          "dns_failure_events": { "type": "number", "minimum": 0 },
+          "tls_failure_events": { "type": "number", "minimum": 0 },
+          "quic_blocked_ratio": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "experiment": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["scenario_id", "fault_start", "fault_end", "ground_truth"],
+      "properties": {
+        "scenario_id": { "type": "string", "minLength": 1 },
+        "fault_start": { "type": "string" },
+        "fault_end": { "type": "string" },
+        "ground_truth": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

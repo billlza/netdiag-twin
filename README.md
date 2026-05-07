@@ -217,12 +217,16 @@ Runs are written to `artifacts/runs/<run_id>/`:
 - `report.json`
 
 The Rust ML model cache is generated under `artifacts/model/` when needed.
+Lab scenarios reuse this shared model cache; they do not create an implicit
+per-lab-run model under `artifacts/lab-runs/.../model/`.
 
 Lab runs are written to `artifacts/lab-runs/<scenario_id>/<timestamp>/` and
 indexed in `artifacts/lab_run_index.json`. They include `scenario.yaml`,
 `connector_health.json`, `report.json`,
 `multi_source_evidence.json`, `comparison.json`, `acceptance.json`,
 `evidence_bundle.json`, and a reviewable `netdiag-evidence-<run_id>.zip`.
+Evidence, review, export, feedback, what-if, and evidence-bundle commands can
+resolve indexed lab runs from the top-level `--artifacts artifacts` directory.
 
 Version bumps are procedural: run `scripts/bump_version.sh <semver>`, then run
 the validation gates above before tagging `v<semver>`.

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to publish, for example v0.3.5. Required when dispatching from a branch."
+        description: "Release tag to publish, for example v0.3.6. Required when dispatching from a branch."
         required: false
         type: string
   push:
@@ -89,6 +89,8 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
           RUSTFLAGS="-D warnings" cargo test --workspace
+          python3 -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
+          python3 scripts/validate_adapter_samples.py
           RUSTFLAGS="-D warnings" cargo build --release -p netdiag-app
       - name: Script static checks
         run: |

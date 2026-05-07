@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import argparse
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -13,26 +15,48 @@ SCHEMA_PATH = ROOT / "examples/adapters/schema/netdiag-adapter-payload.schema.js
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--schema-only",
+        action="store_true",
+        help="skip Rust ingest validation and only validate JSON schema",
+    )
+    args = parser.parse_args()
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     failed = False
 
-    for name, adapter_path in discover_adapters():
-        try:
-            payload = emit_sample(adapter_path)
-        except RuntimeError as error:
-            print(f"{name}: {error}", file=sys.stderr)
-            failed = True
-            continue
+    with tempfile.TemporaryDirectory(prefix="netdiag-adapters-") as tmp:
+        tmp_dir = Path(tmp)
+        for name, adapter_path in discover_adapters():
+            try:
+                payload = emit_sample(adapter_path)
+            except RuntimeError as error:
+                print(f"{name}: {error}", file=sys.stderr)
+                failed = True
+                continue
 
-        errors: list[str] = []
-        validate(payload, schema, "$", errors)
-        if errors:
-            failed = True
-            print(f"{name}: schema validation failed", file=sys.stderr)
-            for error in errors:
-                print(f"  - {error}", file=sys.stderr)
-        else:
-            print(f"{name}: ok")
+            errors: list[str] = []
+            validate(payload, schema, "$", errors)
+            if errors:
+                failed = True
+                print(f"{name}: schema validation failed", file=sys.stderr)
+                for error in errors:
+                    print(f"  - {error}", file=sys.stderr)
+                continue
+
+            if not args.schema_only:
+                sample_path = tmp_dir / f"{name}.json"
+                sample_path.write_text(json.dumps(payload), encoding="utf-8")
+                try:
+                    validate_rust_ingest(sample_path)
+                except RuntimeError as error:
+                    failed = True
+                    print(f"{name}: Rust ingest validation failed", file=sys.stderr)
+                    print(f"  - {error}", file=sys.stderr)
+                    continue
+
+            suffix = "schema ok" if args.schema_only else "schema+ingest ok"
+            print(f"{name}: {suffix}")
 
     return 1 if failed else 0
 
@@ -62,6 +86,30 @@ def emit_sample(adapter_path: Path) -> Any:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise RuntimeError(f"--emit-sample did not emit JSON: {error}") from error
+
+
+def validate_rust_ingest(sample_path: Path) -> None:
+    completed = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "--quiet",
+            "-p",
+            "netdiag-cli",
+            "--",
+            "validate-trace",
+            str(sample_path),
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        raise RuntimeError(detail)
 
 
 def validate(instance: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:

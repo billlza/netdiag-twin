@@ -7,12 +7,13 @@ on:
 
 jobs:
   adapter-schema:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - uses: actions/checkout@v4
-      - name: Validate adapter samples
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Validate adapter samples through schema and Rust ingest
         run: python3 scripts/validate_adapter_samples.py
 
   rust:

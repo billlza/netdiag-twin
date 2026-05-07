@@ -7,7 +7,7 @@ use crate::models::{
     RunIndexEntry, RunManifest, RunTimelineEvent,
 };
 use crate::report::Report;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -16,6 +16,67 @@ use std::path::{Path, PathBuf};
 
 pub fn run_dir(artifact_root: impl AsRef<Path>, run_id: &str) -> PathBuf {
     artifact_root.as_ref().join("runs").join(run_id)
+}
+
+#[derive(Debug, Clone)]
+pub struct RunLocation {
+    pub artifact_root: PathBuf,
+    pub run_dir: PathBuf,
+    pub lab_run_dir: Option<PathBuf>,
+    pub lab_index_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LabRunIndexDisk {
+    #[serde(default)]
+    runs: Vec<LabRunIndexEntryDisk>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LabRunIndexEntryDisk {
+    run_id: String,
+    lab_run_dir: String,
+    pipeline_run_dir: String,
+}
+
+pub fn resolve_run_location(artifact_root: impl AsRef<Path>, run_id: &str) -> Result<RunLocation> {
+    let artifact_root = artifact_root.as_ref();
+    if let Some(location) = top_level_run_location(artifact_root, run_id) {
+        return Ok(location);
+    }
+    if let Some(location) = lab_index_run_location(artifact_root, run_id)? {
+        return Ok(location);
+    }
+    if let Some(location) = scan_lab_run_location(artifact_root, run_id)? {
+        return Ok(location);
+    }
+    Err(NetdiagError::InvalidTrace(format!(
+        "unknown run id: {run_id}"
+    )))
+}
+
+pub fn list_run_locations(artifact_root: impl AsRef<Path>) -> Result<Vec<RunLocation>> {
+    let artifact_root = artifact_root.as_ref();
+    let mut locations = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for location in scan_top_level_run_locations(artifact_root)? {
+        if seen.insert(location.run_dir.display().to_string()) {
+            locations.push(location);
+        }
+    }
+    for location in lab_index_run_locations(artifact_root)? {
+        if seen.insert(location.run_dir.display().to_string()) {
+            locations.push(location);
+        }
+    }
+    for location in scan_lab_run_locations(artifact_root)? {
+        if seen.insert(location.run_dir.display().to_string()) {
+            locations.push(location);
+        }
+    }
+    locations.sort_by(|left, right| left.run_dir.cmp(&right.run_dir));
+    Ok(locations)
 }
 
 pub fn save_json<T: Serialize + ?Sized>(path: impl AsRef<Path>, value: &T) -> Result<PathBuf> {
@@ -59,15 +120,170 @@ pub fn read_json(path: impl AsRef<Path>) -> Result<Value> {
 }
 
 pub fn read_manifest(artifact_root: impl AsRef<Path>, run_id: &str) -> Result<RunManifest> {
-    let path = run_dir(artifact_root, run_id).join("manifest.json");
+    let location = resolve_run_location(artifact_root, run_id)?;
+    let path = location.run_dir.join("manifest.json");
     let file = File::open(&path).with_path(&path)?;
     Ok(serde_json::from_reader(BufReader::new(file))?)
 }
 
 pub fn read_report(artifact_root: impl AsRef<Path>, run_id: &str) -> Result<Report> {
-    let path = run_dir(artifact_root, run_id).join("report.json");
+    let location = resolve_run_location(artifact_root, run_id)?;
+    let path = location.run_dir.join("report.json");
     let file = File::open(&path).with_path(&path)?;
     Ok(serde_json::from_reader(BufReader::new(file))?)
+}
+
+fn top_level_run_location(artifact_root: &Path, run_id: &str) -> Option<RunLocation> {
+    let run_dir_path = run_dir(artifact_root, run_id);
+    run_dir_path
+        .join("manifest.json")
+        .exists()
+        .then(|| RunLocation {
+            artifact_root: artifact_root.to_path_buf(),
+            run_dir: run_dir_path,
+            lab_run_dir: None,
+            lab_index_root: None,
+        })
+}
+
+fn scan_top_level_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
+    let runs_dir = artifact_root.join("runs");
+    if !runs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut locations = Vec::new();
+    for entry in fs::read_dir(&runs_dir).with_path(&runs_dir)? {
+        let entry = entry.with_path(&runs_dir)?;
+        let path = entry.path();
+        if !path.is_dir()
+            || path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            || !path.join("manifest.json").exists()
+        {
+            continue;
+        }
+        locations.push(RunLocation {
+            artifact_root: artifact_root.to_path_buf(),
+            run_dir: path,
+            lab_run_dir: None,
+            lab_index_root: None,
+        });
+    }
+    Ok(locations)
+}
+
+fn read_lab_run_index_disk(artifact_root: &Path) -> Result<Option<LabRunIndexDisk>> {
+    let index_path = artifact_root.join("lab_run_index.json");
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    serde_json::from_value(read_json(index_path)?)
+        .map(Some)
+        .map_err(NetdiagError::from)
+}
+
+fn lab_index_run_location(artifact_root: &Path, run_id: &str) -> Result<Option<RunLocation>> {
+    let Some(index) = read_lab_run_index_disk(artifact_root)? else {
+        return Ok(None);
+    };
+    for entry in index.runs {
+        if entry.run_id != run_id {
+            continue;
+        }
+        if let Some(location) = lab_entry_location(artifact_root, &entry) {
+            return Ok(Some(location));
+        }
+    }
+    Ok(None)
+}
+
+fn lab_index_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
+    let Some(index) = read_lab_run_index_disk(artifact_root)? else {
+        return Ok(Vec::new());
+    };
+    Ok(index
+        .runs
+        .iter()
+        .filter_map(|entry| lab_entry_location(artifact_root, entry))
+        .collect())
+}
+
+fn lab_entry_location(artifact_root: &Path, entry: &LabRunIndexEntryDisk) -> Option<RunLocation> {
+    let lab_run_dir = PathBuf::from(&entry.lab_run_dir);
+    let pipeline_run_dir = PathBuf::from(&entry.pipeline_run_dir);
+    let artifact_candidate = if run_dir(&lab_run_dir, &entry.run_id)
+        .join("manifest.json")
+        .exists()
+    {
+        lab_run_dir.clone()
+    } else if pipeline_run_dir.join("manifest.json").exists() {
+        pipeline_run_dir
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&lab_run_dir)
+            .to_path_buf()
+    } else {
+        return None;
+    };
+    Some(RunLocation {
+        run_dir: run_dir(&artifact_candidate, &entry.run_id),
+        artifact_root: artifact_candidate,
+        lab_run_dir: Some(lab_run_dir),
+        lab_index_root: Some(artifact_root.to_path_buf()),
+    })
+}
+
+fn scan_lab_run_location(artifact_root: &Path, run_id: &str) -> Result<Option<RunLocation>> {
+    Ok(scan_lab_run_locations(artifact_root)?
+        .into_iter()
+        .find(|location| {
+            location.run_dir.file_name().and_then(|name| name.to_str()) == Some(run_id)
+        }))
+}
+
+fn scan_lab_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
+    let lab_runs_dir = artifact_root.join("lab-runs");
+    if !lab_runs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut locations = Vec::new();
+    for scenario in fs::read_dir(&lab_runs_dir).with_path(&lab_runs_dir)? {
+        let scenario = scenario.with_path(&lab_runs_dir)?;
+        let scenario_path = scenario.path();
+        if !scenario_path.is_dir() {
+            continue;
+        }
+        for lab_run in fs::read_dir(&scenario_path).with_path(&scenario_path)? {
+            let lab_run = lab_run.with_path(&scenario_path)?;
+            let lab_run_dir = lab_run.path();
+            let runs_dir = lab_run_dir.join("runs");
+            if !runs_dir.is_dir() {
+                continue;
+            }
+            for run in fs::read_dir(&runs_dir).with_path(&runs_dir)? {
+                let run = run.with_path(&runs_dir)?;
+                let run_dir_path = run.path();
+                if !run_dir_path.is_dir()
+                    || run_dir_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with('.'))
+                    || !run_dir_path.join("manifest.json").exists()
+                {
+                    continue;
+                }
+                locations.push(RunLocation {
+                    artifact_root: lab_run_dir.clone(),
+                    run_dir: run_dir_path,
+                    lab_run_dir: Some(lab_run_dir.clone()),
+                    lab_index_root: Some(artifact_root.to_path_buf()),
+                });
+            }
+        }
+    }
+    Ok(locations)
 }
 
 pub fn list_run_index(artifact_root: impl AsRef<Path>) -> Result<Vec<RunIndexEntry>> {
@@ -83,6 +299,30 @@ pub fn list_run_index(artifact_root: impl AsRef<Path>) -> Result<Vec<RunIndexEnt
     } else {
         scan_run_manifests(artifact_root)?
     };
+    let mut seen = entries
+        .iter()
+        .map(|entry| entry.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    for location in list_run_locations(artifact_root)? {
+        let manifest_path = location.run_dir.join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        let manifest: RunManifest = serde_json::from_value(read_json(&manifest_path)?)?;
+        if !seen.insert(manifest.run_id.clone()) {
+            continue;
+        }
+        let status = read_report(location.artifact_root.clone(), &manifest.run_id)
+            .map(|report| report.hil_summary.run_status().to_string())
+            .unwrap_or_else(|_| "complete".to_string());
+        entries.push(RunIndexEntry {
+            run_id: manifest.run_id,
+            sample: manifest.sample,
+            created_at: manifest.created_at,
+            status,
+            run_dir: location.run_dir.display().to_string(),
+        });
+    }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
     Ok(entries)
 }
@@ -202,9 +442,8 @@ pub fn run_artifacts(
     artifact_root: impl AsRef<Path>,
     run_id: &str,
 ) -> Result<Vec<RunArtifactEntry>> {
-    let artifact_root = artifact_root.as_ref();
-    let dir = run_dir(artifact_root, run_id);
-    let manifest_path = dir.join("manifest.json");
+    let location = resolve_run_location(artifact_root, run_id)?;
+    let manifest_path = location.run_dir.join("manifest.json");
     let file = File::open(&manifest_path).with_path(&manifest_path)?;
     let manifest: RunManifest = serde_json::from_reader(BufReader::new(file))?;
     let mut entries = vec![RunArtifactEntry {
@@ -220,7 +459,7 @@ pub fn run_artifacts(
                 if key == "run_id" {
                     return None;
                 }
-                let path = resolve_artifact_path(artifact_root, run_id, &value);
+                let path = resolve_artifact_path(&location, &value);
                 Some(RunArtifactEntry {
                     key,
                     exists: path.exists(),
@@ -277,24 +516,24 @@ pub fn read_connector_health(
     artifact_root: impl AsRef<Path>,
     run_id: &str,
 ) -> Result<Option<ConnectorHealthSnapshot>> {
-    let artifact_root = artifact_root.as_ref();
-    if let Ok(manifest) = read_manifest(artifact_root, run_id)
+    let location = resolve_run_location(artifact_root, run_id)?;
+    if let Ok(manifest) = read_manifest(&location.artifact_root, run_id)
         && let Some(path) = manifest.artifact_paths.get("connector_health")
     {
-        let path = resolve_artifact_path(artifact_root, run_id, path);
+        let path = resolve_artifact_path(&location, path);
         if path.exists() {
             let health = serde_json::from_value(read_json(path)?)?;
             return Ok(Some(health));
         }
     }
 
-    let default_path = run_dir(artifact_root, run_id).join("connector_health.json");
+    let default_path = location.run_dir.join("connector_health.json");
     if default_path.exists() {
         let health = serde_json::from_value(read_json(default_path)?)?;
         return Ok(Some(health));
     }
 
-    infer_connector_health(artifact_root, run_id)
+    infer_connector_health(&location.artifact_root, run_id)
 }
 
 pub fn run_evidence(artifact_root: impl AsRef<Path>, run_id: &str) -> Result<RunEvidenceSummary> {
@@ -375,8 +614,8 @@ pub fn review_recommendation(
     reviewer: &str,
     final_label: Option<FaultLabel>,
 ) -> Result<HilReviewOutcome> {
-    let artifact_root = artifact_root.as_ref();
-    let dir = run_dir(artifact_root, run_id);
+    let location = resolve_run_location(artifact_root, run_id)?;
+    let dir = location.run_dir.clone();
     let recommendations_path = dir.join("recommendations.json");
     let mut recommendations: Vec<Recommendation> =
         serde_json::from_value(read_json(&recommendations_path)?)?;
@@ -408,7 +647,8 @@ pub fn review_recommendation(
     let status = HilReviewSummary::from_recommendations(&recommendations)
         .run_status()
         .to_string();
-    update_run_index_status(artifact_root, run_id, status.as_str())?;
+    update_run_index_status(&location.artifact_root, run_id, status.as_str())?;
+    sync_lab_review_artifacts(&location, &recommendations)?;
 
     Ok(HilReviewOutcome {
         review,
@@ -455,6 +695,16 @@ fn update_report(dir: &Path, recommendations: &[Recommendation]) -> Result<()> {
     report.hil_summary = HilReviewSummary::from_recommendations(recommendations);
     save_json_atomic(report_path, &report)?;
     Ok(())
+}
+
+fn sync_lab_review_artifacts(
+    location: &RunLocation,
+    recommendations: &[Recommendation],
+) -> Result<()> {
+    let Some(lab_run_dir) = location.lab_run_dir.as_deref() else {
+        return Ok(());
+    };
+    update_report(lab_run_dir, recommendations)
 }
 
 fn write_feedback_record(dir: &Path, record: HilFeedbackRecord) -> Result<()> {
@@ -557,18 +807,24 @@ fn run_history_matches(entry: &RunHistoryEntry, filter: &RunHistoryFilter) -> bo
     true
 }
 
-fn resolve_artifact_path(artifact_root: &Path, run_id: &str, value: &str) -> PathBuf {
+fn resolve_artifact_path(location: &RunLocation, value: &str) -> PathBuf {
     let raw = PathBuf::from(value);
     if raw.is_absolute() {
         return raw;
     }
 
-    let dir = run_dir(artifact_root, run_id);
+    let dir = &location.run_dir;
     let mut candidates = Vec::new();
     if raw.components().count() == 1 {
         candidates.push(dir.join(&raw));
     }
-    candidates.push(artifact_root.join(&raw));
+    candidates.push(location.artifact_root.join(&raw));
+    if let Some(lab_run_dir) = &location.lab_run_dir {
+        candidates.push(lab_run_dir.join(&raw));
+    }
+    if let Some(lab_index_root) = &location.lab_index_root {
+        candidates.push(lab_index_root.join(&raw));
+    }
     candidates.push(raw.clone());
     candidates.push(dir.join(&raw));
 

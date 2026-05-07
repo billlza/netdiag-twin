@@ -1,6 +1,6 @@
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{RunArtifactEntry, TopologyModel};
-use crate::storage::{read_report, run_artifacts, run_dir};
+use crate::storage::{read_report, resolve_run_location, run_artifacts};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -67,16 +67,26 @@ pub fn export_evidence_bundle(
         files: Vec::new(),
     };
     let mut used_paths = BTreeSet::new();
-    let allowed_run_dir = run_dir(artifact_root, run_id);
+    let location = resolve_run_location(artifact_root, run_id)?;
+    let allowed_run_dir = location.run_dir.clone();
 
     add_readme(&mut zip, options, run_id, &mut used_paths)?;
-    for artifact in run_artifacts(artifact_root, run_id)? {
+    for artifact in run_artifacts(&location.artifact_root, run_id)? {
         if !artifact_path_is_inside_run(&artifact, &allowed_run_dir) {
             continue;
         }
         add_artifact_file(&mut zip, options, artifact, &mut manifest, &mut used_paths)?;
     }
-    for extra in extra_files {
+    let default_extra_files = if extra_files.is_empty() {
+        location
+            .lab_run_dir
+            .as_deref()
+            .map(default_lab_extra_files)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for extra in default_extra_files.iter().chain(extra_files.iter()) {
         add_path_file(
             &mut zip,
             options,
@@ -90,7 +100,7 @@ pub fn export_evidence_bundle(
     add_topology_snapshots(
         &mut zip,
         options,
-        artifact_root,
+        &location.artifact_root,
         run_id,
         &mut manifest,
         &mut used_paths,
@@ -103,6 +113,31 @@ pub fn export_evidence_bundle(
     zip.finish().map_err(zip_error)?;
     std::fs::rename(&tmp_path, output).with_path(output)?;
     Ok(manifest)
+}
+
+fn default_lab_extra_files(lab_run_dir: &Path) -> Vec<EvidenceBundleExtraFile> {
+    [
+        ("scenario", "scenario.yaml", "scenario.yaml"),
+        ("acceptance", "acceptance.json", "acceptance.json"),
+        ("comparison", "comparison.json", "comparison.json"),
+        (
+            "multi_source_evidence",
+            "multi_source_evidence.json",
+            "multi_source_evidence.json",
+        ),
+        (
+            "lab_connector_health",
+            "connector_health.json",
+            "lab_connector_health.json",
+        ),
+    ]
+    .into_iter()
+    .map(|(key, file_name, zip_path)| EvidenceBundleExtraFile {
+        key: key.to_string(),
+        path: lab_run_dir.join(file_name),
+        zip_path: zip_path.to_string(),
+    })
+    .collect()
 }
 
 fn add_readme(

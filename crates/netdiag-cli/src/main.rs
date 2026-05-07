@@ -12,6 +12,7 @@ use netdiag_core::dataset::{
     validate_dataset_jsonl_with_options,
 };
 use netdiag_core::evidence_bundle::export_evidence_bundle;
+use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
     LabPreflightMode, LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_batch,
     run_lab_scenario, summarize_lab_runs, validate_lab_run,
@@ -28,7 +29,8 @@ use netdiag_core::perf_budget::{
 };
 use netdiag_core::storage::{
     compare_runs, connector_health_from_ingest, list_run_history_filtered, read_json,
-    review_recommendation, run_artifacts, run_dir, run_evidence, save_json, write_connector_health,
+    resolve_run_location, review_recommendation, run_artifacts, run_evidence, save_json,
+    write_connector_health,
 };
 use netdiag_core::twin::{
     TopologyFormat, import_policy_action, import_topology, run_simulated_whatif,
@@ -55,6 +57,8 @@ enum Command {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+    #[command(name = "validate-trace", hide = true)]
+    ValidateTrace { file: PathBuf },
     Whatif {
         run_id: String,
         topology: String,
@@ -339,6 +343,21 @@ fn run(args: Args) -> anyhow::Result<()> {
                 .context("diagnosis failed")?;
             println!("{}", serde_json::to_string_pretty(&result.report)?);
         }
+        Command::ValidateTrace { file } => {
+            let ingest = ingest_trace(&file).with_context(|| {
+                format!("trace ingest validation failed for {}", file.display())
+            })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "valid",
+                    "file": file,
+                    "rows": ingest.schema.rows,
+                    "sample": ingest.schema.sample,
+                    "warnings": ingest.warnings,
+                }))?
+            );
+        }
         Command::Whatif {
             run_id,
             topology,
@@ -557,7 +576,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
         Command::Export { run_id, artifacts } => {
-            let path = run_dir(artifacts, &run_id).join("report.json");
+            let path = resolve_run_location(&artifacts, &run_id)?
+                .run_dir
+                .join("report.json");
             let report = read_json(path)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
@@ -832,7 +853,7 @@ fn run_whatif(
     action: &str,
     artifacts: PathBuf,
 ) -> anyhow::Result<()> {
-    let dir = run_dir(&artifacts, run_id);
+    let dir = resolve_run_location(&artifacts, run_id)?.run_dir;
     let summary_path = dir.join("telemetry_summary.json");
     let summary_value = read_json(summary_path)?;
     let summary: TelemetrySummary = serde_json::from_value(summary_value)?;
@@ -849,7 +870,7 @@ fn run_whatif_policy(
     policy: &std::path::Path,
     artifacts: PathBuf,
 ) -> anyhow::Result<()> {
-    let dir = run_dir(&artifacts, run_id);
+    let dir = resolve_run_location(&artifacts, run_id)?.run_dir;
     let summary_path = dir.join("telemetry_summary.json");
     let summary_value = read_json(summary_path)?;
     let summary: TelemetrySummary = serde_json::from_value(summary_value)?;

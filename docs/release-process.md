@@ -103,6 +103,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTFLAGS="-D warnings" cargo test --workspace
+python3 -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
+python3 scripts/validate_adapter_samples.py
 scripts/check_perf_budget.sh
 git diff --check
 bash -n scripts/*.sh
@@ -113,6 +115,7 @@ bash -n scripts/*.sh
 - 0 clippy warnings。
 - 0 rustc warnings。
 - 测试全通过。
+- adapter sample 同时通过 JSON schema 与 Rust ingest 校验。
 - 性能预算通过。
 - shell 脚本语法检查通过。
 

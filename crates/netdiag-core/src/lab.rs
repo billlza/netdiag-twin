@@ -15,7 +15,7 @@ use crate::models::{
     DiagnosisEvent, EvidenceRecord, EvidenceRef, FaultLabel, HilState, IngestResult, MetricQuality,
     MultiSourceEvidenceSummary, RunComparison, Severity, SourceEvidenceSummary, TimeWindow,
 };
-use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif};
+use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_model_dir};
 use crate::recommendation::recommend_actions;
 use crate::report::Report;
 use crate::report::{compare_rule_ml, render_report};
@@ -706,7 +706,7 @@ fn check_source_reachability_preflight(
                 LabPreflightMode::Static => check_source_static(source, scenario_dir),
                 LabPreflightMode::Live => check_source_reachable(source, scenario, scenario_dir),
             };
-            preflight_check(name, source.role == LabDataSourceRole::Primary, result)
+            preflight_check(name, true, result)
         })
         .collect()
 }
@@ -715,13 +715,18 @@ fn check_source_static(source: &LabDataSource, scenario_dir: &Path) -> Result<St
     match source.kind {
         LabDataSourceKind::TraceFile => {
             let path = resolve_path(scenario_dir, &source.endpoint);
-            if path.is_file() {
-                Ok(format!("trace file exists: {}", path.display()))
-            } else {
+            if !path.is_file() {
                 Err(NetdiagError::InvalidTrace(format!(
                     "trace file does not exist: {}",
                     path.display()
                 )))
+            } else {
+                let ingest = ingest_trace(&path)?;
+                Ok(format!(
+                    "trace file schema valid: {} rows from {}",
+                    ingest.schema.rows,
+                    path.display()
+                ))
             }
         }
         LabDataSourceKind::HttpJson
@@ -977,8 +982,13 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         .map(|what_if| build_what_if_request(what_if, scenario_dir))
         .transpose()?;
 
-    let mut pipeline =
-        diagnose_ingest_with_whatif(primary.loaded.ingest.clone(), &lab_run_dir, what_if.clone())?;
+    let model_dir = options.artifacts.join("model");
+    let mut pipeline = diagnose_ingest_with_whatif_and_model_dir(
+        primary.loaded.ingest.clone(),
+        &lab_run_dir,
+        &model_dir,
+        what_if.clone(),
+    )?;
     let primary_health = primary.health.clone();
     write_connector_health(&lab_run_dir, &pipeline.run_id, &primary_health)?;
     let connector_health = loaded_sources
@@ -986,13 +996,6 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         .map(|source| source.health.clone())
         .collect::<Vec<_>>();
     let corroboration_signals = collect_corroboration_signals(&loaded_sources);
-    let multi_source_evidence = multi_source_evidence(
-        &scenario,
-        &pipeline.report,
-        &loaded_sources,
-        &primary_health,
-        &corroboration_signals,
-    );
     apply_corroboration_signals(&mut pipeline.diagnosis_events, &corroboration_signals);
     pipeline.comparison = compare_rule_ml(&pipeline.diagnosis_events, &pipeline.ml_result);
     pipeline.recommendations =
@@ -1004,6 +1007,13 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         &pipeline.ml_result,
         pipeline.what_if.clone(),
         &pipeline.recommendations,
+    );
+    let multi_source_evidence = multi_source_evidence(
+        &scenario,
+        &pipeline.report,
+        &loaded_sources,
+        &primary_health,
+        &corroboration_signals,
     );
     pipeline.report.multi_source_evidence = Some(multi_source_evidence.clone());
     save_json(
@@ -2899,6 +2909,20 @@ mod tests {
         let validation =
             validate_lab_run(temp.path(), &result.run_id, None).expect("indexed validate");
         assert!(validation.passed, "{:?}", validation.failures);
+        assert!(
+            temp.path()
+                .join("model")
+                .join(crate::ml::MODEL_MANIFEST_FILE_NAME)
+                .exists(),
+            "lab run should use the shared artifact model directory"
+        );
+        assert!(
+            !PathBuf::from(&result.lab_run_dir).join("model").exists(),
+            "lab run should not create a private model directory"
+        );
+        let evidence =
+            crate::storage::run_evidence(temp.path(), &result.run_id).expect("indexed evidence");
+        assert_eq!(evidence.report.run_id, result.run_id);
 
         let keys = result
             .evidence_bundle
@@ -2914,6 +2938,33 @@ mod tests {
         ] {
             assert!(keys.contains(expected), "missing {expected}: {keys:?}");
         }
+
+        let report =
+            crate::storage::read_report(temp.path(), &result.run_id).expect("indexed report");
+        let recommendation = report
+            .recommendations
+            .iter()
+            .find(|recommendation| recommendation.diagnosis_symptom == Some(FaultLabel::Congestion))
+            .expect("diagnosis recommendation");
+        crate::storage::review_recommendation(
+            temp.path(),
+            &result.run_id,
+            &recommendation.recommendation_id,
+            HilState::Accepted,
+            "confirmed lab label",
+            "tester",
+            Some(FaultLabel::Congestion),
+        )
+        .expect("indexed review");
+        let feedback_output = temp.path().join("feedback.jsonl");
+        let feedback = crate::ml::export_feedback_training_dataset(temp.path(), &feedback_output)
+            .expect("feedback export");
+        assert_eq!(feedback.rows, 1);
+        let top_report: Report = serde_json::from_value(
+            read_json(PathBuf::from(&result.lab_run_dir).join("report.json")).expect("top report"),
+        )
+        .expect("top report json");
+        assert_eq!(top_report.hil_summary.accepted, 1);
     }
 
     #[test]
@@ -3004,6 +3055,179 @@ acceptance:
                 .any(|reference| reference.artifact == "multi_source_evidence.json")
         );
         assert!(congestion.evidence.why.contains("Multi-source evidence"));
+    }
+
+    #[test]
+    fn lab_multisource_summary_uses_final_diagnosis_after_corroboration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let normal = repo_root().join("data").join("samples").join("normal.csv");
+        let congestion = repo_root()
+            .join("data")
+            .join("samples")
+            .join("congestion.csv");
+        let scenario_path = temp.path().join("scenario.yaml");
+        std::fs::write(
+            &scenario_path,
+            format!(
+                r#"schema: netdiag-lab-scenario/v1
+id: lab-suspected-corroboration-test
+name: Suspected corroboration test
+expected_label: congestion
+data_sources:
+  - name: primary-normal
+    role: primary
+    kind: trace-file
+    endpoint: "{}"
+  - name: corroborating-congestion
+    role: corroborating
+    kind: trace-file
+    endpoint: "{}"
+acceptance:
+  expected_root_cause: congestion
+  min_rule_confidence: 0.50
+  min_ml_probability: 0.0
+  require_rule_ml_agreement: false
+  require_what_if_improvement: false
+  allow_synthetic_model: true
+  allow_suspected_corroboration: true
+"#,
+                normal.display(),
+                congestion.display()
+            ),
+        )
+        .expect("write scenario");
+
+        let result = run_lab_scenario(
+            &scenario_path,
+            LabRunOptions {
+                artifacts: temp.path().join("artifacts"),
+            },
+        )
+        .expect("lab run");
+        let report: Report = serde_json::from_value(
+            read_json(PathBuf::from(&result.pipeline_run_dir).join("report.json"))
+                .expect("report json"),
+        )
+        .expect("report");
+        assert!(
+            report
+                .root_causes
+                .iter()
+                .any(|root| root.symptom == "congestion" && root.source == "corroboration"),
+            "{:?}",
+            report.root_causes
+        );
+        let multi = report.multi_source_evidence.expect("multi source evidence");
+        assert!(
+            multi
+                .primary_evidence
+                .iter()
+                .any(|evidence| evidence.contains("congestion")),
+            "{:?}",
+            multi.primary_evidence
+        );
+    }
+
+    #[test]
+    fn static_preflight_parses_trace_file_schema() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bad_trace = temp.path().join("bad.csv");
+        std::fs::write(&bad_trace, "timestamp,latency_ms\nnot-a-time,10\n").expect("bad trace");
+        let scenario_path = temp.path().join("scenario.yaml");
+        std::fs::write(
+            &scenario_path,
+            format!(
+                r#"schema: netdiag-lab-scenario/v1
+id: lab-bad-trace-preflight
+name: Bad trace preflight
+expected_label: normal
+data_sources:
+  - role: primary
+    kind: trace-file
+    endpoint: "{}"
+"#,
+                bad_trace.display()
+            ),
+        )
+        .expect("scenario");
+
+        let report = preflight_lab_scenario(
+            &scenario_path,
+            LabPreflightOptions {
+                artifacts: temp.path().join("artifacts"),
+                mode: LabPreflightMode::Static,
+            },
+        )
+        .expect("preflight report");
+
+        assert!(!report.passed);
+        assert!(
+            report.checks.iter().any(|check| {
+                check.name == "primary source reachable"
+                    && check.status == LabPreflightCheckStatus::Failed
+            }),
+            "{:?}",
+            report.checks
+        );
+    }
+
+    #[test]
+    fn static_preflight_fails_bad_corroborating_trace_file_schema() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let good_trace = temp.path().join("good.csv");
+        std::fs::write(
+            &good_trace,
+            "timestamp,latency_ms,packet_loss_rate,retransmission_rate,throughput_mbps\n2026-04-30T12:00:00Z,10,0,0,100\n",
+        )
+        .expect("good trace");
+        let bad_trace = temp.path().join("bad.csv");
+        std::fs::write(
+            &bad_trace,
+            "timestamp,latency_ms,packet_loss_rate,retransmission_rate,throughput_mbps\n2026-04-30T12:00:00Z,-1,0,0,100\n",
+        )
+        .expect("bad trace");
+        let scenario_path = temp.path().join("scenario.yaml");
+        std::fs::write(
+            &scenario_path,
+            format!(
+                r#"schema: netdiag-lab-scenario/v1
+id: lab-bad-corroborating-trace-preflight
+name: Bad corroborating trace preflight
+expected_label: normal
+data_sources:
+  - role: primary
+    kind: trace-file
+    endpoint: "{}"
+  - name: corroborating
+    role: corroborating
+    kind: trace-file
+    endpoint: "{}"
+"#,
+                good_trace.display(),
+                bad_trace.display()
+            ),
+        )
+        .expect("scenario");
+
+        let report = preflight_lab_scenario(
+            &scenario_path,
+            LabPreflightOptions {
+                artifacts: temp.path().join("artifacts"),
+                mode: LabPreflightMode::Static,
+            },
+        )
+        .expect("preflight report");
+
+        assert!(!report.passed);
+        assert!(
+            report.checks.iter().any(|check| {
+                check.name == "corroborating reachable"
+                    && check.required
+                    && check.status == LabPreflightCheckStatus::Failed
+            }),
+            "{:?}",
+            report.checks
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::models::{
     TraceRecord,
 };
 use crate::report::Report;
-use crate::storage::{read_json, save_json_atomic};
+use crate::storage::{list_run_locations, read_json, save_json_atomic};
 use crate::telemetry::{extract_features_from_windows, mean, summarize_telemetry};
 use chrono::Utc;
 use linfa::Dataset;
@@ -133,14 +133,24 @@ pub fn infer_with_quality(
     provenance: &[MetricProvenance],
 ) -> Result<MlResult> {
     let model_dir = artifact_root.as_ref().join("model");
-    let model = load_or_train_model(&model_dir)?;
+    infer_with_quality_from_model_dir(windows, run_id, &model_dir, provenance)
+}
+
+pub fn infer_with_quality_from_model_dir(
+    windows: &[TelemetryWindow],
+    run_id: &str,
+    model_dir: impl AsRef<Path>,
+    provenance: &[MetricProvenance],
+) -> Result<MlResult> {
+    let model_dir = model_dir.as_ref();
+    let model = load_or_train_model(model_dir)?;
     let model_manifest = read_json(model_dir.join(MODEL_MANIFEST_FILE_NAME))
         .ok()
         .and_then(|value| serde_json::from_value::<ModelManifest>(value).ok());
     let raw_features = extract_features_from_windows(windows);
     let feature_quality = feature_quality_map(provenance);
     let weighted_features = apply_feature_quality(&raw_features, &feature_quality);
-    let scaled = scale_row(&weighted_features, &model.means, &model.stds);
+    let scaled = scale_row(&weighted_features, &model.means, &model.stds)?;
     let x = Array2::from_shape_vec((1, FEATURES.len()), scaled.clone())
         .map_err(|err| NetdiagError::Ml(err.to_string()))?;
     let probabilities = model.model.predict_probabilities(&x);
@@ -262,25 +272,32 @@ fn feature_metric(feature: &str) -> &'static str {
 pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
     let model_path = model_dir.join(MODEL_FILE_NAME);
     let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
-    if model_path.exists()
-        && let Ok(file) = File::open(&model_path)
-    {
+    if model_path.exists() {
+        let file = File::open(&model_path).with_path(&model_path)?;
         let reader = BufReader::new(file);
-        if let Ok(model) = serde_json::from_reader::<_, RustMlModel>(reader) {
-            if !manifest_path.exists() {
-                let manifest = build_model_manifest(
-                    "cached_existing_model",
-                    0,
-                    BTreeMap::new(),
-                    false,
-                    &model,
-                    None,
-                    None,
-                );
-                save_json_atomic(&manifest_path, &manifest)?;
-            }
-            return Ok(model);
+        let model = serde_json::from_reader::<_, RustMlModel>(reader).map_err(|err| {
+            NetdiagError::Ml(format!(
+                "cached model {} is not a valid Rust ML model: {err}",
+                model_path.display()
+            ))
+        })?;
+        validate_model_structure(&model)?;
+        if manifest_path.exists() {
+            let manifest: ModelManifest = serde_json::from_value(read_json(&manifest_path)?)?;
+            validate_model_manifest(&manifest, &model)?;
+        } else {
+            let manifest = build_model_manifest(
+                "cached_existing_model",
+                0,
+                BTreeMap::new(),
+                false,
+                &model,
+                None,
+                None,
+            );
+            save_json_atomic(&manifest_path, &manifest)?;
         }
+        return Ok(model);
     }
 
     std::fs::create_dir_all(model_dir).with_path(model_dir)?;
@@ -336,7 +353,7 @@ pub fn train_model_from_jsonl_with_options(
     let validation = validate_dataset_jsonl_with_options(
         dataset_path,
         DatasetValidationOptions {
-            min_rows_per_label: options.min_rows_per_label,
+            min_rows_per_label: 0,
         },
     )?;
     let mut gate_failures = validation.failures.clone();
@@ -346,9 +363,33 @@ pub fn train_model_from_jsonl_with_options(
                 .to_string(),
         );
     }
+    let rows = read_training_jsonl(dataset_path)?;
+    let dataset_hash = sha256_file(dataset_path)?;
+    let dataset_labels = rows.iter().map(|row| row.label).collect::<BTreeSet<_>>();
+    let (training_rows, validation_rows) = partition_training_rows(&rows, options);
+    if options.min_rows_per_label > 0 {
+        let distribution = label_distribution(&training_rows);
+        for label in FaultLabel::ALL {
+            let count = distribution
+                .get(label.as_str())
+                .copied()
+                .unwrap_or_default();
+            if count < options.min_rows_per_label {
+                gate_failures.push(format!(
+                    "training split label {} has {} rows, below required {}",
+                    label.as_str(),
+                    count,
+                    options.min_rows_per_label
+                ));
+            }
+        }
+    }
     let gate = ModelTrainingGate {
         passed: gate_failures.is_empty(),
         rows: validation.rows,
+        dataset_rows: validation.rows,
+        training_rows: training_rows.len(),
+        validation_rows: validation_rows.len(),
         min_rows_per_label: options.min_rows_per_label,
         validation_split: options.validation_split,
         stratified: options.stratified,
@@ -360,10 +401,6 @@ pub fn train_model_from_jsonl_with_options(
             gate.failures.join("; ")
         )));
     }
-    let rows = read_training_jsonl(dataset_path)?;
-    let dataset_hash = sha256_file(dataset_path)?;
-    let dataset_labels = rows.iter().map(|row| row.label).collect::<BTreeSet<_>>();
-    let (training_rows, validation_rows) = partition_training_rows(&rows, options);
     let model = train_model_from_feature_rows(&training_rows)?;
     let evaluation = if validation_rows.is_empty() {
         None
@@ -396,30 +433,13 @@ pub fn export_feedback_training_dataset(
 ) -> Result<FeedbackExportSummary> {
     let artifact_root = artifact_root.as_ref();
     let output_path = output_path.as_ref();
-    let runs_root = artifact_root.join("runs");
     let mut rows = Vec::new();
     let mut skipped_runs = 0usize;
 
-    let mut run_dirs = std::fs::read_dir(&runs_root)
-        .with_path(&runs_root)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_path(&runs_root)?;
-    run_dirs.sort();
-
-    for run_dir in run_dirs {
-        if !run_dir.is_dir()
-            || run_dir
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
-        {
-            continue;
-        }
-
-        let report_path = run_dir.join("report.json");
-        let ml_path = run_dir.join("ml_result.json");
-        let feedback_path = run_dir.join("hil_feedback.json");
+    for location in list_run_locations(artifact_root)? {
+        let report_path = location.run_dir.join("report.json");
+        let ml_path = location.run_dir.join("ml_result.json");
+        let feedback_path = location.run_dir.join("hil_feedback.json");
         if !report_path.exists() || !ml_path.exists() || !feedback_path.exists() {
             skipped_runs += 1;
             continue;
@@ -687,7 +707,8 @@ fn evaluate_model(
 }
 
 fn predict_label(model: &RustMlModel, features: &[f64]) -> Result<FaultLabel> {
-    let scaled = scale_row(features, &model.means, &model.stds);
+    validate_model_structure(model)?;
+    let scaled = scale_row(features, &model.means, &model.stds)?;
     let x = Array2::from_shape_vec((1, FEATURES.len()), scaled)
         .map_err(|err| NetdiagError::Ml(err.to_string()))?;
     let probabilities = model.model.predict_probabilities(&x);
@@ -803,10 +824,10 @@ fn fit_model(rows: &[Vec<f64>], targets: &[usize]) -> Result<RustMlModel> {
         })
         .collect::<Vec<_>>();
 
-    let scaled_rows = rows
-        .iter()
-        .flat_map(|row| scale_row(row, &means, &stds))
-        .collect::<Vec<_>>();
+    let mut scaled_rows = Vec::with_capacity(rows.len() * FEATURES.len());
+    for row in rows {
+        scaled_rows.extend(scale_row(row, &means, &stds)?);
+    }
     let x = Array2::from_shape_vec((rows.len(), FEATURES.len()), scaled_rows)
         .map_err(|err| NetdiagError::Ml(err.to_string()))?;
     let y = Array1::from(targets.to_vec());
@@ -899,6 +920,8 @@ fn write_model_bundle(
     model: &RustMlModel,
     manifest: &ModelManifest,
 ) -> Result<()> {
+    validate_model_structure(model)?;
+    validate_model_manifest(manifest, model)?;
     std::fs::create_dir_all(model_dir).with_path(model_dir)?;
     save_json_atomic(model_dir.join(MODEL_FILE_NAME), model)?;
     save_json_atomic(model_dir.join(MODEL_MANIFEST_FILE_NAME), manifest)?;
@@ -1046,10 +1069,150 @@ fn write_jsonl_atomic<T: Serialize>(path: &Path, rows: &[T]) -> Result<PathBuf> 
     Ok(path.to_path_buf())
 }
 
-fn scale_row(row: &[f64], means: &[f64], stds: &[f64]) -> Vec<f64> {
+fn validate_model_structure(model: &RustMlModel) -> Result<()> {
+    if model.means.len() != FEATURES.len() {
+        return Err(NetdiagError::Ml(format!(
+            "cached model means has {} entries, expected {}",
+            model.means.len(),
+            FEATURES.len()
+        )));
+    }
+    if model.stds.len() != FEATURES.len() {
+        return Err(NetdiagError::Ml(format!(
+            "cached model stds has {} entries, expected {}",
+            model.stds.len(),
+            FEATURES.len()
+        )));
+    }
+    if model.means.iter().any(|value| !value.is_finite()) {
+        return Err(NetdiagError::Ml(
+            "cached model means contain non-finite values".to_string(),
+        ));
+    }
+    if model
+        .stds
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(NetdiagError::Ml(
+            "cached model stds must be finite and positive".to_string(),
+        ));
+    }
+    let classes = model.model.classes();
+    if classes.len() < 2 {
+        return Err(NetdiagError::Ml(
+            "cached model must contain at least two classes".to_string(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for class in classes {
+        if *class >= FaultLabel::ALL.len() {
+            return Err(NetdiagError::Ml(format!(
+                "cached model class index {} is outside known fault labels",
+                class
+            )));
+        }
+        if !seen.insert(*class) {
+            return Err(NetdiagError::Ml(format!(
+                "cached model class index {} appears more than once",
+                class
+            )));
+        }
+    }
+    let params = model.model.params();
+    let shape = params.shape();
+    if shape.len() != 2 || shape[0] != FEATURES.len() || shape[1] != classes.len() {
+        return Err(NetdiagError::Ml(format!(
+            "cached model parameter shape {:?} does not match {} features and {} classes",
+            shape,
+            FEATURES.len(),
+            classes.len()
+        )));
+    }
+    if params.iter().any(|value| !value.is_finite()) {
+        return Err(NetdiagError::Ml(
+            "cached model parameters contain non-finite values".to_string(),
+        ));
+    }
+    let intercept = model.model.intercept();
+    if intercept.len() != classes.len() {
+        return Err(NetdiagError::Ml(format!(
+            "cached model intercept has {} entries, expected {} classes",
+            intercept.len(),
+            classes.len()
+        )));
+    }
+    if intercept.iter().any(|value| !value.is_finite()) {
+        return Err(NetdiagError::Ml(
+            "cached model intercept contains non-finite values".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_model_manifest(manifest: &ModelManifest, model: &RustMlModel) -> Result<()> {
+    if manifest.model_file != MODEL_FILE_NAME {
+        return Err(NetdiagError::Ml(format!(
+            "model manifest points at {}, expected {}",
+            manifest.model_file, MODEL_FILE_NAME
+        )));
+    }
+    if manifest.feature_count != FEATURES.len() {
+        return Err(NetdiagError::Ml(format!(
+            "model manifest feature_count is {}, expected {}",
+            manifest.feature_count,
+            FEATURES.len()
+        )));
+    }
+    let expected_features = FEATURES
+        .iter()
+        .map(|feature| (*feature).to_string())
+        .collect::<Vec<_>>();
+    if manifest.feature_names != expected_features {
+        return Err(NetdiagError::Ml(
+            "model manifest feature_names do not match inference features".to_string(),
+        ));
+    }
+    let expected_labels = model
+        .model
+        .classes()
+        .iter()
+        .map(|class| FaultLabel::from_index(*class).as_str().to_string())
+        .collect::<Vec<_>>();
+    if manifest.labels != expected_labels {
+        return Err(NetdiagError::Ml(
+            "model manifest labels do not match cached model classes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn scale_row(row: &[f64], means: &[f64], stds: &[f64]) -> Result<Vec<f64>> {
+    if row.len() != FEATURES.len() {
+        return Err(NetdiagError::Ml(format!(
+            "feature row has {} entries, expected {}",
+            row.len(),
+            FEATURES.len()
+        )));
+    }
+    if means.len() != FEATURES.len() || stds.len() != FEATURES.len() {
+        return Err(NetdiagError::Ml(
+            "model scaler dimensions do not match inference features".to_string(),
+        ));
+    }
     row.iter()
         .enumerate()
-        .map(|(idx, value)| (value - means[idx]) / stds[idx].max(1e-9))
+        .map(|(idx, value)| {
+            let mean = means[idx];
+            let std = stds[idx];
+            if !value.is_finite() || !mean.is_finite() || !std.is_finite() || std <= 0.0 {
+                return Err(NetdiagError::Ml(format!(
+                    "feature {} cannot be scaled with non-finite input or scaler",
+                    FEATURES[idx]
+                )));
+            }
+            Ok((value - mean) / std.max(1e-9))
+        })
         .collect()
 }
 
@@ -1117,6 +1280,31 @@ mod tests {
             label,
             features: vec![value; FEATURES.len()],
         }
+    }
+
+    fn dataset_line(label: FaultLabel, value: f64) -> String {
+        let features = FEATURES
+            .iter()
+            .map(|feature| ((*feature).to_string(), value))
+            .collect::<BTreeMap<_, _>>();
+        serde_json::json!({
+            "label": label,
+            "features": features,
+        })
+        .to_string()
+    }
+
+    fn write_feature_dataset(path: &Path, rows_per_label: usize) {
+        let mut lines = Vec::new();
+        for label in FaultLabel::ALL {
+            for idx in 0..rows_per_label {
+                lines.push(dataset_line(
+                    label,
+                    label.index() as f64 + idx as f64 * 0.01,
+                ));
+            }
+        }
+        std::fs::write(path, lines.join("\n")).expect("dataset");
     }
 
     #[test]
@@ -1204,5 +1392,113 @@ mod tests {
             "{:?}",
             evaluation.warnings
         );
+    }
+
+    #[test]
+    fn training_gate_checks_training_split_distribution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("feedback.jsonl");
+        write_feature_dataset(&dataset, 2);
+
+        let err = train_model_from_jsonl_with_options(
+            &dataset,
+            temp.path().join("model"),
+            TrainingOptions {
+                validation_split: 0.5,
+                shuffle_seed: Some(2026),
+                stratified: true,
+                min_rows_per_label: 2,
+            },
+        )
+        .expect_err("training split should fail gate");
+
+        assert!(
+            err.to_string()
+                .contains("training split label normal has 1 rows"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn training_gate_passes_when_training_split_keeps_enough_rows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = temp.path().join("feedback.jsonl");
+        write_feature_dataset(&dataset, 3);
+
+        let manifest = train_model_from_jsonl_with_options(
+            &dataset,
+            temp.path().join("model"),
+            TrainingOptions {
+                validation_split: 0.34,
+                shuffle_seed: Some(2026),
+                stratified: true,
+                min_rows_per_label: 2,
+            },
+        )
+        .expect("training should pass");
+
+        let gate = manifest.training_gate.expect("gate");
+        assert!(gate.passed, "{:?}", gate.failures);
+        assert_eq!(gate.dataset_rows, FaultLabel::ALL.len() * 3);
+        assert_eq!(gate.training_rows, FaultLabel::ALL.len() * 2);
+        assert_eq!(gate.validation_rows, FaultLabel::ALL.len());
+    }
+
+    #[test]
+    fn cached_model_with_bad_scaler_dimensions_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp.path().join("model");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        let mut model = train_default_model().expect("model");
+        model.means.pop();
+        save_json_atomic(model_dir.join(MODEL_FILE_NAME), &model).expect("model json");
+
+        let err = load_or_train_model(&model_dir).expect_err("bad cache should fail");
+
+        assert!(err.to_string().contains("cached model means"), "{err}");
+    }
+
+    #[test]
+    fn cached_model_manifest_must_match_model_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp.path().join("model");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        let model = train_default_model().expect("model");
+        let mut manifest =
+            build_model_manifest("test", 1, BTreeMap::new(), false, &model, None, None);
+        manifest.feature_count = FEATURES.len() + 1;
+        save_json_atomic(model_dir.join(MODEL_FILE_NAME), &model).expect("model json");
+        save_json_atomic(model_dir.join(MODEL_MANIFEST_FILE_NAME), &manifest)
+            .expect("manifest json");
+
+        let err = load_or_train_model(&model_dir).expect_err("bad manifest should fail");
+
+        assert!(
+            err.to_string().contains("model manifest feature_count"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cached_model_with_bad_intercept_shape_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp.path().join("model");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        let model = train_default_model().expect("model");
+        let mut value = serde_json::to_value(&model).expect("model value");
+        let intercept = value
+            .get_mut("model")
+            .and_then(|model| model.get_mut("intercept"))
+            .expect("intercept");
+        intercept["dim"] = serde_json::json!([FaultLabel::ALL.len() - 1]);
+        intercept["data"]
+            .as_array_mut()
+            .expect("intercept data")
+            .pop();
+        save_json_atomic(model_dir.join(MODEL_FILE_NAME), &value).expect("model json");
+
+        let err = load_or_train_model(&model_dir).expect_err("bad cache should fail");
+
+        assert!(err.to_string().contains("cached model intercept"), "{err}");
     }
 }

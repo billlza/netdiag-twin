@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.3.5 platform contract: how telemetry becomes
+This guide describes the stable v0.3.6 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -164,7 +164,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.3.5 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.3.6 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -185,7 +185,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.3.5 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.3.6 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -250,7 +250,9 @@ different `--artifacts` root is provided.
 | `hil_feedback.json` | Created after human review is saved. |
 
 The model cache is stored under `artifacts/model/`. It is deterministic and can
-be regenerated if removed.
+be regenerated if removed. Lab scenarios use this same trained cache, so a lab
+run does not silently substitute a synthetic per-run model unless the scenario
+explicitly opts into synthetic fallback behavior.
 
 `run_index.json` is the Evidence Console index. New runs also write
 `connector_health.json`, which records source kind, profile name, rows,
@@ -270,6 +272,10 @@ cargo run -p netdiag-cli -- evidence-bundle <run_id> \
   --output target/netdiag-evidence-<run_id>.zip
 ```
 
+The same top-level `--artifacts artifacts` lookup resolves regular runs and
+indexed lab runs for evidence, artifacts, review, export, feedback export,
+what-if, and evidence-bundle commands.
+
 ## Lab Scenarios
 
 Lab scenarios are YAML files with a stable `netdiag-lab-scenario/v1` schema.
@@ -286,9 +292,11 @@ cargo run -p netdiag-cli -- lab validate <run_id> \
 
 Preflight defaults to `--mode static`, which validates scenario schema,
 topology/policy shape, mapping files, paths, endpoint syntax, and artifact
-writability without querying live data sources. Use `--mode live` when you want
-the check to actually call HTTP/JSON, Prometheus, pcap interfaces/files, OTLP
-bind probes, or system counters.
+writability without querying live data sources. Local trace-file sources are
+also parsed in static mode so missing columns, invalid timestamps, negative
+values, and non-finite values fail before a lab run starts. Use `--mode live`
+when you want the check to actually call HTTP/JSON, Prometheus, pcap
+interfaces/files, OTLP bind probes, or system counters.
 
 `lab validate` first reads `artifacts/lab_run_index.json`, then falls back to a
 bounded scan under `artifacts/lab-runs/*/*/runs/<run_id>`. Passing `--scenario`

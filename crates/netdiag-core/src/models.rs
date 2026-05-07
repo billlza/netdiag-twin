@@ -555,6 +555,12 @@ pub struct ModelTrainingConfig {
 pub struct ModelTrainingGate {
     pub passed: bool,
     pub rows: usize,
+    #[serde(default)]
+    pub dataset_rows: usize,
+    #[serde(default)]
+    pub training_rows: usize,
+    #[serde(default)]
+    pub validation_rows: usize,
     pub min_rows_per_label: usize,
     pub validation_split: f64,
     pub stratified: bool,

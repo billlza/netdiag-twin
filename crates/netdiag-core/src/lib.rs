@@ -18,4 +18,5 @@ pub mod twin;
 pub use error::{NetdiagError, Result};
 pub use pipeline::{
     PipelineResult, WhatIfRequest, diagnose_file, diagnose_ingest, diagnose_ingest_with_whatif,
+    diagnose_ingest_with_whatif_and_model_dir,
 };

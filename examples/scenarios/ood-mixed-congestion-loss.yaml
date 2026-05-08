@@ -1,0 +1,17 @@
+schema: netdiag-lab-scenario/v1
+id: ood-mixed-congestion-loss-001
+name: Unknown mixed congestion and loss benchmark
+
+data_sources:
+  - name: ood-mixed-congestion-loss-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/ood_mixed_congestion_loss.csv
+
+acceptance:
+  min_ml_probability: 0.0
+  allowed_diagnosis_statuses:
+    - uncertain
+    - out_of_distribution
+  require_rule_ml_agreement: false
+  require_what_if_improvement: false

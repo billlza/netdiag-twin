@@ -1,10 +1,13 @@
 use crate::models::{
-    DiagnosisCandidate, DiagnosisDecision, DiagnosisEvent, DiagnosisStatus, FaultLabel,
-    HilReviewSummary, MetricProvenance, MlResult, ModelManifest, MultiSourceEvidenceSummary,
-    Recommendation, TelemetrySummary, UncertaintyAssessment, UncertaintyReasonCode, WhatIfResult,
+    DiagnosisCandidate, DiagnosisDecision, DiagnosisEvent, DiagnosisStatus, EvidenceTimelineEvent,
+    FaultLabel, HilReviewSummary, MetricProvenance, MlResult, ModelManifest,
+    MultiSourceEvidenceSummary, Recommendation, TelemetrySummary, UncertaintyAssessment,
+    UncertaintyReasonCode, WhatIfResult,
 };
+use crate::telemetry::quantile;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
@@ -30,6 +33,8 @@ pub struct Report {
     pub what_if: Option<WhatIfResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_source_evidence: Option<MultiSourceEvidenceSummary>,
+    #[serde(default)]
+    pub evidence_timeline: Vec<EvidenceTimelineEvent>,
     pub recommendations: Vec<Recommendation>,
     #[serde(default)]
     pub hil_summary: HilReviewSummary,
@@ -266,9 +271,287 @@ pub fn render_report(
         model_file_hash: ml.model_file_hash.clone(),
         what_if,
         multi_source_evidence: None,
+        evidence_timeline: build_evidence_timeline(summary, events, ml, None),
         recommendations: recommendations.to_vec(),
         hil_summary: HilReviewSummary::from_recommendations(recommendations),
     }
+}
+
+pub fn refresh_report_evidence_timeline(report: &mut Report) {
+    let supplemental = build_evidence_timeline(
+        &report.trace_summary,
+        &[],
+        &MlResult {
+            method: "report".to_string(),
+            run_id: report.run_id.clone(),
+            top_predictions: Vec::new(),
+            top_features: Vec::new(),
+            features: Default::default(),
+            feature_quality: Default::default(),
+            uncertainty: report.uncertainty.clone(),
+            model_manifest: report.model_manifest.clone(),
+            model_manifest_hash: report.model_manifest_hash.clone(),
+            model_file_hash: report.model_file_hash.clone(),
+        },
+        report.multi_source_evidence.as_ref(),
+    );
+    if report.evidence_timeline.is_empty() {
+        report.evidence_timeline = supplemental;
+    } else {
+        let mut existing = report
+            .evidence_timeline
+            .iter()
+            .map(event_key)
+            .collect::<BTreeSet<_>>();
+        for event in supplemental {
+            push_unique_timeline_event(&mut report.evidence_timeline, &mut existing, event);
+        }
+    }
+    let mut existing = report
+        .evidence_timeline
+        .iter()
+        .map(event_key)
+        .collect::<BTreeSet<_>>();
+    for root in &report.root_causes {
+        let event = EvidenceTimelineEvent {
+            occurred_at: report.generated_at,
+            phase: "diagnosis".to_string(),
+            title: format!("diagnosis candidate {}", root.symptom),
+            detail: root.why.clone(),
+            label: root.symptom.parse::<FaultLabel>().ok(),
+            confidence: Some(root.confidence),
+            source: Some(root.source.clone()),
+            artifact: Some("report.json".to_string()),
+        };
+        push_unique_timeline_event(&mut report.evidence_timeline, &mut existing, event);
+    }
+    sort_timeline(&mut report.evidence_timeline);
+}
+
+fn build_evidence_timeline(
+    summary: &TelemetrySummary,
+    events: &[DiagnosisEvent],
+    ml: &MlResult,
+    multi_source: Option<&MultiSourceEvidenceSummary>,
+) -> Vec<EvidenceTimelineEvent> {
+    let mut timeline = Vec::new();
+    let mut seen = BTreeSet::new();
+    let throughput_values = summary
+        .windows
+        .iter()
+        .map(|window| window.throughput_mbps.mean)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    let latency_values = summary
+        .windows
+        .iter()
+        .map(|window| window.latency_ms.p95)
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    let throughput_floor = quantile(&throughput_values, 0.20);
+    let latency_ceiling = quantile(&latency_values, 0.80).max(summary.overall.latency.p95 * 0.85);
+
+    for window in &summary.windows {
+        if throughput_floor > 0.0
+            && window.throughput_mbps.mean <= throughput_floor
+            && summary.overall.throughput_mbps.mean > 0.0
+            && window.throughput_mbps.mean <= summary.overall.throughput_mbps.mean * 0.90
+        {
+            push_unique_timeline_event(
+                &mut timeline,
+                &mut seen,
+                EvidenceTimelineEvent {
+                    occurred_at: window.start_ts,
+                    phase: "telemetry".to_string(),
+                    title: "throughput drop".to_string(),
+                    detail: format!(
+                        "throughput mean {:.2} Mbps fell below the run low-water envelope",
+                        window.throughput_mbps.mean
+                    ),
+                    label: None,
+                    confidence: None,
+                    source: Some("telemetry_summary".to_string()),
+                    artifact: Some("telemetry_windows.json".to_string()),
+                },
+            );
+        }
+        if latency_ceiling > 0.0 && window.latency_ms.p95 >= latency_ceiling {
+            push_unique_timeline_event(
+                &mut timeline,
+                &mut seen,
+                EvidenceTimelineEvent {
+                    occurred_at: window.start_ts,
+                    phase: "telemetry".to_string(),
+                    title: "latency p95 rises".to_string(),
+                    detail: format!(
+                        "latency p95 reached {:.2} ms against {:.2} ms run envelope",
+                        window.latency_ms.p95, latency_ceiling
+                    ),
+                    label: None,
+                    confidence: None,
+                    source: Some("telemetry_summary".to_string()),
+                    artifact: Some("telemetry_windows.json".to_string()),
+                },
+            );
+        }
+        if window.retransmission_rate > 1.0 {
+            push_unique_timeline_event(
+                &mut timeline,
+                &mut seen,
+                EvidenceTimelineEvent {
+                    occurred_at: window.start_ts,
+                    phase: "telemetry".to_string(),
+                    title: "retransmission increases".to_string(),
+                    detail: format!(
+                        "retransmission rate reached {:.2}%",
+                        window.retransmission_rate
+                    ),
+                    label: None,
+                    confidence: None,
+                    source: Some("telemetry_summary".to_string()),
+                    artifact: Some("telemetry_windows.json".to_string()),
+                },
+            );
+        }
+        if window.packet_loss_rate > 0.5 {
+            push_unique_timeline_event(
+                &mut timeline,
+                &mut seen,
+                EvidenceTimelineEvent {
+                    occurred_at: window.start_ts,
+                    phase: "telemetry".to_string(),
+                    title: "packet loss increases".to_string(),
+                    detail: format!("packet loss reached {:.2}%", window.packet_loss_rate),
+                    label: None,
+                    confidence: None,
+                    source: Some("telemetry_summary".to_string()),
+                    artifact: Some("telemetry_windows.json".to_string()),
+                },
+            );
+        }
+    }
+
+    for event in events {
+        push_unique_timeline_event(
+            &mut timeline,
+            &mut seen,
+            EvidenceTimelineEvent {
+                occurred_at: event.evidence.window.end_ts,
+                phase: "rule".to_string(),
+                title: format!("rule {} fires", event.evidence.symptom),
+                detail: event.evidence.why.clone(),
+                label: Some(event.evidence.symptom),
+                confidence: Some(event.evidence.confidence),
+                source: Some(event.source.clone()),
+                artifact: event
+                    .evidence
+                    .raw_evidence_refs
+                    .first()
+                    .map(|reference| reference.artifact.clone()),
+            },
+        );
+    }
+
+    let ml_time = summary
+        .windows
+        .last()
+        .map(|window| window.end_ts)
+        .unwrap_or_else(Utc::now);
+    if ml.uncertainty.status != DiagnosisStatus::Known || !ml.uncertainty.reason_codes.is_empty() {
+        let reason = ml
+            .uncertainty
+            .reason_codes
+            .first()
+            .map(ToString::to_string)
+            .or_else(|| ml.uncertainty.reasons.first().cloned())
+            .unwrap_or_else(|| ml.uncertainty.status.to_string());
+        push_unique_timeline_event(
+            &mut timeline,
+            &mut seen,
+            EvidenceTimelineEvent {
+                occurred_at: ml_time,
+                phase: "ml".to_string(),
+                title: format!("ML {}", ml.uncertainty.status),
+                detail: reason,
+                label: ml
+                    .top_predictions
+                    .first()
+                    .map(|prediction| prediction.label),
+                confidence: ml.top_predictions.first().map(|prediction| prediction.prob),
+                source: Some("ml".to_string()),
+                artifact: Some("ml_result.json".to_string()),
+            },
+        );
+    }
+
+    if let Some(multi_source) = multi_source {
+        for signal in &multi_source.signals {
+            let (title, label) = if let Some(label) = signal.supports {
+                (
+                    format!("corroborating {} supports {}", signal.source_kind, label),
+                    Some(label),
+                )
+            } else if let Some(label) = signal.contradicts {
+                (
+                    format!("corroborating {} contradicts {}", signal.source_kind, label),
+                    Some(label),
+                )
+            } else {
+                (
+                    format!("corroborating {} adds context", signal.source_kind),
+                    None,
+                )
+            };
+            push_unique_timeline_event(
+                &mut timeline,
+                &mut seen,
+                EvidenceTimelineEvent {
+                    occurred_at: ml_time,
+                    phase: "corroboration".to_string(),
+                    title,
+                    detail: signal.signal.clone(),
+                    label,
+                    confidence: Some(signal.confidence_delta.abs().min(1.0)),
+                    source: Some(signal.source_kind.clone()),
+                    artifact: Some("multi_source_evidence.json".to_string()),
+                },
+            );
+        }
+    }
+
+    sort_timeline(&mut timeline);
+    timeline
+}
+
+fn push_unique_timeline_event(
+    timeline: &mut Vec<EvidenceTimelineEvent>,
+    seen: &mut BTreeSet<String>,
+    event: EvidenceTimelineEvent,
+) {
+    if seen.insert(event_key(&event)) {
+        timeline.push(event);
+    }
+}
+
+fn event_key(event: &EvidenceTimelineEvent) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        event.occurred_at.to_rfc3339(),
+        event.phase,
+        event.title,
+        event.detail,
+        event.source.as_deref().unwrap_or(""),
+        event.artifact.as_deref().unwrap_or("")
+    )
+}
+
+fn sort_timeline(timeline: &mut [EvidenceTimelineEvent]) {
+    timeline.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| left.phase.cmp(&right.phase))
+            .then_with(|| left.title.cmp(&right.title))
+    });
 }
 
 fn status_aware_root_cause_why(status: DiagnosisStatus, why: &str) -> String {
@@ -289,7 +572,8 @@ fn status_aware_root_cause_why(status: DiagnosisStatus, why: &str) -> String {
 mod tests {
     use super::*;
     use crate::models::{
-        EvidenceRecord, EvidenceRef, MetricPoint, MetricQuality, Prediction, Severity, TimeWindow,
+        EvidenceRecord, EvidenceRef, MetricPoint, MetricQuality, Prediction, Severity,
+        TelemetrySummary, TimeWindow,
     };
     use std::collections::BTreeMap;
 
@@ -381,5 +665,59 @@ mod tests {
 
         assert_eq!(decision.status, DiagnosisStatus::Uncertain);
         assert_eq!(decision.status_source, "ml");
+    }
+
+    #[test]
+    fn report_evidence_timeline_includes_rule_and_ml_events() {
+        let events = vec![event(FaultLabel::DnsFailure, 0.96)];
+        let ml = ml(
+            DiagnosisStatus::Uncertain,
+            vec![UncertaintyReasonCode::Ambiguous],
+        );
+        let decision = decide_diagnosis(&events, &ml);
+        let report = render_report(
+            "run-test",
+            &TelemetrySummary {
+                overall: crate::models::OverallTelemetry {
+                    duration_s: 1.0,
+                    samples: 1,
+                    latency: Default::default(),
+                    jitter_ms: Default::default(),
+                    packet_loss_rate: 0.0,
+                    retransmission_rate: 0.0,
+                    timeout_events: 0.0,
+                    retry_events: 0.0,
+                    throughput_mbps: crate::models::ThroughputStats {
+                        mean: 100.0,
+                        p95: 100.0,
+                        min: Some(100.0),
+                    },
+                    dns_failure_events: 0.0,
+                    tls_failure_events: 0.0,
+                    quic_blocked_ratio: 0.0,
+                    window_count: 0,
+                },
+                windows: Vec::new(),
+                metric_provenance: Vec::new(),
+            },
+            &events,
+            &ml,
+            &decision,
+            None,
+            &[],
+        );
+
+        assert!(
+            report
+                .evidence_timeline
+                .iter()
+                .any(|event| event.phase == "rule")
+        );
+        assert!(
+            report
+                .evidence_timeline
+                .iter()
+                .any(|event| event.phase == "ml")
+        );
     }
 }

@@ -14,8 +14,9 @@ NetDiag Twin is a Rust desktop application and CLI for SRE/platform teams that n
 6. Evidence Console / Recommendation Report
 
 Typical service reliability workflows include before/after deploy network
-regression checks, platform incident evidence bundles, and lab gates for
-adapter or telemetry-source changes.
+regression checks, platform incident evidence bundles, lab gates for adapter or
+telemetry-source changes, and calibrated unknown/OOD checks before a model is
+trusted in a real environment.
 
 ## Rust Workspace
 
@@ -133,13 +134,20 @@ cargo run -p netdiag-cli -- lab verify-action <before_run_id> \
   --after <after_run_id> \
   --artifacts artifacts \
   --recommendation-id <recommendation_id>
+cargo run -p netdiag-cli -- lab verify-action \
+  --before <before_run_id> \
+  --after <after_run_id> \
+  --artifacts artifacts \
+  --policy examples/policies/reroute-path-b.yaml \
+  --objective examples/policies/verification-objective.yaml
 ```
 
 What-if output is advisory. `lab verify-action` is the closed-loop check that
 compares observed before/after telemetry. By default it still accepts a clear
 5% improvement with no quality degradation; Lab scenarios can now define a
 `verification.objective` and `verification.fail_if` policy when a change has a
-specific latency/loss/throughput target.
+specific latency/loss/throughput target. When a policy is provided, the command
+also reports predicted-vs-observed percentage deltas and prediction error.
 
 Export a saved report:
 
@@ -186,13 +194,30 @@ Copy the manifest/model hashes into the scenario acceptance block when the lab
 gate must be pinned to a specific model bundle. Known-fault scenarios should set
 `expected_label` or `acceptance.expected_root_cause`; OOD-only scenarios can
 omit both when `allowed_diagnosis_statuses` explicitly contains only
-`out_of_distribution` or `uncertain`.
+`out_of_distribution` or `uncertain`. `lab calibrate` summarizes per-label
+accuracy, OOD false positives/false negatives, rule/ML disagreement hotspots,
+feature-distance distributions, and proposed uncertainty/rule thresholds. It
+only writes `model_manifest.json` when accepted lab runs cover all known labels
+and at least one explicit OOD run; low-coverage calibration is reported but not
+applied.
+
+Run the bundled unknown/OOD benchmark pack when tuning abstention behavior:
+
+```bash
+for scenario in examples/scenarios/ood-*.yaml; do
+  cargo run -p netdiag-cli -- lab preflight "$scenario"
+done
+```
 
 Validate topology and policy YAML before giving it to a lab run:
 
 ```bash
 cargo run -p netdiag-cli -- topology validate examples/topologies/ring.yaml
 cargo run -p netdiag-cli -- policy validate examples/policies/reroute-path-b.yaml --topology examples/topologies/ring.yaml
+cargo run -p netdiag-cli -- topology calibrate \
+  --topology examples/topologies/ring.yaml \
+  --runs artifacts/lab-runs \
+  --output target/calibrated-ring.yaml
 ```
 
 Register and split supervised datasets with deterministic hashes:
@@ -239,7 +264,9 @@ Runs are written to `artifacts/runs/<run_id>/`:
 - `telemetry_windows.json`
 - `diagnosis_events.json`
 - `ml_result.json`
+- `evidence_timeline` in `report.json`, ordering telemetry, rule, ML, and corroborating evidence into a human-readable incident sequence.
 - `whatif_*.json`
+- `action_verification_<run_id>.json`
 - `recommendations.json`
 - `hil_feedback.json` after human review
 - `report.json`

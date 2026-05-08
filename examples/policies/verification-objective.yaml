@@ -1,0 +1,8 @@
+verification:
+  objective:
+    latency_p95_delta_pct: "<= -5"
+    throughput_delta_pct: ">= 0"
+    packet_loss_delta_pct: "<= 0"
+  fail_if:
+    latency_p95_delta_pct: "> 20"
+    throughput_delta_pct: "< -10"

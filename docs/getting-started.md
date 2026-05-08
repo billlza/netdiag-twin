@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.4.1 platform contract for SRE and platform
+This guide describes the stable v0.4.2 platform contract for SRE and platform
 teams: how telemetry becomes canonical `TraceRecord` rows, how live adapters
 map into the same pipeline, how ML abstention is reported, and where diagnosis,
 what-if, post-action verification, recommendation, and human-review artifacts
@@ -165,7 +165,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.4.1 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.4.2 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -186,7 +186,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.4.1 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.4.2 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -335,10 +335,27 @@ so the scenario does not pretend an unknown failure is one of the six known
 labels.
 
 Run `lab calibrate` after collecting accepted lab runs from representative
-equipment. It updates `artifacts/model/model_manifest.json` with thresholds
-derived from accepted known/OOD runs, preserving feature bounds already stored in
-the manifest. Use `--dry-run` to inspect the proposed thresholds without writing
-the manifest.
+equipment. It derives thresholds from accepted known/OOD runs and writes
+`artifacts/model/model_manifest.json` only when the corpus covers every known
+label plus at least one explicit OOD run. Low-coverage calibration still returns
+a report, but `applied` stays `false` so provisional thresholds do not masquerade
+as lab-grade. The report includes per-label accuracy, known/uncertain/OOD status
+rates, OOD false-positive and false-negative rates, rule/ML disagreement
+hotspots, feature-distance percentiles, and proposed rule confidence thresholds.
+It rebuilds feature bounds from accepted known runs while preserving manifest
+bounds for features not present in the current lab corpus. Use `--dry-run` to
+inspect the proposed thresholds without writing the manifest.
+
+The repository includes a small unknown/OOD benchmark pack. These scenarios are
+label-free on purpose: they should drive `uncertain` or `out_of_distribution`
+status and recommendation text that asks for more evidence instead of forcing
+the sample into one of the six known `FaultLabel` values.
+
+```bash
+for scenario in examples/scenarios/ood-*.yaml; do
+  cargo run -p netdiag-cli -- lab preflight "$scenario"
+done
+```
 
 Each lab run writes:
 
@@ -363,10 +380,22 @@ Validate topology and policy files before adding them to a scenario:
 cargo run -p netdiag-cli -- topology validate examples/topologies/ring.yaml
 cargo run -p netdiag-cli -- policy validate examples/policies/reroute-path-b.yaml \
   --topology examples/topologies/ring.yaml
+cargo run -p netdiag-cli -- topology calibrate \
+  --topology examples/topologies/ring.yaml \
+  --runs artifacts/lab-runs \
+  --output target/calibrated-ring.yaml
 cargo run -p netdiag-cli -- whatif-policy <run_id> \
   --topology examples/topologies/ring.yaml \
   --policy examples/policies/reroute-path-b.yaml
 ```
+
+`topology calibrate` scans historical lab run summaries and writes a calibrated
+topology with observed latency, loss, capacity, path bottleneck metadata, and a
+redundancy score. When source telemetry has no per-link attribution, NetDiag
+distributes observed path metrics only across the current shortest
+client-to-server path and records that limitation as a warning. Treat the output
+as lab-derived input for future what-if runs, not as a substitute for fresh
+before/after verification.
 
 ## Closed-Loop Verification
 
@@ -379,6 +408,12 @@ cargo run -p netdiag-cli -- lab verify-action <before_run_id> \
   --after <after_run_id> \
   --artifacts artifacts \
   --recommendation-id <recommendation_id>
+cargo run -p netdiag-cli -- lab verify-action \
+  --before <before_run_id> \
+  --after <after_run_id> \
+  --artifacts artifacts \
+  --policy examples/policies/reroute-path-b.yaml \
+  --objective examples/policies/verification-objective.yaml
 ```
 
 The output schema is `netdiag-action-verification/v1`. It records predicted
@@ -401,7 +436,17 @@ verification:
 
 All objective conditions must pass. Any matching `fail_if` condition makes the
 change `not_verified`; missing objective metrics make the result
-`inconclusive`.
+`inconclusive`. When a policy is supplied, the verification artifact also
+records predicted percentage deltas, observed percentage deltas, and prediction
+error by metric so the digital twin can be calibrated over time.
+
+## Evidence Timeline
+
+Every report now carries an `evidence_timeline` array. The timeline orders major
+signals inside a run: throughput drops, latency/loss/retransmission movement,
+rule firing, ML uncertainty/OOD decisions, and corroborating source support.
+Use it when handing an incident to another SRE or when reviewing why a lab gate
+accepted, abstained, or rejected a run.
 
 ## Dataset Registry
 

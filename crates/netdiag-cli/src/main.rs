@@ -14,9 +14,9 @@ use netdiag_core::dataset::{
 use netdiag_core::evidence_bundle::export_evidence_bundle;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
-    LabPreflightMode, LabPreflightOptions, LabRunOptions, calibrate_lab_uncertainty,
-    preflight_lab_scenario, run_lab_batch, run_lab_scenario, summarize_lab_runs, validate_lab_run,
-    verify_action,
+    ActionVerificationOptions, LabPreflightMode, LabPreflightOptions, LabRunOptions,
+    calibrate_lab_uncertainty, preflight_lab_scenario, run_lab_batch, run_lab_scenario,
+    summarize_lab_runs, validate_lab_run, verify_action_with_options,
 };
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
@@ -34,9 +34,9 @@ use netdiag_core::storage::{
     write_connector_health,
 };
 use netdiag_core::twin::{
-    TopologyFormat, import_policy_action, import_topology, run_simulated_whatif,
-    run_simulated_whatif_with_policy, validate_policy_action_for_topology,
-    validate_policy_action_shape, validate_topology_model,
+    TopologyFormat, calibrate_topology_from_runs, export_topology, import_policy_action,
+    import_topology, run_simulated_whatif, run_simulated_whatif_with_policy,
+    validate_policy_action_for_topology, validate_policy_action_shape, validate_topology_model,
 };
 use netdiag_core::{Result as CoreResult, diagnose_file};
 use std::path::PathBuf;
@@ -261,13 +261,19 @@ enum LabCommand {
         dry_run: bool,
     },
     VerifyAction {
-        before_run_id: String,
+        before_run_id: Option<String>,
+        #[arg(long)]
+        before: Option<String>,
         #[arg(long)]
         after: String,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
         #[arg(long)]
         recommendation_id: Option<String>,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        #[arg(long)]
+        objective: Option<PathBuf>,
     },
 }
 
@@ -336,7 +342,17 @@ enum DatasetCommand {
 
 #[derive(Debug, Subcommand)]
 enum TopologyCommand {
-    Validate { topology: PathBuf },
+    Validate {
+        topology: PathBuf,
+    },
+    Calibrate {
+        #[arg(long)]
+        topology: PathBuf,
+        #[arg(long)]
+        runs: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -423,6 +439,25 @@ fn run(args: Args) -> anyhow::Result<()> {
                         "links": model.links.len(),
                     }))?
                 );
+            }
+            TopologyCommand::Calibrate {
+                topology,
+                runs,
+                output,
+            } => {
+                let model = read_topology(&topology)?;
+                let report = calibrate_topology_from_runs(&model, &runs).with_context(|| {
+                    format!(
+                        "topology calibration failed for {} using {}",
+                        topology.display(),
+                        runs.display()
+                    )
+                })?;
+                let format = format_for_path(&output);
+                let encoded = export_topology(&report.calibrated_topology, format)?;
+                write_text_atomic(&output, &encoded)
+                    .with_context(|| format!("failed to write {}", output.display()))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
         Command::Policy { command } => match command {
@@ -517,15 +552,32 @@ fn run(args: Args) -> anyhow::Result<()> {
             }
             LabCommand::VerifyAction {
                 before_run_id,
+                before,
                 after,
                 artifacts,
                 recommendation_id,
+                policy,
+                objective,
             } => {
-                let verification = verify_action(
+                if before.is_some() && before_run_id.is_some() {
+                    anyhow::bail!(
+                        "lab verify-action accepts either --before or a positional before run id, not both"
+                    );
+                }
+                let before_run_id = before.or(before_run_id).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "lab verify-action requires --before or a positional before run id"
+                    )
+                })?;
+                let verification = verify_action_with_options(
                     &artifacts,
                     &before_run_id,
                     &after,
-                    recommendation_id.as_deref(),
+                    ActionVerificationOptions {
+                        recommendation_id,
+                        policy_path: policy,
+                        objective_path: objective,
+                    },
                 )
                 .with_context(|| {
                     format!("lab action verification failed for {before_run_id} -> {after}")
@@ -975,6 +1027,25 @@ fn format_for_path(path: &std::path::Path) -> TopologyFormat {
     }
 }
 
+fn write_text_atomic(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension(format!(
+        "{}tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|ext| format!("{ext}."))
+            .unwrap_or_default()
+    ));
+    std::fs::write(&tmp, contents)
+        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to move {} to {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
 fn load_mapping(
     path: Option<PathBuf>,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
@@ -1215,6 +1286,35 @@ mod tests {
                 .iter()
                 .any(|entry| entry.key == "connector_health")
         );
+    }
+
+    #[test]
+    fn topology_calibrate_command_writes_calibrated_topology() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        diagnose_file(
+            sample("normal"),
+            temp.path(),
+            Some(("line", "reroute_path_b")),
+        )
+        .expect("diagnose");
+        let output = temp.path().join("calibrated-ring.yaml");
+        let args = Args::parse_from([
+            "netdiag",
+            "topology",
+            "calibrate",
+            "--topology",
+            path_str(&repo_file("examples/topologies/ring.yaml")),
+            "--runs",
+            path_str(temp.path()),
+            "--output",
+            path_str(&output),
+        ]);
+
+        run(args).expect("topology calibrate");
+
+        assert!(output.exists());
+        let calibrated = read_topology(&output).expect("read calibrated topology");
+        assert!(calibrated.metadata.contains_key("calibrated_run_count"));
     }
 
     #[test]

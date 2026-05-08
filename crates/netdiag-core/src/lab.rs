@@ -12,14 +12,17 @@ use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model, 
 use crate::models::{
     ActionVerification, ActionVerificationVerdict, ConnectorHealthSnapshot, ConnectorHealthStatus,
     CorroborationDecision, CorroborationSignal, DiagnosisEvent, DiagnosisStatus, EvidenceRecord,
-    EvidenceRef, FaultLabel, HilReviewSummary, HilState, IngestResult, MetricQuality, MlResult,
-    ModelManifest, ModelUncertaintyThresholds, MultiSourceEvidenceSummary, Recommendation,
-    RunComparison, Severity, SourceEvidenceSummary, TimeWindow, TwinPolicyImpact,
+    EvidenceRef, FaultLabel, FeatureBounds, HilReviewSummary, HilState, IngestResult,
+    MetricQuality, MlResult, ModelManifest, ModelUncertaintyThresholds, MultiSourceEvidenceSummary,
+    Recommendation, RunComparison, RunManifest, Severity, SourceEvidenceSummary, TimeWindow,
+    TwinPolicyImpact,
 };
 use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_existing_model_dir};
 use crate::recommendation::recommend_actions;
 use crate::report::Report;
-use crate::report::{compare_rule_ml, decide_diagnosis, render_report};
+use crate::report::{
+    compare_rule_ml, decide_diagnosis, refresh_report_evidence_timeline, render_report,
+};
 use crate::storage::{
     RunLocation, compare_runs, connector_health_from_ingest, read_connector_health, read_json,
     resolve_stored_path, run_artifacts, run_dir, save_json, write_connector_health,
@@ -149,6 +152,13 @@ pub struct LabVerification {
     pub objective: BTreeMap<String, String>,
     #[serde(default)]
     pub fail_if: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ActionVerificationOptions {
+    pub recommendation_id: Option<String>,
+    pub policy_path: Option<PathBuf>,
+    pub objective_path: Option<PathBuf>,
 }
 
 impl LabVerification {
@@ -430,16 +440,64 @@ pub struct LabCalibrationReport {
     pub generated_at: DateTime<Utc>,
     pub artifact_root: String,
     pub model_manifest_path: String,
+    pub evaluated_runs: usize,
     pub known_runs: usize,
     pub uncertain_runs: usize,
     pub out_of_distribution_runs: usize,
     pub skipped_runs: usize,
+    #[serde(default)]
+    pub per_label: BTreeMap<String, LabCalibrationLabelStats>,
+    pub ood: LabCalibrationOodStats,
+    #[serde(default)]
+    pub rule_ml_disagreement_hotspots: Vec<LabCalibrationHotspot>,
+    pub feature_distance_distribution: LabCalibrationDistribution,
+    #[serde(default)]
+    pub suggested_rule_thresholds: BTreeMap<String, f64>,
     pub applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_thresholds: Option<ModelUncertaintyThresholds>,
     pub calibrated_thresholds: ModelUncertaintyThresholds,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabCalibrationLabelStats {
+    pub runs: usize,
+    pub rule_correct: usize,
+    pub ml_correct: usize,
+    pub rule_accuracy: f64,
+    pub ml_accuracy: f64,
+    pub known_rate: f64,
+    pub uncertain_rate: f64,
+    pub out_of_distribution_rate: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabCalibrationOodStats {
+    pub expected_ood_runs: usize,
+    pub expected_known_runs: usize,
+    pub false_positive_runs: usize,
+    pub false_negative_runs: usize,
+    pub false_positive_rate: f64,
+    pub false_negative_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabCalibrationHotspot {
+    pub scenario_id: String,
+    pub scenario_name: String,
+    pub disagreements: usize,
+    pub runs: usize,
+    pub rate: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabCalibrationDistribution {
+    pub count: usize,
+    pub p50: f64,
+    pub p95: f64,
+    pub max: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -493,9 +551,9 @@ pub fn validate_lab_scenario(scenario: &LabScenario) -> Result<()> {
         .iter()
         .filter(|source| source.role == LabDataSourceRole::Primary)
         .count();
-    if primary_count > 1 {
+    if primary_count != 1 {
         return Err(NetdiagError::InvalidTrace(format!(
-            "lab scenario {} has more than one primary data source",
+            "lab scenario {} must declare exactly one primary data source",
             scenario.id
         )));
     }
@@ -1092,6 +1150,7 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         &corroboration_signals,
     );
     pipeline.report.multi_source_evidence = Some(multi_source_evidence.clone());
+    refresh_report_evidence_timeline(&mut pipeline.report);
     save_json(
         run_dir(&lab_run_dir, &pipeline.run_id).join("diagnosis_events.json"),
         &pipeline.diagnosis_events,
@@ -1361,18 +1420,29 @@ pub fn calibrate_lab_uncertainty(
     let mut uncertain_runs = 0usize;
     let mut out_of_distribution_runs = 0usize;
     let mut skipped_runs = 0usize;
+    let mut evaluated_runs = 0usize;
+    let mut per_label = BTreeMap::<String, LabCalibrationLabelAccumulator>::new();
+    let mut expected_ood_runs = 0usize;
+    let mut expected_known_runs = 0usize;
+    let mut ood_false_positive_runs = 0usize;
+    let mut ood_false_negative_runs = 0usize;
+    let mut scenario_hotspots = BTreeMap::<String, LabCalibrationHotspotAccumulator>::new();
+    let mut feature_distances = Vec::new();
+    let mut rule_threshold_samples = BTreeMap::<String, Vec<f64>>::new();
+    let mut known_feature_values = BTreeMap::<String, Vec<f64>>::new();
 
     for entry in &index.runs {
         let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path);
         let acceptance = match read_json(&acceptance_path).and_then(|value| {
             serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
         }) {
-            Ok(acceptance) if acceptance.passed => acceptance,
-            Ok(_) | Err(_) => {
+            Ok(acceptance) => acceptance,
+            Err(_) => {
                 skipped_runs += 1;
                 continue;
             }
         };
+        evaluated_runs += 1;
         let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
         let ml_result_path = run_dir(&lab_run_dir, &entry.run_id).join("ml_result.json");
         let ml: MlResult = match read_json(&ml_result_path)
@@ -1384,6 +1454,72 @@ pub fn calibrate_lab_uncertainty(
                 continue;
             }
         };
+        if ml.uncertainty.feature_distance.is_finite() {
+            feature_distances.push(ml.uncertainty.feature_distance);
+        }
+
+        let comparison_path = resolve_stored_path(artifact_root, &entry.comparison_path);
+        if let Ok(comparison) = read_json(&comparison_path)
+            .and_then(|value| serde_json::from_value::<LabRunComparison>(value).map_err(Into::into))
+        {
+            let hotspot = scenario_hotspots
+                .entry(entry.scenario_id.clone())
+                .or_insert_with(|| LabCalibrationHotspotAccumulator {
+                    scenario_name: entry.scenario_name.clone(),
+                    ..Default::default()
+                });
+            hotspot.runs += 1;
+            if !comparison.rule_ml_agreement {
+                hotspot.disagreements += 1;
+            }
+        }
+
+        if let Some(expected_label) = acceptance.expected_label {
+            expected_known_runs += 1;
+            let label_key = expected_label.as_str().to_string();
+            let stats = per_label.entry(label_key.clone()).or_default();
+            stats.runs += 1;
+            match acceptance.actual_diagnosis_status {
+                DiagnosisStatus::Known => stats.known += 1,
+                DiagnosisStatus::Uncertain => stats.uncertain += 1,
+                DiagnosisStatus::OutOfDistribution => {
+                    stats.out_of_distribution += 1;
+                    ood_false_positive_runs += 1;
+                }
+            }
+            if acceptance
+                .actual_rule_labels
+                .iter()
+                .any(|label| label == expected_label.as_str())
+            {
+                stats.rule_correct += 1;
+            }
+            if acceptance.actual_ml_top == expected_label.as_str() {
+                stats.ml_correct += 1;
+            }
+            let events_path = run_dir(&lab_run_dir, &entry.run_id).join("diagnosis_events.json");
+            if let Ok(events) = read_json(&events_path).and_then(|value| {
+                serde_json::from_value::<Vec<DiagnosisEvent>>(value).map_err(Into::into)
+            }) {
+                rule_threshold_samples.entry(label_key).or_default().extend(
+                    events
+                        .iter()
+                        .filter(|event| event.evidence.symptom == expected_label)
+                        .map(|event| event.evidence.confidence)
+                        .filter(|value| value.is_finite()),
+                );
+            }
+        } else {
+            expected_ood_runs += 1;
+            if acceptance.actual_diagnosis_status == DiagnosisStatus::Known {
+                ood_false_negative_runs += 1;
+            }
+        }
+
+        if !acceptance.passed {
+            skipped_runs += 1;
+            continue;
+        }
         match acceptance.actual_diagnosis_status {
             DiagnosisStatus::Known => {
                 known_runs += 1;
@@ -1391,6 +1527,14 @@ pub fn calibrate_lab_uncertainty(
                 known_margin.push(ml.uncertainty.probability_margin);
                 known_entropy.push(ml.uncertainty.entropy);
                 known_distance.push(ml.uncertainty.feature_distance);
+                for (name, value) in &ml.features {
+                    if value.is_finite() {
+                        known_feature_values
+                            .entry(name.clone())
+                            .or_default()
+                            .push(*value);
+                    }
+                }
             }
             DiagnosisStatus::Uncertain => {
                 uncertain_runs += 1;
@@ -1414,8 +1558,27 @@ pub fn calibrate_lab_uncertainty(
                 .to_string(),
         );
     }
+    if known_runs < FaultLabel::ALL.len() {
+        warnings.push(format!(
+            "only {known_runs} accepted known-status runs; calibrate with at least one accepted run per known label before treating thresholds as lab-grade"
+        ));
+    }
+    let covered_labels = FaultLabel::ALL
+        .iter()
+        .filter(|label| per_label.contains_key(label.as_str()))
+        .count();
+    let has_lab_grade_coverage = covered_labels == FaultLabel::ALL.len()
+        && out_of_distribution_runs > 0
+        && expected_ood_runs > 0;
+    if !has_lab_grade_coverage {
+        warnings.push(format!(
+            "calibration coverage is not lab-grade ({covered_labels}/{} labels, {out_of_distribution_runs} accepted OOD runs); thresholds are reported but model_manifest.json was not updated",
+            FaultLabel::ALL.len()
+        ));
+    }
 
     let previous = previous_thresholds.clone().unwrap_or_default();
+    let calibrated_feature_bounds = calibrated_feature_bounds(&known_feature_values, &previous);
     let known_distance_p95 = quantile(&known_distance, 0.95);
     let max_feature_distance = (if let Some(min_ood_distance) = ood_distance
         .iter()
@@ -1434,9 +1597,40 @@ pub fn calibrate_lab_uncertainty(
         min_probability_margin: round4(quantile(&known_margin, 0.05).clamp(0.0, 0.80)),
         max_entropy: round4(quantile(&known_entropy, 0.95).clamp(0.05, 1.0)),
         max_feature_distance: round4(max_feature_distance),
-        feature_bounds: previous.feature_bounds,
+        feature_bounds: calibrated_feature_bounds,
     };
-    if !dry_run {
+    let per_label = per_label
+        .into_iter()
+        .map(|(label, stats)| (label, stats.into_stats()))
+        .collect::<BTreeMap<_, _>>();
+    let rule_ml_disagreement_hotspots = scenario_hotspots
+        .into_iter()
+        .filter_map(|(scenario_id, stats)| {
+            (stats.disagreements > 0).then(|| stats.into_hotspot(scenario_id))
+        })
+        .collect::<Vec<_>>();
+    let suggested_rule_thresholds = rule_threshold_samples
+        .into_iter()
+        .filter_map(|(label, samples)| {
+            (!samples.is_empty())
+                .then(|| (label, round4(quantile(&samples, 0.05).clamp(0.50, 0.95))))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let feature_distance_distribution = calibration_distribution(&feature_distances);
+    let ood = LabCalibrationOodStats {
+        expected_ood_runs,
+        expected_known_runs,
+        false_positive_runs: ood_false_positive_runs,
+        false_negative_runs: ood_false_negative_runs,
+        false_positive_rate: round4(
+            ood_false_positive_runs as f64 / expected_known_runs.max(1) as f64,
+        ),
+        false_negative_rate: round4(
+            ood_false_negative_runs as f64 / expected_ood_runs.max(1) as f64,
+        ),
+    };
+    let applied = !dry_run && has_lab_grade_coverage;
+    if applied {
         manifest.uncertainty_thresholds = Some(calibrated_thresholds.clone());
         save_json(&model_manifest_path, &manifest)?;
     }
@@ -1446,11 +1640,17 @@ pub fn calibrate_lab_uncertainty(
         generated_at: Utc::now(),
         artifact_root: artifact_root.display().to_string(),
         model_manifest_path: model_manifest_path.display().to_string(),
+        evaluated_runs,
         known_runs,
         uncertain_runs,
         out_of_distribution_runs,
         skipped_runs,
-        applied: !dry_run,
+        per_label,
+        ood,
+        rule_ml_disagreement_hotspots,
+        feature_distance_distribution,
+        suggested_rule_thresholds,
+        applied,
         previous_thresholds,
         calibrated_thresholds,
         warnings,
@@ -1465,6 +1665,97 @@ struct LabSummaryAccumulator {
     ml_correct: usize,
     quality_degraded: usize,
     rule_ml_disagreement: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LabCalibrationLabelAccumulator {
+    runs: usize,
+    rule_correct: usize,
+    ml_correct: usize,
+    known: usize,
+    uncertain: usize,
+    out_of_distribution: usize,
+}
+
+impl LabCalibrationLabelAccumulator {
+    fn into_stats(self) -> LabCalibrationLabelStats {
+        let denominator = self.runs.max(1) as f64;
+        LabCalibrationLabelStats {
+            runs: self.runs,
+            rule_correct: self.rule_correct,
+            ml_correct: self.ml_correct,
+            rule_accuracy: round4(self.rule_correct as f64 / denominator),
+            ml_accuracy: round4(self.ml_correct as f64 / denominator),
+            known_rate: round4(self.known as f64 / denominator),
+            uncertain_rate: round4(self.uncertain as f64 / denominator),
+            out_of_distribution_rate: round4(self.out_of_distribution as f64 / denominator),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LabCalibrationHotspotAccumulator {
+    scenario_name: String,
+    runs: usize,
+    disagreements: usize,
+}
+
+impl LabCalibrationHotspotAccumulator {
+    fn into_hotspot(self, scenario_id: String) -> LabCalibrationHotspot {
+        let denominator = self.runs.max(1) as f64;
+        LabCalibrationHotspot {
+            scenario_id,
+            scenario_name: self.scenario_name,
+            disagreements: self.disagreements,
+            runs: self.runs,
+            rate: round4(self.disagreements as f64 / denominator),
+        }
+    }
+}
+
+fn calibration_distribution(values: &[f64]) -> LabCalibrationDistribution {
+    let finite = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    LabCalibrationDistribution {
+        count: finite.len(),
+        p50: round4(quantile(&finite, 0.50)),
+        p95: round4(quantile(&finite, 0.95)),
+        max: round4(finite.into_iter().fold(0.0, f64::max)),
+    }
+}
+
+fn calibrated_feature_bounds(
+    values: &BTreeMap<String, Vec<f64>>,
+    previous: &ModelUncertaintyThresholds,
+) -> BTreeMap<String, FeatureBounds> {
+    let mut bounds = previous.feature_bounds.clone();
+    for (name, samples) in values {
+        let finite = samples
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .collect::<Vec<_>>();
+        if finite.len() < 2 {
+            continue;
+        }
+        let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let span = (max - min)
+            .abs()
+            .max(max.abs().max(min.abs()) * 0.05)
+            .max(1e-6);
+        bounds.insert(
+            name.clone(),
+            FeatureBounds {
+                min: round4(min - span * 0.10),
+                max: round4(max + span * 0.10),
+            },
+        );
+    }
+    bounds
 }
 
 impl LabSummaryAccumulator {
@@ -1571,32 +1862,175 @@ pub fn verify_action(
     after_run_id: &str,
     recommendation_id: Option<&str>,
 ) -> Result<ActionVerification> {
+    verify_action_with_options(
+        artifact_root,
+        before_run_id,
+        after_run_id,
+        ActionVerificationOptions {
+            recommendation_id: recommendation_id.map(str::to_string),
+            policy_path: None,
+            objective_path: None,
+        },
+    )
+}
+
+pub fn verify_action_with_options(
+    artifact_root: impl AsRef<Path>,
+    before_run_id: &str,
+    after_run_id: &str,
+    options: ActionVerificationOptions,
+) -> Result<ActionVerification> {
     let artifact_root = artifact_root.as_ref();
     let comparison = compare_runs(artifact_root, before_run_id, after_run_id)?;
     let before_location = crate::storage::resolve_run_location(artifact_root, before_run_id)?;
     let before_report: Report =
         serde_json::from_value(read_json(before_location.run_dir.join("report.json"))?)?;
-    let predicted_what_if_effect = predicted_action_effect(&before_report, recommendation_id)?;
-    let verification_policy = verification_policy_for_run(artifact_root, before_run_id)?;
-    let (verdict, reasons) = action_verification_verdict(&comparison, verification_policy.as_ref());
+    let predicted_what_if_effect = if let Some(policy_path) = options.policy_path.as_deref() {
+        Some(read_policy_from_path(policy_path)?.impact)
+    } else {
+        predicted_action_effect(&before_report, options.recommendation_id.as_deref())?
+    };
+    let verification_policy = if let Some(objective_path) = options.objective_path.as_deref() {
+        Some(read_verification_objective(objective_path)?)
+    } else {
+        verification_policy_for_run(artifact_root, before_run_id)?
+    };
+    let predicted_deltas_pct = predicted_delta_pct_map(predicted_what_if_effect.as_ref());
+    let observed_deltas_pct = observed_delta_pct_map(&comparison);
+    let prediction_error_pct =
+        prediction_error_pct_map(&predicted_deltas_pct, &observed_deltas_pct);
+    let (verdict, reasons) = action_verification_verdict(
+        &comparison,
+        verification_policy.as_ref(),
+        &predicted_deltas_pct,
+        &observed_deltas_pct,
+    );
     let verification = ActionVerification {
         schema: "netdiag-action-verification/v1".to_string(),
         generated_at: Utc::now(),
         before_run_id: before_run_id.to_string(),
         after_run_id: after_run_id.to_string(),
-        recommendation_id: recommendation_id.map(str::to_string),
+        recommendation_id: options.recommendation_id,
         predicted_what_if_effect,
+        predicted_deltas_pct,
+        observed_deltas_pct,
+        prediction_error_pct,
+        objective: verification_policy
+            .as_ref()
+            .map(|policy| policy.objective.clone())
+            .unwrap_or_default(),
+        fail_if: verification_policy
+            .as_ref()
+            .map(|policy| policy.fail_if.clone())
+            .unwrap_or_default(),
         observed_comparison: comparison,
         verdict,
         reasons,
     };
-    save_json(
-        before_location
-            .run_dir
-            .join(format!("action_verification_{after_run_id}.json")),
-        &verification,
-    )?;
+    record_action_verification_artifact(&before_location.run_dir, after_run_id, &verification)?;
     Ok(verification)
+}
+
+fn record_action_verification_artifact(
+    run_dir: &Path,
+    after_run_id: &str,
+    verification: &ActionVerification,
+) -> Result<()> {
+    let file_name = format!("action_verification_{after_run_id}.json");
+    save_json(run_dir.join(&file_name), verification)?;
+    let manifest_path = run_dir.join("manifest.json");
+    if manifest_path.exists() {
+        let mut manifest: RunManifest =
+            serde_json::from_value(read_json(&manifest_path)?).map_err(NetdiagError::from)?;
+        manifest
+            .artifact_paths
+            .insert(format!("action_verification_{after_run_id}"), file_name);
+        save_json(&manifest_path, &manifest)?;
+    }
+    Ok(())
+}
+
+fn read_policy_from_path(path: &Path) -> Result<crate::models::TwinPolicyAction> {
+    let raw = fs::read_to_string(path).with_path(path)?;
+    import_policy_action(&raw, format_for_path(path))
+}
+
+fn read_verification_objective(path: &Path) -> Result<LabVerification> {
+    let raw = fs::read_to_string(path).with_path(path)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .map_err(|err| NetdiagError::InvalidTrace(format!("invalid objective YAML: {err}")))?;
+    if let Ok(policy) = serde_yaml::from_value::<LabVerification>(value.clone())
+        && !policy.is_empty()
+    {
+        return Ok(policy);
+    }
+    if let Some(verification) = value.get("verification") {
+        let policy: LabVerification =
+            serde_yaml::from_value(verification.clone()).map_err(|err| {
+                NetdiagError::InvalidTrace(format!("invalid verification YAML: {err}"))
+            })?;
+        if !policy.is_empty() {
+            return Ok(policy);
+        }
+    }
+    Err(NetdiagError::InvalidTrace(format!(
+        "verification objective {} must contain objective and/or fail_if",
+        path.display()
+    )))
+}
+
+fn predicted_delta_pct_map(effect: Option<&TwinPolicyImpact>) -> BTreeMap<String, f64> {
+    let Some(effect) = effect else {
+        return BTreeMap::new();
+    };
+    BTreeMap::from([
+        (
+            "latency_p95_delta_pct".to_string(),
+            normalize_impact_to_pct(effect.latency_delta_pct),
+        ),
+        (
+            "packet_loss_delta_pct".to_string(),
+            normalize_impact_to_pct(effect.loss_delta_pct),
+        ),
+        (
+            "throughput_delta_pct".to_string(),
+            normalize_impact_to_pct(effect.throughput_delta_pct),
+        ),
+    ])
+}
+
+fn normalize_impact_to_pct(value: f64) -> f64 {
+    let pct = if value.abs() <= 1.0 {
+        value * 100.0
+    } else {
+        value
+    };
+    round4(pct)
+}
+
+fn observed_delta_pct_map(comparison: &RunComparison) -> BTreeMap<String, f64> {
+    [
+        ("latency_p95_delta_pct", comparison.latency_p95_delta_pct),
+        ("packet_loss_delta_pct", comparison.loss_delta_pct),
+        ("throughput_delta_pct", comparison.throughput_delta_pct),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| (key.to_string(), round4(value))))
+    .collect()
+}
+
+fn prediction_error_pct_map(
+    predicted: &BTreeMap<String, f64>,
+    observed: &BTreeMap<String, f64>,
+) -> BTreeMap<String, f64> {
+    predicted
+        .iter()
+        .filter_map(|(key, predicted)| {
+            observed
+                .get(key)
+                .map(|observed| (key.clone(), round4(observed - predicted)))
+        })
+        .collect()
 }
 
 fn predicted_action_effect(
@@ -1722,6 +2156,8 @@ fn condition_matches(value: f64, condition: MetricCondition) -> bool {
 fn action_verification_verdict(
     comparison: &RunComparison,
     policy: Option<&LabVerification>,
+    predicted_deltas_pct: &BTreeMap<String, f64>,
+    observed_deltas_pct: &BTreeMap<String, f64>,
 ) -> (ActionVerificationVerdict, Vec<String>) {
     let mut reasons = Vec::new();
     if comparison.right.quality_status > comparison.left.quality_status {
@@ -1753,7 +2189,10 @@ fn action_verification_verdict(
                 Err(err) => return (ActionVerificationVerdict::Inconclusive, vec![err]),
             };
             let Some(value) = metric_delta(comparison, metric) else {
-                continue;
+                return (
+                    ActionVerificationVerdict::Inconclusive,
+                    vec![format!("verification fail_if metric {metric} is missing")],
+                );
             };
             if condition_matches(value, condition) {
                 return (
@@ -1804,6 +2243,47 @@ fn action_verification_verdict(
         return (ActionVerificationVerdict::Inconclusive, reasons);
     }
 
+    let mut tradeoff_failures = Vec::new();
+    if comparison
+        .latency_p95_delta_pct
+        .is_some_and(|delta| delta > 5.0)
+    {
+        tradeoff_failures.push(format!(
+            "latency_p95_delta_pct regressed by {:.2}%",
+            comparison.latency_p95_delta_pct.unwrap_or_default()
+        ));
+    }
+    if comparison.loss_delta_pct.is_some_and(|delta| delta > 5.0) {
+        tradeoff_failures.push(format!(
+            "packet_loss_delta_pct regressed by {:.2}%",
+            comparison.loss_delta_pct.unwrap_or_default()
+        ));
+    }
+    if comparison
+        .throughput_delta_pct
+        .is_some_and(|delta| delta < -5.0)
+    {
+        tradeoff_failures.push(format!(
+            "throughput_delta_pct regressed by {:.2}%",
+            comparison.throughput_delta_pct.unwrap_or_default()
+        ));
+    }
+    for (metric, predicted) in predicted_deltas_pct {
+        if predicted_improves_metric(metric, *predicted)
+            && observed_deltas_pct
+                .get(metric)
+                .is_some_and(|observed| observed_degrades_metric(metric, *observed))
+        {
+            tradeoff_failures.push(format!(
+                "{metric} moved opposite the predicted improvement (predicted {predicted:.2}%, observed {:.2}%)",
+                observed_deltas_pct.get(metric).copied().unwrap_or_default()
+            ));
+        }
+    }
+    if !tradeoff_failures.is_empty() {
+        return (ActionVerificationVerdict::NotVerified, tradeoff_failures);
+    }
+
     if comparison
         .latency_p95_delta_pct
         .is_some_and(|delta| delta <= -5.0)
@@ -1823,6 +2303,22 @@ fn action_verification_verdict(
         "observed before/after telemetry did not meet the 5% improvement threshold".to_string(),
     );
     (ActionVerificationVerdict::NotVerified, reasons)
+}
+
+fn predicted_improves_metric(metric: &str, delta: f64) -> bool {
+    match metric {
+        "latency_p95_delta_pct" | "packet_loss_delta_pct" => delta <= -5.0,
+        "throughput_delta_pct" => delta >= 5.0,
+        _ => false,
+    }
+}
+
+fn observed_degrades_metric(metric: &str, delta: f64) -> bool {
+    match metric {
+        "latency_p95_delta_pct" | "packet_loss_delta_pct" => delta > 5.0,
+        "throughput_delta_pct" => delta < -5.0,
+        _ => false,
+    }
 }
 
 fn metric_quality_rank(quality: MetricQuality) -> u8 {
@@ -3183,6 +3679,7 @@ mod tests {
             model_file_hash: Some("file-test-hash".to_string()),
             what_if,
             multi_source_evidence: None,
+            evidence_timeline: Vec::new(),
             recommendations: Vec::new(),
             hil_summary: Default::default(),
         }
@@ -3291,6 +3788,7 @@ mod tests {
         artifact_root: &Path,
         scenario_id: &str,
         run_id: &str,
+        expected_label: Option<FaultLabel>,
         status: DiagnosisStatus,
         ml: MlResult,
     ) {
@@ -3303,7 +3801,7 @@ mod tests {
             schema: "netdiag-lab-acceptance/v1".to_string(),
             scenario_id: scenario_id.to_string(),
             run_id: run_id.to_string(),
-            expected_label: (status == DiagnosisStatus::Known).then_some(FaultLabel::Congestion),
+            expected_label,
             actual_rule_labels: Vec::new(),
             actual_ml_top: FaultLabel::Congestion.as_str().to_string(),
             actual_ml_probability: ml.uncertainty.max_probability,
@@ -3808,7 +4306,8 @@ mod tests {
         let comparison =
             run_comparison(Some(-5.2), Some(0.0), Some(0.0), ConnectorHealthStatus::Ok);
 
-        let (verdict, reasons) = action_verification_verdict(&comparison, None);
+        let (verdict, reasons) =
+            action_verification_verdict(&comparison, None, &BTreeMap::new(), &BTreeMap::new());
 
         assert_eq!(verdict, ActionVerificationVerdict::Verified);
         assert!(
@@ -3828,7 +4327,8 @@ mod tests {
             ConnectorHealthStatus::Degraded,
         );
 
-        let (verdict, reasons) = action_verification_verdict(&comparison, None);
+        let (verdict, reasons) =
+            action_verification_verdict(&comparison, None, &BTreeMap::new(), &BTreeMap::new());
 
         assert_eq!(verdict, ActionVerificationVerdict::Inconclusive);
         assert!(
@@ -3852,7 +4352,12 @@ mod tests {
             fail_if: BTreeMap::new(),
         };
 
-        let (verdict, reasons) = action_verification_verdict(&comparison, Some(&policy));
+        let (verdict, reasons) = action_verification_verdict(
+            &comparison,
+            Some(&policy),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
 
         assert_eq!(verdict, ActionVerificationVerdict::Verified);
         assert!(
@@ -3875,7 +4380,12 @@ mod tests {
             fail_if: BTreeMap::from([("throughput_delta_pct".to_string(), "< -10".to_string())]),
         };
 
-        let (verdict, reasons) = action_verification_verdict(&comparison, Some(&policy));
+        let (verdict, reasons) = action_verification_verdict(
+            &comparison,
+            Some(&policy),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
 
         assert_eq!(verdict, ActionVerificationVerdict::NotVerified);
         assert!(reasons.iter().any(|reason| reason.contains("fail_if")));
@@ -3889,7 +4399,12 @@ mod tests {
             fail_if: BTreeMap::new(),
         };
 
-        let (verdict, reasons) = action_verification_verdict(&comparison, Some(&policy));
+        let (verdict, reasons) = action_verification_verdict(
+            &comparison,
+            Some(&policy),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
 
         assert_eq!(verdict, ActionVerificationVerdict::Inconclusive);
         assert!(
@@ -3900,20 +4415,140 @@ mod tests {
     }
 
     #[test]
+    fn verify_action_default_verdict_rejects_large_tradeoff() {
+        let comparison = run_comparison(
+            Some(-8.0),
+            Some(0.0),
+            Some(-12.0),
+            ConnectorHealthStatus::Ok,
+        );
+
+        let (verdict, reasons) =
+            action_verification_verdict(&comparison, None, &BTreeMap::new(), &BTreeMap::new());
+
+        assert_eq!(verdict, ActionVerificationVerdict::NotVerified);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("throughput_delta_pct regressed")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn verify_action_fail_if_missing_metric_is_inconclusive() {
+        let comparison = run_comparison(Some(-8.0), None, Some(1.0), ConnectorHealthStatus::Ok);
+        let policy = LabVerification {
+            objective: BTreeMap::new(),
+            fail_if: BTreeMap::from([("packet_loss_delta_pct".to_string(), "> 1".to_string())]),
+        };
+
+        let (verdict, reasons) = action_verification_verdict(
+            &comparison,
+            Some(&policy),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(verdict, ActionVerificationVerdict::Inconclusive);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("fail_if metric packet_loss_delta_pct is missing")),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn verify_action_prediction_error_uses_percentage_units() {
+        let effect = TwinPolicyImpact {
+            latency_delta_pct: -0.18,
+            loss_delta_pct: -0.06,
+            throughput_delta_pct: 0.12,
+        };
+        let predicted = predicted_delta_pct_map(Some(&effect));
+        let observed = observed_delta_pct_map(&run_comparison(
+            Some(-14.0),
+            Some(-4.0),
+            Some(10.0),
+            ConnectorHealthStatus::Ok,
+        ));
+        let error = prediction_error_pct_map(&predicted, &observed);
+
+        assert_eq!(predicted["latency_p95_delta_pct"], -18.0);
+        assert_eq!(error["latency_p95_delta_pct"], 4.0);
+        assert_eq!(error["throughput_delta_pct"], -2.0);
+    }
+
+    #[test]
+    fn verify_action_artifact_is_recorded_in_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run_dir = temp.path().join("runs").join("before");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let mut artifact_paths = BTreeMap::new();
+        artifact_paths.insert("report".to_string(), "report.json".to_string());
+        save_json(
+            run_dir.join("manifest.json"),
+            &RunManifest {
+                run_id: "before".to_string(),
+                sample: "sample".to_string(),
+                created_at: Utc::now(),
+                trace_rows: 1,
+                artifact_paths,
+            },
+        )
+        .expect("manifest");
+        let verification = ActionVerification {
+            schema: "netdiag-action-verification/v1".to_string(),
+            generated_at: Utc::now(),
+            before_run_id: "before".to_string(),
+            after_run_id: "after".to_string(),
+            recommendation_id: None,
+            predicted_what_if_effect: None,
+            predicted_deltas_pct: BTreeMap::new(),
+            observed_deltas_pct: BTreeMap::new(),
+            prediction_error_pct: BTreeMap::new(),
+            objective: BTreeMap::new(),
+            fail_if: BTreeMap::new(),
+            observed_comparison: run_comparison(None, None, None, ConnectorHealthStatus::Ok),
+            verdict: ActionVerificationVerdict::Inconclusive,
+            reasons: Vec::new(),
+        };
+
+        record_action_verification_artifact(&run_dir, "after", &verification).expect("record");
+
+        let manifest: RunManifest =
+            serde_json::from_value(read_json(run_dir.join("manifest.json")).expect("read"))
+                .expect("manifest");
+        assert_eq!(
+            manifest
+                .artifact_paths
+                .get("action_verification_after")
+                .map(String::as_str),
+            Some("action_verification_after.json")
+        );
+    }
+
+    #[test]
     fn lab_calibration_updates_model_manifest_thresholds_from_accepted_runs() {
         let temp = tempfile::tempdir().expect("tempdir");
         provision_test_model(temp.path());
-        write_lab_calibration_sample(
-            temp.path(),
-            "known",
-            "known-run",
-            DiagnosisStatus::Known,
-            calibration_ml_result("known-run", DiagnosisStatus::Known, 0.82, 0.18, 0.42, 2.0),
-        );
+        for (idx, label) in FaultLabel::ALL.iter().enumerate() {
+            let run_id = format!("known-run-{idx}");
+            write_lab_calibration_sample(
+                temp.path(),
+                label.as_str(),
+                &run_id,
+                Some(*label),
+                DiagnosisStatus::Known,
+                calibration_ml_result(&run_id, DiagnosisStatus::Known, 0.82, 0.18, 0.42, 2.0),
+            );
+        }
         write_lab_calibration_sample(
             temp.path(),
             "ood",
             "ood-run",
+            None,
             DiagnosisStatus::OutOfDistribution,
             calibration_ml_result(
                 "ood-run",
@@ -3928,8 +4563,12 @@ mod tests {
         let report = calibrate_lab_uncertainty(temp.path(), false).expect("calibration");
 
         assert!(report.applied);
-        assert_eq!(report.known_runs, 1);
+        assert_eq!(report.evaluated_runs, FaultLabel::ALL.len() + 1);
+        assert_eq!(report.known_runs, FaultLabel::ALL.len());
         assert_eq!(report.out_of_distribution_runs, 1);
+        assert_eq!(report.ood.expected_ood_runs, 1);
+        assert!(report.feature_distance_distribution.p95 >= 2.0);
+        assert!(report.per_label.contains_key("congestion"));
         assert!(report.calibrated_thresholds.max_feature_distance > 2.0);
         assert!(report.calibrated_thresholds.max_feature_distance < 10.0);
         let manifest: ModelManifest = serde_json::from_value(

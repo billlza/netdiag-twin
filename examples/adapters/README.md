@@ -30,15 +30,33 @@ python3 scripts/validate_adapter_samples.py
 ```
 
 The CI validator uses `--emit-sample`, so adapter schema checks do not require
-network access, `tc`, an `iperf3` server, or long-running HTTP exporters.
+network access, `tc`, an `iperf3` server, SNMP/gNMI credentials, or long-running
+HTTP exporters.
 
 Templates:
 
 - `http-json-python`: expose a CSV/JSON trace as `GET /trace`.
 - `iperf3-http-json`: convert `iperf3 -J` throughput/loss output.
 - `tc-netem-lab`: emit or apply a planned `tc netem` impairment.
+- `openconfig-gnmi`: convert normalized OpenConfig interface notifications.
+- `snmp-if-mib`: convert IF-MIB counter deltas from SNMP polling.
+- `frr-routing-state`: convert FRR route-state snapshots and flap counters.
 - `dns-probe`: count resolver failures.
 - `tls-probe`: measure TLS handshake failures.
 - `quic-probe`: measure UDP/QUIC reachability.
 - `prometheus-exporter-python`: expose `/metrics` plus `/trace`.
 - `otlp-metrics-gateway`: map gateway metrics into NetDiag's OTLP receiver.
+- `opentelemetry-collector-config`: collector pipeline examples for Prometheus,
+  host metrics, and OTLP forwarding.
+
+For a complete local lab, use `iperf3-http-json` for traffic, `tc-netem-lab`
+for impairment control, Prometheus/OTLP for time-series evidence, and pcap or
+native capture for packet-level corroboration.
+
+Adapters that cannot directly observe a canonical field must say so in
+`experiment.measurement_quality`. For example, IF-MIB counters can derive
+throughput and discard/error ratios but cannot prove RTT; routing-state snapshots
+can indicate churn and forwarding stalls but should not pretend to measure
+packet loss. Use those adapters as corroborating sources unless the missing
+metrics are supplied by Prometheus, pcap, active probes, or another primary
+source.

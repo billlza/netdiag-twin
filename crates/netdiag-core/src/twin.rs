@@ -1,12 +1,15 @@
 use crate::error::{NetdiagError, Result};
 use crate::models::{
-    OverallTelemetry, TopologyLink, TopologyModel, TopologyNode, TwinPolicyAction,
-    TwinPolicyActionKind, TwinPolicyImpact, TwinPolicyTarget, WhatIfResult,
+    OverallTelemetry, TelemetrySummary, TopologyCalibrationReport, TopologyLink, TopologyModel,
+    TopologyNode, TwinPolicyAction, TwinPolicyActionKind, TwinPolicyImpact, TwinPolicyTarget,
+    WhatIfResult,
 };
-use petgraph::algo::dijkstra;
+use chrono::Utc;
+use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct Topology {
@@ -228,6 +231,234 @@ pub fn import_topology_json(input: &str) -> Result<TopologyModel> {
 pub fn export_topology_json(model: &TopologyModel) -> Result<String> {
     validate_topology_model(model)?;
     serde_json::to_string_pretty(model).map_err(NetdiagError::from)
+}
+
+pub fn calibrate_topology_from_runs(
+    topology: &TopologyModel,
+    runs_path: impl AsRef<Path>,
+) -> Result<TopologyCalibrationReport> {
+    validate_topology_model(topology)?;
+    let runs_path = runs_path.as_ref();
+    let summaries = collect_telemetry_summaries(runs_path)?;
+    if summaries.is_empty() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "topology calibration found no telemetry_summary.json files under {}",
+            runs_path.display()
+        )));
+    }
+
+    let latency_values = summaries
+        .iter()
+        .map(|summary| summary.overall.latency.p95)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+    let loss_values = summaries
+        .iter()
+        .map(|summary| summary.overall.packet_loss_rate)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect::<Vec<_>>();
+    let throughput_values = summaries
+        .iter()
+        .map(|summary| summary.overall.throughput_mbps.mean)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<_>>();
+
+    let observed_path_latency_p95_ms = mean_or_default(&latency_values, 1.0);
+    let observed_loss_pct = mean_or_default(&loss_values, 0.0);
+    let observed_throughput_mbps = mean_or_default(&throughput_values, 1.0);
+    let mut calibrated_topology = topology.clone();
+    let path_link_ids = shortest_path_link_ids(&calibrated_topology)?;
+    let path_link_count = path_link_ids.len().max(1) as f64;
+    let per_link_latency = (observed_path_latency_p95_ms / path_link_count).max(0.1);
+    let per_link_loss = (observed_loss_pct / path_link_count).max(0.0);
+    let calibrated_capacity = (observed_throughput_mbps * 1.20).max(1.0);
+    let redundancy_score = redundancy_score(&calibrated_topology);
+
+    for link in &mut calibrated_topology.links {
+        if !path_link_ids.iter().any(|id| id == &link.id) {
+            link.metadata
+                .insert("calibration_role".to_string(), json!("off_shortest_path"));
+            continue;
+        }
+        link.latency_ms = round2(per_link_latency);
+        link.loss_pct = round4(per_link_loss);
+        link.capacity_mbps = round2(calibrated_capacity);
+        link.metadata
+            .insert("calibrated_from_runs".to_string(), json!(summaries.len()));
+        link.metadata.insert(
+            "observed_path_latency_p95_ms".to_string(),
+            json!(round2(observed_path_latency_p95_ms)),
+        );
+        link.metadata.insert(
+            "observed_loss_pct".to_string(),
+            json!(round4(observed_loss_pct)),
+        );
+        link.metadata.insert(
+            "observed_throughput_mbps".to_string(),
+            json!(round2(observed_throughput_mbps)),
+        );
+    }
+    calibrated_topology
+        .metadata
+        .insert("calibrated_at".to_string(), json!(Utc::now().to_rfc3339()));
+    calibrated_topology
+        .metadata
+        .insert("calibrated_run_count".to_string(), json!(summaries.len()));
+    calibrated_topology.metadata.insert(
+        "redundancy_score".to_string(),
+        json!(round4(redundancy_score)),
+    );
+
+    let path_bottleneck_link_id = calibrated_topology
+        .links
+        .iter()
+        .filter(|link| path_link_ids.iter().any(|id| id == &link.id))
+        .min_by(|left, right| left.capacity_mbps.total_cmp(&right.capacity_mbps))
+        .map(|link| link.id.clone())
+        .unwrap_or_default();
+
+    let mut warnings = calibration_warnings(&latency_values, &loss_values, &throughput_values);
+    warnings.push(
+        "source telemetry has no per-link attribution; observed path metrics were distributed only across the current shortest client-to-server path"
+            .to_string(),
+    );
+
+    Ok(TopologyCalibrationReport {
+        schema: "netdiag-topology-calibration/v1".to_string(),
+        generated_at: Utc::now(),
+        topology_key: calibrated_topology.key.clone(),
+        source_runs: summaries.len(),
+        updated_metrics: vec![
+            "link_latency_ms".to_string(),
+            "loss_pct".to_string(),
+            "capacity_mbps".to_string(),
+            "path_bottleneck".to_string(),
+            "redundancy_score".to_string(),
+        ],
+        observed_path_latency_p95_ms: round2(observed_path_latency_p95_ms),
+        observed_loss_pct: round4(observed_loss_pct),
+        observed_throughput_mbps: round2(observed_throughput_mbps),
+        path_bottleneck_link_id,
+        redundancy_score: round4(redundancy_score),
+        warnings,
+        calibrated_topology,
+    })
+}
+
+fn collect_telemetry_summaries(path: &Path) -> Result<Vec<TelemetrySummary>> {
+    let mut summaries = Vec::new();
+    collect_telemetry_summaries_inner(path, &mut summaries)?;
+    Ok(summaries)
+}
+
+fn collect_telemetry_summaries_inner(
+    path: &Path,
+    summaries: &mut Vec<TelemetrySummary>,
+) -> Result<()> {
+    if path.is_file() {
+        if path.file_name().and_then(|value| value.to_str()) == Some("telemetry_summary.json") {
+            let raw = std::fs::read_to_string(path).map_err(|source| NetdiagError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let summary: TelemetrySummary = serde_json::from_str(&raw)?;
+            summaries.push(summary);
+        }
+        return Ok(());
+    }
+    if !path.exists() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "runs path does not exist: {}",
+            path.display()
+        )));
+    }
+    for entry in std::fs::read_dir(path).map_err(|source| NetdiagError::Io {
+        path: path.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| NetdiagError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        collect_telemetry_summaries_inner(&entry.path(), summaries)?;
+    }
+    Ok(())
+}
+
+fn mean_or_default(values: &[f64], default: f64) -> f64 {
+    if values.is_empty() {
+        default
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn calibration_warnings(latency: &[f64], loss: &[f64], throughput: &[f64]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if latency.is_empty() {
+        warnings.push(
+            "no finite latency p95 observations; kept conservative latency defaults".to_string(),
+        );
+    }
+    if loss.is_empty() {
+        warnings.push("no finite loss observations; kept zero-loss calibration".to_string());
+    }
+    if throughput.is_empty() {
+        warnings.push(
+            "no finite throughput observations; capacity calibration used 1 Mbps floor".to_string(),
+        );
+    }
+    warnings
+}
+
+fn shortest_path_link_ids(model: &TopologyModel) -> Result<Vec<String>> {
+    let mut graph = UnGraph::<&str, f64>::new_undirected();
+    let mut indices = BTreeMap::<&str, NodeIndex>::new();
+    for node in &model.nodes {
+        indices.insert(node.id.as_str(), graph.add_node(node.id.as_str()));
+    }
+    for link in &model.links {
+        let source = *indices.get(link.source.as_str()).ok_or_else(|| {
+            NetdiagError::InvalidTrace(format!("unknown source node {}", link.source))
+        })?;
+        let target = *indices.get(link.target.as_str()).ok_or_else(|| {
+            NetdiagError::InvalidTrace(format!("unknown target node {}", link.target))
+        })?;
+        graph.add_edge(source, target, link.latency_ms.max(0.1));
+    }
+    let (start, end) = topology_endpoints(model, &indices)?;
+    let Some((_, nodes)) = astar(
+        &graph,
+        start,
+        |candidate| candidate == end,
+        |edge| *edge.weight(),
+        |_| 0.0,
+    ) else {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "topology {} has no connected client-to-server path",
+            model.key
+        )));
+    };
+    let mut link_ids = Vec::new();
+    for pair in nodes.windows(2) {
+        let left = graph[pair[0]];
+        let right = graph[pair[1]];
+        let link = model
+            .links
+            .iter()
+            .find(|link| {
+                (link.source == left && link.target == right)
+                    || (link.source == right && link.target == left)
+            })
+            .ok_or_else(|| {
+                NetdiagError::InvalidTrace(format!(
+                    "topology {} path references missing link {left}<->{right}",
+                    model.key
+                ))
+            })?;
+        link_ids.push(link.id.clone());
+    }
+    Ok(link_ids)
 }
 
 pub fn topology_graph(key: &str) -> Result<UnGraph<String, ()>> {
@@ -673,23 +904,14 @@ fn topology_stats(model: &TopologyModel) -> Result<TopologyStats> {
         })?;
         graph.add_edge(source, target, link.latency_ms.max(0.1));
     }
-    let start = graph
-        .node_indices()
-        .next()
-        .ok_or_else(|| NetdiagError::InvalidTrace("topology has no nodes".to_string()))?;
-    let end = graph
-        .node_indices()
-        .next_back()
-        .ok_or_else(|| NetdiagError::InvalidTrace("topology has no nodes".to_string()))?;
+    let (start, end) = topology_endpoints(model, &indices)?;
     let distances = dijkstra(&graph, start, Some(end), |edge| *edge.weight());
-    let path_latency_ms = distances.get(&end).copied().unwrap_or_else(|| {
-        model
-            .links
-            .iter()
-            .map(|link| link.latency_ms)
-            .sum::<f64>()
-            .max(1.0)
-    });
+    let path_latency_ms = distances.get(&end).copied().ok_or_else(|| {
+        NetdiagError::InvalidTrace(format!(
+            "topology {} has no connected client-to-server path",
+            model.key
+        ))
+    })?;
     let path_loss_pct = if model.links.is_empty() {
         0.0
     } else {
@@ -708,6 +930,58 @@ fn topology_stats(model: &TopologyModel) -> Result<TopologyStats> {
         bottleneck_mbps,
         redundant_paths,
     })
+}
+
+fn topology_endpoints(
+    model: &TopologyModel,
+    indices: &BTreeMap<&str, NodeIndex>,
+) -> Result<(NodeIndex, NodeIndex)> {
+    let start_id = model
+        .nodes
+        .iter()
+        .find(|node| node.role.eq_ignore_ascii_case("client"))
+        .or_else(|| model.nodes.first())
+        .ok_or_else(|| NetdiagError::InvalidTrace("topology has no nodes".to_string()))?
+        .id
+        .as_str();
+    let end_id = model
+        .nodes
+        .iter()
+        .rev()
+        .find(|node| node.role.eq_ignore_ascii_case("server"))
+        .or_else(|| model.nodes.last())
+        .ok_or_else(|| NetdiagError::InvalidTrace("topology has no nodes".to_string()))?
+        .id
+        .as_str();
+    let start = *indices
+        .get(start_id)
+        .ok_or_else(|| NetdiagError::InvalidTrace(format!("unknown endpoint node {start_id}")))?;
+    let end = *indices
+        .get(end_id)
+        .ok_or_else(|| NetdiagError::InvalidTrace(format!("unknown endpoint node {end_id}")))?;
+    if start == end && model.nodes.len() > 1 {
+        return Err(NetdiagError::InvalidTrace(
+            "topology client and server endpoints resolve to the same node".to_string(),
+        ));
+    }
+    Ok((start, end))
+}
+
+fn redundancy_score(model: &TopologyModel) -> f64 {
+    if model.nodes.len() <= 1 {
+        return 0.0;
+    }
+    let tree_edges = model.nodes.len().saturating_sub(1) as f64;
+    let extra_edges = (model.links.len() as f64 - tree_edges).max(0.0);
+    (extra_edges / tree_edges.max(1.0)).clamp(0.0, 1.0)
+}
+
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
 }
 
 fn pct_delta(proposed: f64, baseline: f64) -> f64 {
@@ -783,6 +1057,53 @@ mod tests {
         let err = import_topology_json(&invalid_json).expect_err("invalid topology");
 
         assert!(err.to_string().contains("capacity must be greater than 0"));
+    }
+
+    #[test]
+    fn topology_stats_rejects_disconnected_endpoint_path() {
+        let mut model = topology_model("line").expect("line");
+        model.links.truncate(1);
+
+        let err = topology_stats(&model).expect_err("disconnected topology");
+
+        assert!(
+            err.to_string()
+                .contains("no connected client-to-server path")
+        );
+    }
+
+    #[test]
+    fn topology_calibration_updates_link_metrics_from_run_summaries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run_dir = temp.path().join("runs").join("run-1");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        let summary = TelemetrySummary {
+            overall: telemetry(),
+            windows: Vec::new(),
+            metric_provenance: Vec::new(),
+        };
+        std::fs::write(
+            run_dir.join("telemetry_summary.json"),
+            serde_json::to_vec_pretty(&summary).expect("summary"),
+        )
+        .expect("write summary");
+
+        let report =
+            calibrate_topology_from_runs(&topology_model("line").expect("line"), temp.path())
+                .expect("calibration");
+
+        assert_eq!(report.source_runs, 1);
+        assert!(
+            report
+                .updated_metrics
+                .contains(&"capacity_mbps".to_string())
+        );
+        assert!(report.calibrated_topology.links[0].latency_ms > 0.0);
+        assert!(
+            report.calibrated_topology.links[0]
+                .metadata
+                .contains_key("calibrated_from_runs")
+        );
     }
 
     #[test]

@@ -482,6 +482,22 @@ pub struct MultiSourceEvidenceSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceTimelineEvent {
+    pub occurred_at: DateTime<Utc>,
+    pub phase: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<FaultLabel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorroborationSignal {
     pub source_kind: String,
     pub signal: String,
@@ -856,6 +872,24 @@ pub struct TopologyLink {
     pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyCalibrationReport {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    pub topology_key: String,
+    pub source_runs: usize,
+    #[serde(default)]
+    pub updated_metrics: Vec<String>,
+    pub observed_path_latency_p95_ms: f64,
+    pub observed_loss_pct: f64,
+    pub observed_throughput_mbps: f64,
+    pub path_bottleneck_link_id: String,
+    pub redundancy_score: f64,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub calibrated_topology: TopologyModel,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendationKind {
@@ -1105,6 +1139,16 @@ pub struct ActionVerification {
     pub recommendation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_what_if_effect: Option<TwinPolicyImpact>,
+    #[serde(default)]
+    pub predicted_deltas_pct: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub observed_deltas_pct: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub prediction_error_pct: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub objective: BTreeMap<String, String>,
+    #[serde(default)]
+    pub fail_if: BTreeMap<String, String>,
     pub observed_comparison: RunComparison,
     pub verdict: ActionVerificationVerdict,
     #[serde(default)]

@@ -1,0 +1,17 @@
+schema: netdiag-lab-scenario/v1
+id: ood-asymmetric-routing-001
+name: Unknown asymmetric routing benchmark
+
+data_sources:
+  - name: ood-asymmetric-routing-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/ood_asymmetric_routing.csv
+
+acceptance:
+  min_ml_probability: 0.0
+  allowed_diagnosis_statuses:
+    - uncertain
+    - out_of_distribution
+  require_rule_ml_agreement: false
+  require_what_if_improvement: false

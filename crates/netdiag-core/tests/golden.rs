@@ -1,6 +1,9 @@
 use float_cmp::approx_eq;
 use netdiag_core::error::NetdiagError;
 use netdiag_core::ingest::ingest_trace;
+use netdiag_core::lab::{
+    LabPreflightMode, LabPreflightOptions, load_lab_scenario, preflight_lab_scenario,
+};
 use netdiag_core::ml::{
     MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, export_feedback_training_dataset,
     load_or_train_model, train_model_from_jsonl,
@@ -31,6 +34,12 @@ fn sample(name: &str) -> PathBuf {
         .join(format!("{name}.csv"))
 }
 
+fn scenario(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/scenarios")
+        .join(format!("{name}.yaml"))
+}
+
 #[test]
 fn sample_rules_match_expected_business_labels() {
     let cases = [
@@ -58,6 +67,52 @@ fn sample_rules_match_expected_business_labels() {
             .map(|event| event.evidence.symptom)
             .collect::<Vec<_>>();
         assert_eq!(labels, expected, "{name}");
+    }
+}
+
+#[test]
+fn ood_benchmark_scenarios_are_label_free_and_ingestable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    for name in [
+        "ood-mtu-blackhole",
+        "ood-routing-loop",
+        "ood-asymmetric-routing",
+        "ood-nat-exhaustion",
+        "ood-cpu-saturation",
+        "ood-interface-flap",
+        "ood-mixed-congestion-loss",
+    ] {
+        let scenario_path = scenario(name);
+        let scenario = load_lab_scenario(&scenario_path).expect("scenario");
+        assert_eq!(scenario.expected_label, None, "{name}");
+        assert!(
+            scenario
+                .acceptance
+                .allowed_diagnosis_statuses
+                .iter()
+                .any(|status| status.as_str() == "out_of_distribution"),
+            "{name}"
+        );
+        let source = scenario
+            .data_sources
+            .iter()
+            .find(|source| source.role == netdiag_core::lab::LabDataSourceRole::Primary)
+            .expect("primary source");
+        let path = scenario_path
+            .parent()
+            .expect("scenario parent")
+            .join(&source.endpoint);
+        let ingest = ingest_trace(path).expect("ood sample ingest");
+        assert!(ingest.schema.rows >= 10, "{name}");
+        let preflight = preflight_lab_scenario(
+            &scenario_path,
+            LabPreflightOptions {
+                artifacts: temp.path().to_path_buf(),
+                mode: LabPreflightMode::Static,
+            },
+        )
+        .expect("ood static preflight");
+        assert!(preflight.passed, "{name}: {:?}", preflight.checks);
     }
 }
 

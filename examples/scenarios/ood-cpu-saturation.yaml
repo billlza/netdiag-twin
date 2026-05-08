@@ -1,0 +1,17 @@
+schema: netdiag-lab-scenario/v1
+id: ood-cpu-saturation-001
+name: Unknown CPU saturation benchmark
+
+data_sources:
+  - name: ood-cpu-saturation-trace
+    role: primary
+    kind: trace-file
+    endpoint: ../../data/samples/ood_cpu_saturation.csv
+
+acceptance:
+  min_ml_probability: 0.0
+  allowed_diagnosis_statuses:
+    - uncertain
+    - out_of_distribution
+  require_rule_ml_agreement: false
+  require_what_if_improvement: false

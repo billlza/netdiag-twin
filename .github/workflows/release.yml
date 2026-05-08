@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag to publish, for example v0.3.6. Required when dispatching from a branch."
+        description: "Release tag to publish, for example v0.3.7. Required when dispatching from a branch."
         required: false
         type: string
   push:
@@ -85,12 +85,14 @@ jobs:
       - name: Preflight zero-warning gates
         run: |
           set -euo pipefail
+          python3 -m venv .venv-jsonschema
+          .venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
           RUSTFLAGS="-D warnings" cargo test --workspace
-          python3 -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
-          python3 scripts/validate_adapter_samples.py
+          .venv-jsonschema/bin/python -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
+          .venv-jsonschema/bin/python scripts/validate_adapter_samples.py
           RUSTFLAGS="-D warnings" cargo build --release -p netdiag-app
       - name: Script static checks
         run: |

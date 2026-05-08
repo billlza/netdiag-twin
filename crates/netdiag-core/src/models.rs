@@ -510,6 +510,10 @@ pub struct MlResult {
     pub feature_quality: BTreeMap<String, MetricQuality>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_manifest: Option<ModelManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_file_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

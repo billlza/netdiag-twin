@@ -18,6 +18,32 @@ pub fn run_dir(artifact_root: impl AsRef<Path>, run_id: &str) -> PathBuf {
     artifact_root.as_ref().join("runs").join(run_id)
 }
 
+pub fn resolve_stored_path(artifact_root: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        return path;
+    }
+
+    let artifact_relative = artifact_root.join(&path);
+    if artifact_relative.exists() {
+        return artifact_relative;
+    }
+
+    if let (Some(parent), Some(root_name), Some(first)) = (
+        artifact_root.parent(),
+        artifact_root.file_name(),
+        path.components().next(),
+    ) && first.as_os_str() == root_name
+    {
+        let legacy_cwd_relative = parent.join(&path);
+        if legacy_cwd_relative.exists() {
+            return legacy_cwd_relative;
+        }
+    }
+
+    artifact_relative
+}
+
 #[derive(Debug, Clone)]
 pub struct RunLocation {
     pub artifact_root: PathBuf,
@@ -135,15 +161,18 @@ pub fn read_report(artifact_root: impl AsRef<Path>, run_id: &str) -> Result<Repo
 
 fn top_level_run_location(artifact_root: &Path, run_id: &str) -> Option<RunLocation> {
     let run_dir_path = run_dir(artifact_root, run_id);
-    run_dir_path
-        .join("manifest.json")
-        .exists()
-        .then(|| RunLocation {
+    run_dir_path.join("manifest.json").exists().then(|| {
+        let lab_run_dir = artifact_root
+            .join("scenario.yaml")
+            .exists()
+            .then(|| artifact_root.to_path_buf());
+        RunLocation {
             artifact_root: artifact_root.to_path_buf(),
             run_dir: run_dir_path,
-            lab_run_dir: None,
+            lab_run_dir,
             lab_index_root: None,
-        })
+        }
+    })
 }
 
 fn scan_top_level_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
@@ -211,8 +240,8 @@ fn lab_index_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
 }
 
 fn lab_entry_location(artifact_root: &Path, entry: &LabRunIndexEntryDisk) -> Option<RunLocation> {
-    let lab_run_dir = PathBuf::from(&entry.lab_run_dir);
-    let pipeline_run_dir = PathBuf::from(&entry.pipeline_run_dir);
+    let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
+    let pipeline_run_dir = resolve_stored_path(artifact_root, &entry.pipeline_run_dir);
     let artifact_candidate = if run_dir(&lab_run_dir, &entry.run_id)
         .join("manifest.json")
         .exists()
@@ -378,9 +407,17 @@ pub fn run_history_entry(
     index: RunIndexEntry,
 ) -> Result<RunHistoryEntry> {
     let artifact_root = artifact_root.as_ref();
-    let run_dir_path = PathBuf::from(&index.run_dir);
-    let manifest = read_manifest(artifact_root, &index.run_id).ok();
-    let report = read_report(artifact_root, &index.run_id).ok();
+    let location = resolve_run_location(artifact_root, &index.run_id).ok();
+    let run_dir_path = location
+        .as_ref()
+        .map(|location| location.run_dir.clone())
+        .unwrap_or_else(|| resolve_stored_path(artifact_root, &index.run_dir));
+    let resolved_artifact_root = location
+        .as_ref()
+        .map(|location| location.artifact_root.as_path())
+        .unwrap_or(artifact_root);
+    let manifest = read_manifest(resolved_artifact_root, &index.run_id).ok();
+    let report = read_report(resolved_artifact_root, &index.run_id).ok();
     let artifact_count = manifest
         .as_ref()
         .map(|manifest| {
@@ -399,7 +436,7 @@ pub fn run_history_entry(
         .as_ref()
         .map(|report| report.measurement_quality.clone())
         .unwrap_or_default();
-    let connector_health = read_connector_health(artifact_root, &index.run_id)
+    let connector_health = read_connector_health(resolved_artifact_root, &index.run_id)
         .ok()
         .flatten();
     let quality = connector_health
@@ -648,7 +685,7 @@ pub fn review_recommendation(
         .run_status()
         .to_string();
     update_run_index_status(&location.artifact_root, run_id, status.as_str())?;
-    sync_lab_review_artifacts(&location, &recommendations)?;
+    crate::lab::sync_lab_review_artifacts(&location, &recommendations)?;
 
     Ok(HilReviewOutcome {
         review,
@@ -695,16 +732,6 @@ fn update_report(dir: &Path, recommendations: &[Recommendation]) -> Result<()> {
     report.hil_summary = HilReviewSummary::from_recommendations(recommendations);
     save_json_atomic(report_path, &report)?;
     Ok(())
-}
-
-fn sync_lab_review_artifacts(
-    location: &RunLocation,
-    recommendations: &[Recommendation],
-) -> Result<()> {
-    let Some(lab_run_dir) = location.lab_run_dir.as_deref() else {
-        return Ok(());
-    };
-    update_report(lab_run_dir, recommendations)
 }
 
 fn write_feedback_record(dir: &Path, record: HilFeedbackRecord) -> Result<()> {
@@ -841,9 +868,8 @@ fn update_manifest_artifact_path(dir: &Path, key: &str, path: &Path) -> Result<(
         return Ok(());
     }
     let mut manifest: RunManifest = serde_json::from_value(read_json(&manifest_path)?)?;
-    manifest
-        .artifact_paths
-        .insert(key.to_string(), path.display().to_string());
+    let stored = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+    manifest.artifact_paths.insert(key.to_string(), stored);
     save_json_atomic(manifest_path, &manifest)?;
     Ok(())
 }

@@ -103,8 +103,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTFLAGS="-D warnings" cargo test --workspace
-python3 -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
-python3 scripts/validate_adapter_samples.py
+python3 -m venv .venv-jsonschema
+.venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
+.venv-jsonschema/bin/python -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
+.venv-jsonschema/bin/python scripts/validate_adapter_samples.py
 scripts/check_perf_budget.sh
 git diff --check
 bash -n scripts/*.sh

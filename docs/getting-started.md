@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.3.6 platform contract: how telemetry becomes
+This guide describes the stable v0.3.7 platform contract: how telemetry becomes
 canonical `TraceRecord` rows, how live adapters map into the same pipeline, and
 where the diagnosis, what-if, recommendation, and human-review artifacts are
 written.
@@ -164,7 +164,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.3.6 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.3.7 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -185,7 +185,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.3.6 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.3.7 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -249,10 +249,11 @@ different `--artifacts` root is provided.
 | `report.json` | End-user report combining telemetry, rules, ML, what-if, recommendations, and HIL summary. |
 | `hil_feedback.json` | Created after human review is saved. |
 
-The model cache is stored under `artifacts/model/`. It is deterministic and can
-be regenerated if removed. Lab scenarios use this same trained cache, so a lab
-run does not silently substitute a synthetic per-run model unless the scenario
-explicitly opts into synthetic fallback behavior.
+The model cache is stored under `artifacts/model/`. Regular diagnosis can
+regenerate a deterministic synthetic fallback if the cache is removed, but Lab
+runs are stricter: they require a complete existing model bundle before any lab
+artifacts are written. Train or provision `artifacts/model/` before running
+production scenarios.
 
 `run_index.json` is the Evidence Console index. New runs also write
 `connector_health.json`, which records source kind, profile name, rows,
@@ -304,8 +305,11 @@ is still supported, but indexed lab runs can validate from the global artifact
 root.
 
 Lab acceptance rejects synthetic fallback ML models by default. Prototype or
-smoke scenarios can opt in with `allow_synthetic_model: true`; production lab
-scenarios can pin a trained model by setting `required_model_dataset_hash`.
+smoke fixtures can opt in with `allow_synthetic_model: true`, but that flag only
+accepts an existing synthetic bundle; it does not create one. Production lab
+scenarios should train a model first and pin it with
+`required_model_dataset_hash`, `required_model_manifest_hash`, and
+`required_model_file_hash` when reproducibility matters.
 
 Each lab run writes:
 

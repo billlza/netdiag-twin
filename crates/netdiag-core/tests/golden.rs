@@ -104,6 +104,11 @@ fn full_pipeline_writes_artifacts_and_rust_ml_top_label() {
                 .get("whatif_default")
                 .expect("whatif path"),
         );
+        let whatif_path = if whatif_path.is_absolute() {
+            whatif_path
+        } else {
+            result.run_dir.join(whatif_path)
+        };
         let whatif_json: serde_json::Value =
             serde_json::from_slice(&fs::read(&whatif_path).expect("whatif artifact"))
                 .expect("whatif json");
@@ -128,10 +133,15 @@ fn full_pipeline_writes_artifacts_and_rust_ml_top_label() {
                 continue;
             }
             let path = PathBuf::from(path);
-            assert!(path.starts_with(&result.run_dir), "{name}: {key}");
-            assert!(path.exists(), "{name}: {key}");
+            let resolved_path = if path.is_absolute() {
+                path
+            } else {
+                result.run_dir.join(path)
+            };
+            assert!(resolved_path.starts_with(&result.run_dir), "{name}: {key}");
+            assert!(resolved_path.exists(), "{name}: {key}");
             assert_eq!(
-                path.parent(),
+                resolved_path.parent(),
                 Some(result.run_dir.as_path()),
                 "{name}: {key}"
             );

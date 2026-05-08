@@ -1,6 +1,6 @@
 use crate::error::{IoContext, Result};
 use crate::ingest::ingest_trace;
-use crate::ml::infer_with_quality_from_model_dir;
+use crate::ml::{ModelLoadPolicy, infer_with_quality_from_model_dir_with_policy};
 use crate::models::{
     ConnectorHealthSnapshot, DiagnosisEvent, HilReviewSummary, IngestResult, MlResult,
     Recommendation, RunIndexEntry, RunManifest, TelemetrySummary, TopologyModel, TwinPolicyAction,
@@ -88,6 +88,37 @@ pub fn diagnose_ingest_with_whatif_and_model_dir(
     model_dir: impl AsRef<Path>,
     default_what_if: Option<WhatIfRequest>,
 ) -> Result<PipelineResult> {
+    diagnose_ingest_with_whatif_and_model_dir_with_policy(
+        ingest,
+        artifact_root,
+        model_dir,
+        default_what_if,
+        ModelLoadPolicy::AllowSyntheticFallback,
+    )
+}
+
+pub fn diagnose_ingest_with_whatif_and_existing_model_dir(
+    ingest: IngestResult,
+    artifact_root: impl AsRef<Path>,
+    model_dir: impl AsRef<Path>,
+    default_what_if: Option<WhatIfRequest>,
+) -> Result<PipelineResult> {
+    diagnose_ingest_with_whatif_and_model_dir_with_policy(
+        ingest,
+        artifact_root,
+        model_dir,
+        default_what_if,
+        ModelLoadPolicy::ExistingOnly,
+    )
+}
+
+fn diagnose_ingest_with_whatif_and_model_dir_with_policy(
+    ingest: IngestResult,
+    artifact_root: impl AsRef<Path>,
+    model_dir: impl AsRef<Path>,
+    default_what_if: Option<WhatIfRequest>,
+    model_load_policy: ModelLoadPolicy,
+) -> Result<PipelineResult> {
     let artifact_root = artifact_root.as_ref();
     std::fs::create_dir_all(artifact_root).with_path(artifact_root)?;
     let runs_root = artifact_root.join("runs");
@@ -95,11 +126,12 @@ pub fn diagnose_ingest_with_whatif_and_model_dir(
     let run_id = Uuid::new_v4().to_string();
     let telemetry = summarize_ingest(&ingest, 5)?;
     let diagnosis_events = diagnose_rules(&telemetry, &run_id);
-    let ml_result = infer_with_quality_from_model_dir(
+    let ml_result = infer_with_quality_from_model_dir_with_policy(
         &telemetry.windows,
         &run_id,
         model_dir,
         &telemetry.metric_provenance,
+        model_load_policy,
     )?;
     let comparison = compare_rule_ml(&diagnosis_events, &ml_result);
     let what_if = default_what_if
@@ -130,7 +162,6 @@ pub fn diagnose_ingest_with_whatif_and_model_dir(
     std::fs::create_dir_all(&temp_run_dir).with_path(&temp_run_dir)?;
     let artifact_paths = PersistRun {
         write_dir_path: &temp_run_dir,
-        final_run_dir_path: &run_dir_path,
         run_id: &run_id,
         ingest: &ingest,
         telemetry: &telemetry,
@@ -198,7 +229,7 @@ fn update_run_index(
             sample: manifest.sample.clone(),
             created_at: manifest.created_at,
             status,
-            run_dir: run_dir_path.display().to_string(),
+            run_dir: stored_path(artifact_root, run_dir_path),
         },
     );
     entries.truncate(50);
@@ -206,9 +237,15 @@ fn update_run_index(
     Ok(())
 }
 
+fn stored_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 struct PersistRun<'a> {
     write_dir_path: &'a Path,
-    final_run_dir_path: &'a Path,
     run_id: &'a str,
     ingest: &'a IngestResult,
     telemetry: &'a TelemetrySummary,
@@ -281,13 +318,7 @@ impl PersistRun<'_> {
         value: &T,
     ) -> Result<()> {
         save_json_atomic(self.write_dir_path.join(file_name), value)?;
-        paths.insert(
-            key.to_string(),
-            self.final_run_dir_path
-                .join(file_name)
-                .display()
-                .to_string(),
-        );
+        paths.insert(key.to_string(), file_name.to_string());
         Ok(())
     }
 }

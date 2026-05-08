@@ -76,6 +76,12 @@ impl Default for TrainingOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLoadPolicy {
+    AllowSyntheticFallback,
+    ExistingOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeedbackTrainingRow {
     pub label: FaultLabel,
@@ -142,11 +148,52 @@ pub fn infer_with_quality_from_model_dir(
     model_dir: impl AsRef<Path>,
     provenance: &[MetricProvenance],
 ) -> Result<MlResult> {
+    infer_with_quality_from_model_dir_with_policy(
+        windows,
+        run_id,
+        model_dir,
+        provenance,
+        ModelLoadPolicy::AllowSyntheticFallback,
+    )
+}
+
+pub fn infer_with_quality_from_existing_model_dir(
+    windows: &[TelemetryWindow],
+    run_id: &str,
+    model_dir: impl AsRef<Path>,
+    provenance: &[MetricProvenance],
+) -> Result<MlResult> {
+    infer_with_quality_from_model_dir_with_policy(
+        windows,
+        run_id,
+        model_dir,
+        provenance,
+        ModelLoadPolicy::ExistingOnly,
+    )
+}
+
+pub fn infer_with_quality_from_model_dir_with_policy(
+    windows: &[TelemetryWindow],
+    run_id: &str,
+    model_dir: impl AsRef<Path>,
+    provenance: &[MetricProvenance],
+    load_policy: ModelLoadPolicy,
+) -> Result<MlResult> {
     let model_dir = model_dir.as_ref();
-    let model = load_or_train_model(model_dir)?;
-    let model_manifest = read_json(model_dir.join(MODEL_MANIFEST_FILE_NAME))
+    let model = load_model_with_policy(model_dir, load_policy)?;
+    let model_path = model_dir.join(MODEL_FILE_NAME);
+    let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
+    let model_manifest = read_json(&manifest_path)
         .ok()
         .and_then(|value| serde_json::from_value::<ModelManifest>(value).ok());
+    let model_file_hash = model_path
+        .exists()
+        .then(|| sha256_file(&model_path))
+        .transpose()?;
+    let model_manifest_hash = manifest_path
+        .exists()
+        .then(|| sha256_file(&manifest_path))
+        .transpose()?;
     let raw_features = extract_features_from_windows(windows);
     let feature_quality = feature_quality_map(provenance);
     let weighted_features = apply_feature_quality(&raw_features, &feature_quality);
@@ -209,6 +256,8 @@ pub fn infer_with_quality_from_model_dir(
         features,
         feature_quality,
         model_manifest,
+        model_manifest_hash,
+        model_file_hash,
     })
 }
 
@@ -270,6 +319,14 @@ fn feature_metric(feature: &str) -> &'static str {
 }
 
 pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
+    load_model_with_policy(model_dir, ModelLoadPolicy::AllowSyntheticFallback)
+}
+
+pub fn load_existing_model(model_dir: &Path) -> Result<RustMlModel> {
+    load_model_with_policy(model_dir, ModelLoadPolicy::ExistingOnly)
+}
+
+fn load_model_with_policy(model_dir: &Path, load_policy: ModelLoadPolicy) -> Result<RustMlModel> {
     let model_path = model_dir.join(MODEL_FILE_NAME);
     let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
     if model_path.exists() {
@@ -285,6 +342,11 @@ pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
         if manifest_path.exists() {
             let manifest: ModelManifest = serde_json::from_value(read_json(&manifest_path)?)?;
             validate_model_manifest(&manifest, &model)?;
+        } else if load_policy == ModelLoadPolicy::ExistingOnly {
+            return Err(NetdiagError::Ml(format!(
+                "model manifest {} is missing; train or provision a complete model bundle before running lab diagnostics",
+                manifest_path.display()
+            )));
         } else {
             let manifest = build_model_manifest(
                 "cached_existing_model",
@@ -298,6 +360,13 @@ pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
             save_json_atomic(&manifest_path, &manifest)?;
         }
         return Ok(model);
+    }
+
+    if load_policy == ModelLoadPolicy::ExistingOnly {
+        return Err(NetdiagError::Ml(format!(
+            "model file {} is missing; train or provision a model bundle before running lab diagnostics",
+            model_path.display()
+        )));
     }
 
     std::fs::create_dir_all(model_dir).with_path(model_dir)?;
@@ -981,7 +1050,7 @@ fn synthetic_label_distribution(samples_per_label: usize) -> BTreeMap<String, us
         .collect()
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path).with_path(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 8192];

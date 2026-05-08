@@ -13,8 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Python schema validator
+        run: |
+          python3 -m venv .venv-jsonschema
+          .venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
       - name: Validate adapter samples through schema and Rust ingest
-        run: python3 scripts/validate_adapter_samples.py
+        run: .venv-jsonschema/bin/python scripts/validate_adapter_samples.py
 
   rust:
     runs-on: macos-14

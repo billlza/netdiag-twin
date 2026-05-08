@@ -16,6 +16,10 @@ pub struct Report {
     pub rule_vs_ml: RuleMlComparison,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_manifest: Option<ModelManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_file_hash: Option<String>,
     pub what_if: Option<WhatIfResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_source_evidence: Option<MultiSourceEvidenceSummary>,
@@ -34,6 +38,8 @@ pub struct RootCause {
     pub source: String,
     #[serde(default)]
     pub method: String,
+    #[serde(default)]
+    pub suspected_corroboration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +56,7 @@ pub struct RuleMlComparison {
 pub fn compare_rule_ml(events: &[DiagnosisEvent], ml: &MlResult) -> RuleMlComparison {
     let rule_labels: Vec<String> = events
         .iter()
+        .filter(|event| !event_is_suspected_corroboration(event))
         .map(|event| event.evidence.symptom.as_str().to_string())
         .collect();
     let ml_top = ml
@@ -93,6 +100,10 @@ pub fn compare_rule_ml(events: &[DiagnosisEvent], ml: &MlResult) -> RuleMlCompar
     }
 }
 
+fn event_is_suspected_corroboration(event: &DiagnosisEvent) -> bool {
+    event.source == "corroboration" || event.evidence.method == "corroboration"
+}
+
 pub fn render_report(
     run_id: &str,
     summary: &TelemetrySummary,
@@ -115,10 +126,13 @@ pub fn render_report(
                 why: event.evidence.why.clone(),
                 source: event.source.clone(),
                 method: event.evidence.method.clone(),
+                suspected_corroboration: event_is_suspected_corroboration(event),
             })
             .collect(),
         rule_vs_ml: compare_rule_ml(events, ml),
         model_manifest: ml.model_manifest.clone(),
+        model_manifest_hash: ml.model_manifest_hash.clone(),
+        model_file_hash: ml.model_file_hash.clone(),
         what_if,
         multi_source_evidence: None,
         recommendations: recommendations.to_vec(),

@@ -6,22 +6,22 @@ use crate::connectors::{
     load_system_counters,
 };
 use crate::error::{IoContext, NetdiagError, Result};
-use crate::evidence_bundle::{
-    EvidenceBundleExtraFile, EvidenceBundleManifest, export_evidence_bundle,
-};
+use crate::evidence_bundle::{EvidenceBundleManifest, export_evidence_bundle};
 use crate::ingest::{CANONICAL_COLUMNS, ingest_trace};
+use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model, sha256_file};
 use crate::models::{
     ConnectorHealthSnapshot, ConnectorHealthStatus, CorroborationDecision, CorroborationSignal,
-    DiagnosisEvent, EvidenceRecord, EvidenceRef, FaultLabel, HilState, IngestResult, MetricQuality,
-    MultiSourceEvidenceSummary, RunComparison, Severity, SourceEvidenceSummary, TimeWindow,
+    DiagnosisEvent, EvidenceRecord, EvidenceRef, FaultLabel, HilReviewSummary, HilState,
+    IngestResult, MetricQuality, MultiSourceEvidenceSummary, Recommendation, RunComparison,
+    Severity, SourceEvidenceSummary, TimeWindow,
 };
-use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_model_dir};
+use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_existing_model_dir};
 use crate::recommendation::recommend_actions;
 use crate::report::Report;
 use crate::report::{compare_rule_ml, render_report};
 use crate::storage::{
-    connector_health_from_ingest, read_connector_health, read_json, run_artifacts, run_dir,
-    save_json, write_connector_health,
+    RunLocation, connector_health_from_ingest, read_connector_health, read_json,
+    resolve_stored_path, run_artifacts, run_dir, save_json, write_connector_health,
 };
 use crate::twin::{
     TopologyFormat, import_policy_action, import_topology, policy_action, topology_model,
@@ -160,6 +160,10 @@ pub struct LabAcceptance {
     pub allow_synthetic_model: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_model_dataset_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_model_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_model_file_hash: Option<String>,
     #[serde(default)]
     pub allow_suspected_corroboration: bool,
 }
@@ -177,6 +181,8 @@ impl Default for LabAcceptance {
             required_artifacts: default_required_artifacts(),
             allow_synthetic_model: false,
             required_model_dataset_hash: None,
+            required_model_manifest_hash: None,
+            required_model_file_hash: None,
             allow_suspected_corroboration: false,
         }
     }
@@ -264,12 +270,16 @@ pub struct LabRunIndexEntry {
     pub passed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LabValidationContext {
     #[serde(default)]
     pub connector_health: Vec<ConnectorHealthSnapshot>,
     #[serde(default)]
     pub artifact_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_file_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +296,10 @@ pub struct LabAcceptanceReport {
     pub synthetic_model: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_dataset_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_manifest_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_file_hash: Option<String>,
     pub quality_status: ConnectorHealthStatus,
     pub passed: bool,
     #[serde(default)]
@@ -949,6 +963,9 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         first.role = LabDataSourceRole::Primary;
     }
     let scenario_dir = scenario_path.parent().unwrap_or_else(|| Path::new("."));
+    let model_dir = options.artifacts.join("model");
+    load_existing_model(&model_dir)?;
+
     let created_at = Utc::now();
     let lab_run_dir = options
         .artifacts
@@ -982,8 +999,7 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         .map(|what_if| build_what_if_request(what_if, scenario_dir))
         .transpose()?;
 
-    let model_dir = options.artifacts.join("model");
-    let mut pipeline = diagnose_ingest_with_whatif_and_model_dir(
+    let mut pipeline = diagnose_ingest_with_whatif_and_existing_model_dir(
         primary.loaded.ingest.clone(),
         &lab_run_dir,
         &model_dir,
@@ -1036,6 +1052,8 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
             .filter(|artifact| artifact.exists)
             .map(|artifact| artifact.key)
             .collect(),
+        model_manifest_hash: pipeline.report.model_manifest_hash.clone(),
+        model_file_hash: pipeline.report.model_file_hash.clone(),
     };
     let acceptance = validate_lab_report(&scenario, &pipeline.report, &validation_context)?;
     fs::write(lab_run_dir.join("run_id.txt"), &pipeline.run_id)
@@ -1055,7 +1073,7 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
         &lab_run_dir,
         &pipeline.run_id,
         lab_run_dir.join(format!("netdiag-evidence-{}.zip", pipeline.run_id)),
-        &lab_evidence_bundle_files(&lab_run_dir, &scenario_copy),
+        &[],
     )?;
     save_json(lab_run_dir.join("evidence_bundle.json"), &evidence_bundle)?;
     update_lab_run_index(
@@ -1065,11 +1083,17 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
             scenario_id: scenario.id.clone(),
             scenario_name: scenario.name.clone(),
             created_at,
-            lab_run_dir: lab_run_dir.display().to_string(),
-            pipeline_run_dir: pipeline.run_dir.display().to_string(),
-            acceptance_path: lab_run_dir.join("acceptance.json").display().to_string(),
-            comparison_path: lab_run_dir.join("comparison.json").display().to_string(),
-            scenario_path: scenario_copy.display().to_string(),
+            lab_run_dir: stored_lab_index_path(&options.artifacts, &lab_run_dir),
+            pipeline_run_dir: stored_lab_index_path(&options.artifacts, &pipeline.run_dir),
+            acceptance_path: stored_lab_index_path(
+                &options.artifacts,
+                &lab_run_dir.join("acceptance.json"),
+            ),
+            comparison_path: stored_lab_index_path(
+                &options.artifacts,
+                &lab_run_dir.join("comparison.json"),
+            ),
+            scenario_path: stored_lab_index_path(&options.artifacts, &scenario_copy),
             passed: acceptance.passed,
         },
     )?;
@@ -1145,7 +1169,7 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
     let mut passed = 0usize;
 
     for entry in &index.runs {
-        let acceptance_path = PathBuf::from(&entry.acceptance_path);
+        let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path);
         let acceptance = match read_json(&acceptance_path).and_then(|value| {
             serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
         }) {
@@ -1159,7 +1183,8 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
                 continue;
             }
         };
-        let comparison = read_json(&entry.comparison_path)
+        let comparison_path = resolve_stored_path(artifact_root, &entry.comparison_path);
+        let comparison = read_json(&comparison_path)
             .and_then(|value| serde_json::from_value::<LabRunComparison>(value).map_err(Into::into))
             .ok();
         if acceptance.passed {
@@ -1313,7 +1338,7 @@ pub fn validate_lab_run(
             resolution
                 .index_entry
                 .as_ref()
-                .map(|entry| PathBuf::from(&entry.scenario_path))
+                .map(|entry| resolve_stored_path(input_root, &entry.scenario_path))
         })
         .or_else(|| {
             let candidate = resolution.artifact_root.join("scenario.yaml");
@@ -1329,14 +1354,90 @@ pub fn validate_lab_run(
     let report: Report = serde_json::from_value(read_json(
         run_dir(&artifact_root, run_id).join("report.json"),
     )?)?;
+    let (model_manifest_hash, model_file_hash) = lab_model_hashes(input_root, &report)?;
     validate_lab_report(
         &scenario,
         &report,
         &LabValidationContext {
             connector_health: read_lab_connector_health(&artifact_root, run_id)?,
             artifact_keys: lab_artifact_keys(&artifact_root, run_id)?,
+            model_manifest_hash,
+            model_file_hash,
         },
     )
+}
+
+fn lab_model_hashes(
+    artifact_root: &Path,
+    report: &Report,
+) -> Result<(Option<String>, Option<String>)> {
+    let model_dir = artifact_root.join("model");
+    let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
+    let model_path = model_dir.join(MODEL_FILE_NAME);
+    let manifest_hash = if manifest_path.exists() {
+        Some(sha256_file(&manifest_path)?)
+    } else {
+        report.model_manifest_hash.clone()
+    };
+    let model_file_hash = if model_path.exists() {
+        Some(sha256_file(&model_path)?)
+    } else {
+        report.model_file_hash.clone()
+    };
+    Ok((manifest_hash, model_file_hash))
+}
+
+pub(crate) fn sync_lab_review_artifacts(
+    location: &RunLocation,
+    recommendations: &[Recommendation],
+) -> Result<()> {
+    let Some(lab_run_dir) = location.lab_run_dir.as_deref() else {
+        return Ok(());
+    };
+    let report_path = lab_run_dir.join("report.json");
+    if !report_path.exists() {
+        return Ok(());
+    }
+
+    let mut report: Report = serde_json::from_value(read_json(&report_path)?)?;
+    report.recommendations = recommendations.to_vec();
+    report.hil_summary = HilReviewSummary::from_recommendations(recommendations);
+    save_json(&report_path, &report)?;
+
+    let scenario_path = lab_run_dir.join("scenario.yaml");
+    let scenario = load_lab_scenario(&scenario_path)?;
+    let model_root = location
+        .lab_index_root
+        .as_deref()
+        .unwrap_or(location.artifact_root.as_path());
+    let (model_manifest_hash, model_file_hash) = lab_model_hashes(model_root, &report)?;
+    let acceptance = validate_lab_report(
+        &scenario,
+        &report,
+        &LabValidationContext {
+            connector_health: read_lab_connector_health(lab_run_dir, &report.run_id)?,
+            artifact_keys: lab_artifact_keys(lab_run_dir, &report.run_id)?,
+            model_manifest_hash,
+            model_file_hash,
+        },
+    )?;
+    let comparison = lab_run_comparison(&scenario, &report, &acceptance, None);
+    save_json(lab_run_dir.join("acceptance.json"), &acceptance)?;
+    save_json(lab_run_dir.join("comparison.json"), &comparison)?;
+
+    let evidence_bundle = export_evidence_bundle(
+        lab_run_dir,
+        &report.run_id,
+        lab_run_dir.join(format!("netdiag-evidence-{}.zip", report.run_id)),
+        &[],
+    )?;
+    save_json(lab_run_dir.join("evidence_bundle.json"), &evidence_bundle)?;
+
+    if let Some(index_root) = location.lab_index_root.as_deref() {
+        update_lab_run_index_passed(index_root, &report.run_id, acceptance.passed)?;
+    }
+
+    Ok(())
 }
 
 fn read_lab_connector_health(
@@ -1371,42 +1472,6 @@ fn lab_artifact_keys(artifact_root: &Path, run_id: &str) -> Result<Vec<String>> 
     Ok(keys)
 }
 
-fn lab_evidence_bundle_files(
-    lab_run_dir: &Path,
-    scenario_copy: &Path,
-) -> Vec<EvidenceBundleExtraFile> {
-    [
-        ("scenario", scenario_copy.to_path_buf(), "scenario.yaml"),
-        (
-            "acceptance",
-            lab_run_dir.join("acceptance.json"),
-            "acceptance.json",
-        ),
-        (
-            "comparison",
-            lab_run_dir.join("comparison.json"),
-            "comparison.json",
-        ),
-        (
-            "multi_source_evidence",
-            lab_run_dir.join("multi_source_evidence.json"),
-            "multi_source_evidence.json",
-        ),
-        (
-            "lab_connector_health",
-            lab_run_dir.join("connector_health.json"),
-            "lab_connector_health.json",
-        ),
-    ]
-    .into_iter()
-    .map(|(key, path, zip_path)| EvidenceBundleExtraFile {
-        key: key.to_string(),
-        path,
-        zip_path: zip_path.to_string(),
-    })
-    .collect()
-}
-
 fn update_lab_run_index(artifact_root: &Path, entry: LabRunIndexEntry) -> Result<()> {
     let index_path = artifact_root.join("lab_run_index.json");
     let mut index = if index_path.exists() {
@@ -1429,6 +1494,27 @@ fn update_lab_run_index(artifact_root: &Path, entry: LabRunIndexEntry) -> Result
     Ok(())
 }
 
+fn update_lab_run_index_passed(artifact_root: &Path, run_id: &str, passed: bool) -> Result<()> {
+    let index_path = artifact_root.join("lab_run_index.json");
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut index = serde_json::from_value::<LabRunIndex>(read_json(&index_path)?)?;
+    if let Some(entry) = index.runs.iter_mut().find(|entry| entry.run_id == run_id) {
+        entry.passed = passed;
+        index.generated_at = Utc::now();
+        save_json(index_path, &index)?;
+    }
+    Ok(())
+}
+
+fn stored_lab_index_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 fn read_lab_run_index(artifact_root: &Path) -> Result<Option<LabRunIndex>> {
     let index_path = artifact_root.join("lab_run_index.json");
     if !index_path.exists() {
@@ -1449,7 +1535,7 @@ fn resolve_lab_run_artifact_root(artifact_root: &Path, run_id: &str) -> Result<L
     if let Some(index) = read_lab_run_index(artifact_root)?
         && let Some(entry) = index.runs.into_iter().find(|entry| entry.run_id == run_id)
     {
-        let lab_run_dir = PathBuf::from(&entry.lab_run_dir);
+        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
         if run_dir(&lab_run_dir, run_id).join("report.json").exists() {
             return Ok(LabRunResolution {
                 artifact_root: lab_run_dir,
@@ -1519,6 +1605,14 @@ pub fn validate_lab_report(
         .model_manifest
         .as_ref()
         .and_then(|manifest| manifest.dataset_hash_sha256.clone());
+    let model_manifest_hash = context
+        .model_manifest_hash
+        .clone()
+        .or_else(|| report.model_manifest_hash.clone());
+    let model_file_hash = context
+        .model_file_hash
+        .clone()
+        .or_else(|| report.model_file_hash.clone());
     match &report.model_manifest {
         Some(manifest) => {
             if manifest.synthetic_fallback && !scenario.acceptance.allow_synthetic_model {
@@ -1534,6 +1628,29 @@ pub fn validate_lab_report(
                     )),
                     None => failures.push(format!(
                         "model dataset hash is missing, expected {required_hash}"
+                    )),
+                }
+            }
+            if let Some(required_hash) = scenario.acceptance.required_model_manifest_hash.as_deref()
+            {
+                match model_manifest_hash.as_deref() {
+                    Some(actual_hash) if actual_hash == required_hash => {}
+                    Some(actual_hash) => failures.push(format!(
+                        "model manifest hash was {actual_hash}, expected {required_hash}"
+                    )),
+                    None => failures.push(format!(
+                        "model manifest hash is missing, expected {required_hash}"
+                    )),
+                }
+            }
+            if let Some(required_hash) = scenario.acceptance.required_model_file_hash.as_deref() {
+                match model_file_hash.as_deref() {
+                    Some(actual_hash) if actual_hash == required_hash => {}
+                    Some(actual_hash) => failures.push(format!(
+                        "model file hash was {actual_hash}, expected {required_hash}"
+                    )),
+                    None => failures.push(format!(
+                        "model file hash is missing, expected {required_hash}"
                     )),
                 }
             }
@@ -1666,6 +1783,8 @@ pub fn validate_lab_report(
         actual_ml_probability: report.rule_vs_ml.ml_top_prob,
         synthetic_model,
         model_dataset_hash,
+        model_manifest_hash,
+        model_file_hash,
         quality_status,
         passed: failures.is_empty(),
         failures,
@@ -1673,7 +1792,7 @@ pub fn validate_lab_report(
 }
 
 fn root_is_suspected_corroboration(root: &crate::report::RootCause) -> bool {
-    root.source == "corroboration" || root.method == "corroboration"
+    root.suspected_corroboration || root.source == "corroboration" || root.method == "corroboration"
 }
 
 fn validate_what_if_improvement(what_if: &crate::models::WhatIfResult, failures: &mut Vec<String>) {
@@ -2489,6 +2608,10 @@ mod tests {
     };
     use crate::report::{Report, RootCause, RuleMlComparison};
     use std::collections::BTreeSet;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn scenario(expected: FaultLabel, require_what_if_improvement: bool) -> LabScenario {
         LabScenario {
@@ -2517,6 +2640,8 @@ mod tests {
                 required_artifacts: Vec::new(),
                 allow_synthetic_model: false,
                 required_model_dataset_hash: None,
+                required_model_manifest_hash: None,
+                required_model_file_hash: None,
                 allow_suspected_corroboration: false,
             },
         }
@@ -2549,6 +2674,8 @@ mod tests {
                 rule_only: Vec::new(),
             },
             model_manifest: Some(model_manifest(false, Some("dataset-test-hash"))),
+            model_manifest_hash: Some("manifest-test-hash".to_string()),
+            model_file_hash: Some("file-test-hash".to_string()),
             what_if,
             multi_source_evidence: None,
             recommendations: Vec::new(),
@@ -2564,6 +2691,7 @@ mod tests {
             why: "test".to_string(),
             source: "rule".to_string(),
             method: "rule".to_string(),
+            suspected_corroboration: false,
         }
     }
 
@@ -2676,6 +2804,35 @@ mod tests {
             .to_path_buf()
     }
 
+    fn provision_test_model(artifacts: &Path) {
+        std::fs::create_dir_all(artifacts).expect("artifacts dir");
+        let dataset_path = artifacts.join("training.jsonl");
+        let mut dataset = std::fs::File::create(&dataset_path).expect("training dataset");
+        for name in [
+            "normal",
+            "congestion",
+            "random_loss",
+            "dns_failure",
+            "tls_failure",
+            "udp_quic_blocked",
+        ] {
+            let ingest = ingest_trace(
+                repo_root()
+                    .join("data")
+                    .join("samples")
+                    .join(format!("{name}.csv")),
+            )
+            .expect("sample ingest");
+            let row = serde_json::json!({
+                "label": name,
+                "records": ingest.records,
+            });
+            writeln!(dataset, "{row}").expect("write training row");
+        }
+        crate::ml::train_model_from_jsonl(&dataset_path, artifacts.join("model"))
+            .expect("train lab test model");
+    }
+
     #[test]
     fn validate_lab_report_accepts_normal_rule_label() {
         let scenario = scenario(FaultLabel::Normal, false);
@@ -2692,6 +2849,8 @@ mod tests {
             &LabValidationContext {
                 connector_health: Vec::new(),
                 artifact_keys: Vec::new(),
+                model_manifest_hash: None,
+                model_file_hash: None,
             },
         )
         .expect("acceptance");
@@ -2717,6 +2876,8 @@ mod tests {
             &LabValidationContext {
                 connector_health: Vec::new(),
                 artifact_keys: Vec::new(),
+                model_manifest_hash: None,
+                model_file_hash: None,
             },
         )
         .expect("acceptance");
@@ -2750,6 +2911,8 @@ mod tests {
             &LabValidationContext {
                 connector_health: Vec::new(),
                 artifact_keys: Vec::new(),
+                model_manifest_hash: None,
+                model_file_hash: None,
             },
         )
         .expect("acceptance");
@@ -2760,6 +2923,45 @@ mod tests {
                 .failures
                 .iter()
                 .any(|failure| failure.contains("expected expected-hash")),
+            "{:?}",
+            acceptance.failures
+        );
+    }
+
+    #[test]
+    fn validate_lab_report_enforces_required_model_identity_hashes() {
+        let mut scenario = scenario(FaultLabel::Normal, false);
+        scenario.acceptance.required_model_manifest_hash = Some("manifest-test-hash".to_string());
+        scenario.acceptance.required_model_file_hash = Some("file-test-hash".to_string());
+        let report = report(
+            "run-normal",
+            vec![root(FaultLabel::Normal, 0.95)],
+            FaultLabel::Normal,
+            None,
+        );
+
+        let acceptance = validate_lab_report(&scenario, &report, &LabValidationContext::default())
+            .expect("acceptance");
+        assert!(acceptance.passed, "{:?}", acceptance.failures);
+        assert_eq!(
+            acceptance.model_manifest_hash.as_deref(),
+            Some("manifest-test-hash")
+        );
+        assert_eq!(
+            acceptance.model_file_hash.as_deref(),
+            Some("file-test-hash")
+        );
+
+        let mut wrong = scenario;
+        wrong.acceptance.required_model_file_hash = Some("wrong-file-hash".to_string());
+        let acceptance = validate_lab_report(&wrong, &report, &LabValidationContext::default())
+            .expect("acceptance");
+        assert!(!acceptance.passed);
+        assert!(
+            acceptance
+                .failures
+                .iter()
+                .any(|failure| failure.contains("model file hash")),
             "{:?}",
             acceptance.failures
         );
@@ -2795,6 +2997,7 @@ mod tests {
                 why: "suspected".to_string(),
                 source: "corroboration".to_string(),
                 method: "corroboration".to_string(),
+                suspected_corroboration: true,
             }],
             FaultLabel::Congestion,
             None,
@@ -2806,6 +3009,8 @@ mod tests {
             &LabValidationContext {
                 connector_health: Vec::new(),
                 artifact_keys: Vec::new(),
+                model_manifest_hash: None,
+                model_file_hash: None,
             },
         )
         .expect("acceptance");
@@ -2836,6 +3041,8 @@ mod tests {
             &LabValidationContext {
                 connector_health: Vec::new(),
                 artifact_keys: Vec::new(),
+                model_manifest_hash: None,
+                model_file_hash: None,
             },
         )
         .expect("acceptance");
@@ -2871,6 +3078,8 @@ mod tests {
             &LabValidationContext {
                 connector_health: Vec::new(),
                 artifact_keys: Vec::new(),
+                model_manifest_hash: None,
+                model_file_hash: None,
             },
         )
         .expect("acceptance");
@@ -2889,6 +3098,7 @@ mod tests {
     #[test]
     fn lab_run_index_resolves_validation_and_bundle_includes_lab_artifacts() {
         let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
         let scenario_path = repo_root()
             .join("examples")
             .join("scenarios")
@@ -2906,9 +3116,28 @@ mod tests {
             temp.path().join("lab_run_index.json").exists(),
             "lab_run_index.json missing"
         );
-        let validation =
-            validate_lab_run(temp.path(), &result.run_id, None).expect("indexed validate");
+        let validation = validate_lab_run(temp.path(), &result.run_id, None)
+            .expect("indexed validate before cwd change");
         assert!(validation.passed, "{:?}", validation.failures);
+        assert!(validation.model_manifest_hash.is_some());
+        assert!(validation.model_file_hash.is_some());
+
+        let _guard = CWD_LOCK.lock().expect("cwd lock");
+        let previous_cwd = std::env::current_dir().expect("current dir");
+        let other_cwd = tempfile::tempdir().expect("other cwd");
+        std::env::set_current_dir(other_cwd.path()).expect("switch cwd");
+        let validation_from_other_cwd = validate_lab_run(temp.path(), &result.run_id, None);
+        let evidence_from_other_cwd = crate::storage::run_evidence(temp.path(), &result.run_id);
+        std::env::set_current_dir(previous_cwd).expect("restore cwd");
+        let validation_from_other_cwd =
+            validation_from_other_cwd.expect("indexed validate from another cwd");
+        assert!(
+            validation_from_other_cwd.passed,
+            "{:?}",
+            validation_from_other_cwd.failures
+        );
+        let evidence_from_other_cwd = evidence_from_other_cwd.expect("evidence from another cwd");
+        assert_eq!(evidence_from_other_cwd.report.run_id, result.run_id);
         assert!(
             temp.path()
                 .join("model")
@@ -2939,6 +3168,28 @@ mod tests {
             assert!(keys.contains(expected), "missing {expected}: {keys:?}");
         }
 
+        let extra_path = temp.path().join("operator-note.txt");
+        std::fs::write(&extra_path, "review note").expect("extra file");
+        let explicit_bundle = export_evidence_bundle(
+            PathBuf::from(&result.lab_run_dir),
+            &result.run_id,
+            temp.path().join("explicit-extra.zip"),
+            &[crate::evidence_bundle::EvidenceBundleExtraFile {
+                key: "operator_note".to_string(),
+                path: extra_path,
+                zip_path: "operator-note.txt".to_string(),
+            }],
+        )
+        .expect("explicit bundle");
+        let explicit_keys = explicit_bundle
+            .files
+            .iter()
+            .map(|file| file.key.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(explicit_keys.contains("operator_note"));
+        assert!(explicit_keys.contains("acceptance"));
+        assert!(explicit_keys.contains("comparison"));
+
         let report =
             crate::storage::read_report(temp.path(), &result.run_id).expect("indexed report");
         let recommendation = report
@@ -2965,6 +3216,46 @@ mod tests {
         )
         .expect("top report json");
         assert_eq!(top_report.hil_summary.accepted, 1);
+        let top_acceptance: LabAcceptanceReport = serde_json::from_value(
+            read_json(PathBuf::from(&result.lab_run_dir).join("acceptance.json"))
+                .expect("top acceptance"),
+        )
+        .expect("top acceptance json");
+        assert!(top_acceptance.passed, "{:?}", top_acceptance.failures);
+        let synced_bundle: EvidenceBundleManifest = serde_json::from_value(
+            read_json(PathBuf::from(&result.lab_run_dir).join("evidence_bundle.json"))
+                .expect("bundle manifest"),
+        )
+        .expect("bundle manifest json");
+        assert!(
+            synced_bundle
+                .files
+                .iter()
+                .any(|file| file.key == "hil_feedback"),
+            "{:?}",
+            synced_bundle.files
+        );
+    }
+
+    #[test]
+    fn lab_run_fails_fast_when_shared_model_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scenario_path = repo_root()
+            .join("examples")
+            .join("scenarios")
+            .join("lab-congestion-001.yaml");
+
+        let err = run_lab_scenario(
+            &scenario_path,
+            LabRunOptions {
+                artifacts: temp.path().to_path_buf(),
+            },
+        )
+        .expect_err("missing model should fail before lab run creation");
+
+        assert!(err.to_string().contains("model file"), "{err}");
+        assert!(!temp.path().join("model").exists());
+        assert!(!temp.path().join("lab-runs").exists());
     }
 
     #[test]
@@ -2980,6 +3271,8 @@ mod tests {
     #[test]
     fn lab_multisource_signals_enrich_diagnosis_artifacts() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_test_model(&artifacts);
         let trace = repo_root()
             .join("data")
             .join("samples")
@@ -3015,13 +3308,8 @@ acceptance:
         )
         .expect("write scenario");
 
-        let result = run_lab_scenario(
-            &scenario_path,
-            LabRunOptions {
-                artifacts: temp.path().join("artifacts"),
-            },
-        )
-        .expect("lab run");
+        let result =
+            run_lab_scenario(&scenario_path, LabRunOptions { artifacts }).expect("lab run");
 
         assert!(result.acceptance.passed, "{:?}", result.acceptance.failures);
         let report: Report = serde_json::from_value(
@@ -3060,6 +3348,8 @@ acceptance:
     #[test]
     fn lab_multisource_summary_uses_final_diagnosis_after_corroboration() {
         let temp = tempfile::tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_test_model(&artifacts);
         let normal = repo_root().join("data").join("samples").join("normal.csv");
         let congestion = repo_root()
             .join("data")
@@ -3097,13 +3387,8 @@ acceptance:
         )
         .expect("write scenario");
 
-        let result = run_lab_scenario(
-            &scenario_path,
-            LabRunOptions {
-                artifacts: temp.path().join("artifacts"),
-            },
-        )
-        .expect("lab run");
+        let result =
+            run_lab_scenario(&scenario_path, LabRunOptions { artifacts }).expect("lab run");
         let report: Report = serde_json::from_value(
             read_json(PathBuf::from(&result.pipeline_run_dir).join("report.json"))
                 .expect("report json"),
@@ -3233,6 +3518,7 @@ data_sources:
     #[test]
     fn lab_batch_and_summary_use_lab_index() {
         let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
         let scenario_path = repo_root()
             .join("examples")
             .join("scenarios")

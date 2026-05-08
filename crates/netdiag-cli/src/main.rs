@@ -347,6 +347,18 @@ fn run(args: Args) -> anyhow::Result<()> {
             let ingest = ingest_trace(&file).with_context(|| {
                 format!("trace ingest validation failed for {}", file.display())
             })?;
+            let temp = tempfile::tempdir().context("failed to create validate-trace tempdir")?;
+            let pipeline = diagnose_file(&file, temp.path(), None).with_context(|| {
+                format!("trace pipeline validation failed for {}", file.display())
+            })?;
+            let ml_top = pipeline.report.rule_vs_ml.ml_top.clone();
+            let ml_top_prob = pipeline.report.rule_vs_ml.ml_top_prob;
+            let root_causes = pipeline
+                .report
+                .root_causes
+                .iter()
+                .map(|root| root.symptom.clone())
+                .collect::<Vec<_>>();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -355,6 +367,14 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "rows": ingest.schema.rows,
                     "sample": ingest.schema.sample,
                     "warnings": ingest.warnings,
+                    "pipeline": {
+                        "run_id": pipeline.run_id,
+                        "root_causes": root_causes,
+                        "ml_top": ml_top,
+                        "ml_top_prob": ml_top_prob,
+                        "model_manifest_hash": pipeline.report.model_manifest_hash,
+                        "model_file_hash": pipeline.report.model_file_hash,
+                    },
                 }))?
             );
         }
@@ -931,7 +951,7 @@ fn _core_result<T>(value: CoreResult<T>) -> CoreResult<T> {
 mod tests {
     use super::*;
     use netdiag_core::ingest::ingest_trace;
-    use netdiag_core::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME};
+    use netdiag_core::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, train_model_from_jsonl};
     use netdiag_core::models::{HilState, ModelManifest};
     use netdiag_core::storage::list_run_history;
     use std::fs;
@@ -951,6 +971,28 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(path)
+    }
+
+    fn provision_test_model(artifacts: &std::path::Path) {
+        fs::create_dir_all(artifacts).expect("artifacts dir");
+        let dataset_path = artifacts.join("training.jsonl");
+        let mut dataset = fs::File::create(&dataset_path).expect("create dataset");
+        for name in [
+            "normal",
+            "congestion",
+            "random_loss",
+            "dns_failure",
+            "tls_failure",
+            "udp_quic_blocked",
+        ] {
+            let ingest = ingest_trace(sample(name)).expect("sample ingest");
+            let row = serde_json::json!({
+                "label": name,
+                "records": ingest.records,
+            });
+            writeln!(dataset, "{row}").expect("write training row");
+        }
+        train_model_from_jsonl(&dataset_path, artifacts.join("model")).expect("train model");
     }
 
     #[test]
@@ -1217,6 +1259,7 @@ mod tests {
     #[test]
     fn lab_run_command_writes_acceptance_artifact() {
         let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
         let scenario = repo_file("examples/scenarios/lab-congestion-001.yaml");
         let preflight_args = Args::parse_from([
             "netdiag",
@@ -1272,5 +1315,11 @@ mod tests {
             path_str(temp.path()),
         ]);
         run(summary_args).expect("lab summary");
+    }
+
+    #[test]
+    fn validate_trace_runs_full_pipeline_smoke() {
+        let args = Args::parse_from(["netdiag", "validate-trace", path_str(&sample("congestion"))]);
+        run(args).expect("validate trace");
     }
 }

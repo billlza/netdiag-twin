@@ -77,15 +77,11 @@ pub fn export_evidence_bundle(
         }
         add_artifact_file(&mut zip, options, artifact, &mut manifest, &mut used_paths)?;
     }
-    let default_extra_files = if extra_files.is_empty() {
-        location
-            .lab_run_dir
-            .as_deref()
-            .map(default_lab_extra_files)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let default_extra_files = location
+        .lab_run_dir
+        .as_deref()
+        .map(default_lab_extra_files)
+        .unwrap_or_default();
     for extra in default_extra_files.iter().chain(extra_files.iter()) {
         add_path_file(
             &mut zip,

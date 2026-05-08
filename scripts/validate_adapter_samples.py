@@ -9,6 +9,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    from jsonschema import Draft202012Validator, FormatChecker
+except ImportError as error:
+    raise SystemExit(
+        "missing dependency: install jsonschema to validate adapter samples"
+    ) from error
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "examples/adapters/schema/netdiag-adapter-payload.schema.json"
@@ -23,6 +30,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    assert_schema_keyword_coverage()
     failed = False
 
     with tempfile.TemporaryDirectory(prefix="netdiag-adapters-") as tmp:
@@ -35,8 +44,7 @@ def main() -> int:
                 failed = True
                 continue
 
-            errors: list[str] = []
-            validate(payload, schema, "$", errors)
+            errors = validation_errors(validator, payload)
             if errors:
                 failed = True
                 print(f"{name}: schema validation failed", file=sys.stderr)
@@ -112,103 +120,36 @@ def validate_rust_ingest(sample_path: Path) -> None:
         raise RuntimeError(detail)
 
 
-def validate(instance: Any, schema: dict[str, Any], path: str, errors: list[str]) -> None:
-    if "const" in schema and instance != schema["const"]:
-        errors.append(f"{path}: expected const {schema['const']!r}, got {instance!r}")
-
-    expected_type = schema.get("type")
-    if expected_type and not matches_type(instance, expected_type):
-        errors.append(f"{path}: expected {expected_type}, got {type_name(instance)}")
-        return
-
-    if isinstance(instance, dict):
-        validate_object(instance, schema, path, errors)
-    elif isinstance(instance, list):
-        validate_array(instance, schema, path, errors)
-    elif isinstance(instance, str):
-        min_length = schema.get("minLength")
-        if min_length is not None and len(instance) < min_length:
-            errors.append(f"{path}: length must be at least {min_length}")
-
-    if is_json_number(instance):
-        minimum = schema.get("minimum")
-        if minimum is not None and instance < minimum:
-            errors.append(f"{path}: value must be >= {minimum}")
+def validation_errors(validator: Draft202012Validator, instance: Any) -> list[str]:
+    return [
+        f"{error.json_path}: {error.message}"
+        for error in sorted(validator.iter_errors(instance), key=lambda item: item.json_path)
+    ]
 
 
-def validate_object(
-    instance: dict[str, Any], schema: dict[str, Any], path: str, errors: list[str]
-) -> None:
-    for key in schema.get("required", []):
-        if key not in instance:
-            errors.append(f"{path}: missing required property {key!r}")
-
-    properties = schema.get("properties", {})
-    for key, child_schema in properties.items():
-        if key in instance:
-            validate(instance[key], child_schema, f"{path}.{key}", errors)
-
-    additional_properties = schema.get("additionalProperties", True)
-    if additional_properties is False:
-        unexpected = sorted(set(instance) - set(properties))
-        for key in unexpected:
-            errors.append(f"{path}: unexpected property {key!r}")
-    elif isinstance(additional_properties, dict):
-        for key in sorted(set(instance) - set(properties)):
-            validate(instance[key], additional_properties, f"{path}.{key}", errors)
-
-
-def validate_array(
-    instance: list[Any], schema: dict[str, Any], path: str, errors: list[str]
-) -> None:
-    min_items = schema.get("minItems")
-    if min_items is not None and len(instance) < min_items:
-        errors.append(f"{path}: expected at least {min_items} item(s)")
-
-    item_schema = schema.get("items")
-    if item_schema:
-        for index, item in enumerate(instance):
-            validate(item, item_schema, f"{path}[{index}]", errors)
-
-
-def matches_type(instance: Any, expected_type: str) -> bool:
-    if expected_type == "object":
-        return isinstance(instance, dict)
-    if expected_type == "array":
-        return isinstance(instance, list)
-    if expected_type == "string":
-        return isinstance(instance, str)
-    if expected_type == "integer":
-        return isinstance(instance, int) and not isinstance(instance, bool)
-    if expected_type == "number":
-        return is_json_number(instance)
-    if expected_type == "boolean":
-        return isinstance(instance, bool)
-    if expected_type == "null":
-        return instance is None
-    raise ValueError(f"unsupported schema type: {expected_type}")
-
-
-def is_json_number(instance: Any) -> bool:
-    return isinstance(instance, (int, float)) and not isinstance(instance, bool)
-
-
-def type_name(instance: Any) -> str:
-    if instance is None:
-        return "null"
-    if isinstance(instance, bool):
-        return "boolean"
-    if isinstance(instance, dict):
-        return "object"
-    if isinstance(instance, list):
-        return "array"
-    if isinstance(instance, str):
-        return "string"
-    if isinstance(instance, int):
-        return "integer"
-    if isinstance(instance, float):
-        return "number"
-    return type(instance).__name__
+def assert_schema_keyword_coverage() -> None:
+    cases: list[tuple[str, dict[str, Any], Any]] = [
+        ("enum", {"enum": ["ok"]}, "bad"),
+        ("format", {"type": "string", "format": "date-time"}, "not-a-timestamp"),
+        ("pattern", {"type": "string", "pattern": "^ok$"}, "bad"),
+        ("oneOf", {"oneOf": [{"const": "a"}, {"const": "b"}]}, "c"),
+        ("anyOf", {"anyOf": [{"const": "a"}, {"const": "b"}]}, "c"),
+        ("maximum", {"type": "number", "maximum": 1}, 2),
+        ("exclusiveMinimum", {"type": "number", "exclusiveMinimum": 0}, 0),
+        (
+            "prefixItems",
+            {
+                "type": "array",
+                "prefixItems": [{"type": "string"}, {"type": "integer"}],
+                "items": False,
+            },
+            ["ok", "bad"],
+        ),
+    ]
+    for name, schema, instance in cases:
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        if not list(validator.iter_errors(instance)):
+            raise AssertionError(f"schema keyword self-test did not fail for {name}")
 
 
 if __name__ == "__main__":

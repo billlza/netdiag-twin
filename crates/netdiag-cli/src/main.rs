@@ -15,7 +15,7 @@ use netdiag_core::evidence_bundle::export_evidence_bundle;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
     LabPreflightMode, LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_batch,
-    run_lab_scenario, summarize_lab_runs, validate_lab_run,
+    run_lab_scenario, summarize_lab_runs, validate_lab_run, verify_action,
 };
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
@@ -253,6 +253,15 @@ enum LabCommand {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
+    VerifyAction {
+        before_run_id: String,
+        #[arg(long)]
+        after: String,
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        #[arg(long)]
+        recommendation_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -374,6 +383,8 @@ fn run(args: Args) -> anyhow::Result<()> {
                         "ml_top_prob": ml_top_prob,
                         "model_manifest_hash": pipeline.report.model_manifest_hash,
                         "model_file_hash": pipeline.report.model_file_hash,
+                        "diagnosis_status": pipeline.report.diagnosis_status,
+                        "uncertainty": pipeline.report.uncertainty,
                     },
                 }))?
             );
@@ -491,6 +502,23 @@ fn run(args: Args) -> anyhow::Result<()> {
                     .with_context(|| format!("lab summary failed for {}", artifacts.display()))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
+            LabCommand::VerifyAction {
+                before_run_id,
+                after,
+                artifacts,
+                recommendation_id,
+            } => {
+                let verification = verify_action(
+                    &artifacts,
+                    &before_run_id,
+                    &after,
+                    recommendation_id.as_deref(),
+                )
+                .with_context(|| {
+                    format!("lab action verification failed for {before_run_id} -> {after}")
+                })?;
+                println!("{}", serde_json::to_string_pretty(&verification)?);
+            }
         },
         Command::Dataset { command } => match command {
             DatasetCommand::Inspect { dataset } => {
@@ -593,6 +621,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         } => {
             let manifest = export_evidence_bundle(&artifacts, &run_id, &output, &[])
                 .with_context(|| format!("evidence bundle failed for {run_id}"))?;
+            let location = resolve_run_location(&artifacts, &run_id)?;
+            save_json(location.run_dir.join("evidence_bundle.json"), &manifest)?;
             println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
         Command::Export { run_id, artifacts } => {
@@ -669,6 +699,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "training_config": manifest.training_config,
                     "training_gate": manifest.training_gate,
                     "evaluation": manifest.evaluation,
+                    "uncertainty_thresholds": manifest.uncertainty_thresholds,
                 }))?
             );
         }
@@ -715,6 +746,8 @@ fn run(args: Args) -> anyhow::Result<()> {
                     "reviewed_at": outcome.review.reviewed_at,
                     "final_label": outcome.review.final_label,
                     "status": outcome.status,
+                    "evidence_bundle_stale": outcome.evidence_bundle_stale,
+                    "next_step": outcome.next_step,
                 }))?
             );
         }

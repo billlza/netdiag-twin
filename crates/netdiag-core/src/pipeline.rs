@@ -139,7 +139,8 @@ fn diagnose_ingest_with_whatif_and_model_dir_with_policy(
             run_simulated_whatif_with_policy(&telemetry.overall, &request.topology, &request.action)
         })
         .transpose()?;
-    let recommendations = recommend_actions(&diagnosis_events, what_if.as_ref());
+    let recommendations =
+        recommend_actions(&diagnosis_events, what_if.as_ref(), &ml_result.uncertainty);
     let report = render_report(
         &run_id,
         &telemetry,

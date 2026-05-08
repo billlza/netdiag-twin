@@ -1,10 +1,10 @@
 use crate::dataset::{DatasetValidationOptions, validate_dataset_jsonl_with_options};
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::{
-    FaultLabel, FeatureImportance, HilFeedbackRecord, HilState, LabelMetrics, MetricProvenance,
-    MetricQuality, MlResult, ModelEvaluation, ModelManifest, ModelTrainingConfig,
-    ModelTrainingGate, Prediction, Recommendation, RecommendationKind, TelemetryWindow,
-    TraceRecord,
+    DiagnosisStatus, FaultLabel, FeatureBounds, FeatureImportance, HilFeedbackRecord, HilState,
+    LabelMetrics, MetricProvenance, MetricQuality, MlResult, ModelEvaluation, ModelManifest,
+    ModelTrainingConfig, ModelTrainingGate, ModelUncertaintyThresholds, Prediction, Recommendation,
+    RecommendationKind, TelemetryWindow, TraceRecord, UncertaintyAssessment,
 };
 use crate::report::Report;
 use crate::storage::{list_run_locations, read_json, save_json_atomic};
@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 pub const MODEL_FILE_NAME: &str = "rust_logistic_model.json";
 pub const MODEL_MANIFEST_FILE_NAME: &str = "model_manifest.json";
@@ -56,6 +57,22 @@ pub struct RustMlModel {
     pub means: Vec<f64>,
     pub stds: Vec<f64>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelCacheKey {
+    canonical_dir: PathBuf,
+    manifest_hash: Option<String>,
+    model_file_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct ModelCacheEntry {
+    key: ModelCacheKey,
+    model: RustMlModel,
+}
+
+static MODEL_CACHE: OnceLock<Mutex<Vec<ModelCacheEntry>>> = OnceLock::new();
+const MODEL_CACHE_CAPACITY: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TrainingOptions {
@@ -204,19 +221,27 @@ pub fn infer_with_quality_from_model_dir_with_policy(
     let classes = model.model.classes().to_vec();
     let calibrated =
         calibrate_probabilities(probabilities.row(0).to_vec(), &classes, &weighted_features);
-    let mut ranking: Vec<Prediction> = calibrated
-        .iter()
-        .enumerate()
-        .map(|(idx, prob)| Prediction {
-            label: classes
-                .get(idx)
-                .copied()
-                .map(FaultLabel::from_index)
-                .unwrap_or(FaultLabel::Normal),
-            prob: *prob,
-        })
-        .collect();
+    let mut ranking = Vec::with_capacity(calibrated.len());
+    for (idx, prob) in calibrated.iter().enumerate() {
+        let class_index = classes.get(idx).copied().ok_or_else(|| {
+            NetdiagError::Ml(format!(
+                "model returned probability index {idx} without a matching class"
+            ))
+        })?;
+        let label = FaultLabel::from_index(class_index).ok_or_else(|| {
+            NetdiagError::Ml(format!(
+                "model returned unknown class index {class_index}; expected one of the six known labels"
+            ))
+        })?;
+        ranking.push(Prediction { label, prob: *prob });
+    }
     ranking.sort_by(|left, right| right.prob.total_cmp(&left.prob));
+    let uncertainty = assess_uncertainty(
+        &ranking,
+        &weighted_features,
+        &scaled,
+        model_manifest.as_ref(),
+    );
 
     let top_class_position = ranking
         .first()
@@ -255,6 +280,7 @@ pub fn infer_with_quality_from_model_dir_with_policy(
         top_features: top_features.into_iter().take(5).collect(),
         features,
         feature_quality,
+        uncertainty,
         model_manifest,
         model_manifest_hash,
         model_file_hash,
@@ -318,6 +344,116 @@ fn feature_metric(feature: &str) -> &'static str {
     }
 }
 
+fn assess_uncertainty(
+    ranking: &[Prediction],
+    weighted_features: &[f64],
+    scaled_features: &[f64],
+    manifest: Option<&ModelManifest>,
+) -> UncertaintyAssessment {
+    let thresholds = manifest
+        .and_then(|manifest| manifest.uncertainty_thresholds.clone())
+        .unwrap_or_default();
+    let max_probability = ranking
+        .first()
+        .map(|prediction| prediction.prob)
+        .unwrap_or(0.0);
+    let second_probability = ranking
+        .get(1)
+        .map(|prediction| prediction.prob)
+        .unwrap_or(0.0);
+    let probability_margin = max_probability - second_probability;
+    let entropy = normalized_entropy(ranking.iter().map(|prediction| prediction.prob));
+    let feature_distance = scaled_features
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let mut feature_bounds_violations = Vec::new();
+    for (idx, feature) in FEATURES.iter().enumerate() {
+        let Some(bounds) = thresholds.feature_bounds.get(*feature) else {
+            continue;
+        };
+        let Some(value) = weighted_features.get(idx).copied() else {
+            continue;
+        };
+        if value < bounds.min || value > bounds.max {
+            feature_bounds_violations.push(format!(
+                "{feature}={:.4} outside [{:.4}, {:.4}]",
+                value, bounds.min, bounds.max
+            ));
+        }
+    }
+
+    let mut reasons = Vec::new();
+    let status = if !feature_bounds_violations.is_empty()
+        || feature_distance > thresholds.max_feature_distance
+    {
+        if !feature_bounds_violations.is_empty() {
+            reasons
+                .push("one or more features are outside the model training envelope".to_string());
+        }
+        if feature_distance > thresholds.max_feature_distance {
+            reasons.push(format!(
+                "feature distance {:.4} exceeds threshold {:.4}",
+                feature_distance, thresholds.max_feature_distance
+            ));
+        }
+        DiagnosisStatus::OutOfDistribution
+    } else if max_probability < thresholds.min_max_probability
+        || probability_margin < thresholds.min_probability_margin
+        || entropy > thresholds.max_entropy
+    {
+        if max_probability < thresholds.min_max_probability {
+            reasons.push(format!(
+                "max probability {:.4} is below threshold {:.4}",
+                max_probability, thresholds.min_max_probability
+            ));
+        }
+        if probability_margin < thresholds.min_probability_margin {
+            reasons.push(format!(
+                "probability margin {:.4} is below threshold {:.4}",
+                probability_margin, thresholds.min_probability_margin
+            ));
+        }
+        if entropy > thresholds.max_entropy {
+            reasons.push(format!(
+                "entropy {:.4} exceeds threshold {:.4}",
+                entropy, thresholds.max_entropy
+            ));
+        }
+        DiagnosisStatus::Uncertain
+    } else {
+        reasons.push(
+            "prediction is inside the model training envelope with sufficient confidence"
+                .to_string(),
+        );
+        DiagnosisStatus::Known
+    };
+
+    UncertaintyAssessment {
+        max_probability: round4(max_probability),
+        probability_margin: round4(probability_margin),
+        entropy: round4(entropy),
+        feature_distance: round4(feature_distance),
+        feature_bounds_violations,
+        status,
+        reasons,
+    }
+}
+
+fn normalized_entropy(probabilities: impl Iterator<Item = f64>) -> f64 {
+    let probs = probabilities.collect::<Vec<_>>();
+    if probs.len() <= 1 {
+        return 0.0;
+    }
+    let entropy = probs
+        .iter()
+        .filter(|prob| **prob > 0.0 && prob.is_finite())
+        .map(|prob| -prob * prob.ln())
+        .sum::<f64>();
+    entropy / (probs.len() as f64).ln()
+}
+
 pub fn load_or_train_model(model_dir: &Path) -> Result<RustMlModel> {
     load_model_with_policy(model_dir, ModelLoadPolicy::AllowSyntheticFallback)
 }
@@ -330,6 +466,12 @@ fn load_model_with_policy(model_dir: &Path, load_policy: ModelLoadPolicy) -> Res
     let model_path = model_dir.join(MODEL_FILE_NAME);
     let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
     if model_path.exists() {
+        let cache_key = model_cache_key(model_dir, &model_path, &manifest_path)?;
+        if let Some(model) = lookup_model_cache(&cache_key) {
+            validate_model_structure(&model)?;
+            validate_or_create_manifest(model_dir, &manifest_path, &model, load_policy)?;
+            return Ok(model);
+        }
         let file = File::open(&model_path).with_path(&model_path)?;
         let reader = BufReader::new(file);
         let model = serde_json::from_reader::<_, RustMlModel>(reader).map_err(|err| {
@@ -339,26 +481,11 @@ fn load_model_with_policy(model_dir: &Path, load_policy: ModelLoadPolicy) -> Res
             ))
         })?;
         validate_model_structure(&model)?;
-        if manifest_path.exists() {
-            let manifest: ModelManifest = serde_json::from_value(read_json(&manifest_path)?)?;
-            validate_model_manifest(&manifest, &model)?;
-        } else if load_policy == ModelLoadPolicy::ExistingOnly {
-            return Err(NetdiagError::Ml(format!(
-                "model manifest {} is missing; train or provision a complete model bundle before running lab diagnostics",
-                manifest_path.display()
-            )));
-        } else {
-            let manifest = build_model_manifest(
-                "cached_existing_model",
-                0,
-                BTreeMap::new(),
-                false,
-                &model,
-                None,
-                None,
-            );
-            save_json_atomic(&manifest_path, &manifest)?;
-        }
+        validate_or_create_manifest(model_dir, &manifest_path, &model, load_policy)?;
+        insert_model_cache(
+            model_cache_key(model_dir, &model_path, &manifest_path)?,
+            &model,
+        );
         return Ok(model);
     }
 
@@ -370,23 +497,119 @@ fn load_model_with_policy(model_dir: &Path, load_policy: ModelLoadPolicy) -> Res
     }
 
     std::fs::create_dir_all(model_dir).with_path(model_dir)?;
-    let model = train_default_model()?;
+    let rows = synthetic_training_rows();
+    let model = train_model_from_feature_rows(&rows)?;
     let manifest = build_model_manifest(
-        "synthetic_fallback",
-        BASELINES.len() * 130,
-        synthetic_label_distribution(130),
-        true,
         &model,
-        None,
-        Some(ModelTrainingConfig {
-            validation_split: 0.0,
-            shuffle_seed: Some(2026),
-            stratified: false,
-            min_rows_per_label: 0,
-        }),
-    );
+        ModelManifestBuild {
+            training_source: "synthetic_fallback".to_string(),
+            training_examples: BASELINES.len() * 130,
+            label_distribution: synthetic_label_distribution(130),
+            synthetic_fallback: true,
+            dataset_hash_sha256: None,
+            training_config: Some(ModelTrainingConfig {
+                validation_split: 0.0,
+                shuffle_seed: Some(2026),
+                stratified: false,
+                min_rows_per_label: 0,
+            }),
+            uncertainty_thresholds: Some(uncertainty_thresholds_from_rows(&rows, &model)?),
+        },
+    )?;
     write_model_bundle(model_dir, &model, &manifest)?;
+    insert_model_cache(
+        model_cache_key(model_dir, &model_path, &manifest_path)?,
+        &model,
+    );
     Ok(model)
+}
+
+fn validate_or_create_manifest(
+    model_dir: &Path,
+    manifest_path: &Path,
+    model: &RustMlModel,
+    load_policy: ModelLoadPolicy,
+) -> Result<()> {
+    if manifest_path.exists() {
+        let manifest: ModelManifest = serde_json::from_value(read_json(manifest_path)?)?;
+        validate_model_manifest(&manifest, model)?;
+    } else if load_policy == ModelLoadPolicy::ExistingOnly {
+        return Err(NetdiagError::Ml(format!(
+            "model manifest {} is missing; train or provision a complete model bundle before running lab diagnostics",
+            manifest_path.display()
+        )));
+    } else {
+        let manifest = build_model_manifest(
+            model,
+            ModelManifestBuild {
+                training_source: "cached_existing_model".to_string(),
+                training_examples: 0,
+                label_distribution: BTreeMap::new(),
+                synthetic_fallback: false,
+                dataset_hash_sha256: None,
+                training_config: None,
+                uncertainty_thresholds: None,
+            },
+        )?;
+        save_json_atomic(model_dir.join(MODEL_MANIFEST_FILE_NAME), &manifest)?;
+    }
+    Ok(())
+}
+
+fn model_cache_key(
+    model_dir: &Path,
+    model_path: &Path,
+    manifest_path: &Path,
+) -> Result<ModelCacheKey> {
+    Ok(ModelCacheKey {
+        canonical_dir: canonical_model_dir(model_dir)?,
+        manifest_hash: manifest_path
+            .exists()
+            .then(|| sha256_file(manifest_path))
+            .transpose()?,
+        model_file_hash: sha256_file(model_path)?,
+    })
+}
+
+fn canonical_model_dir(model_dir: &Path) -> Result<PathBuf> {
+    if let Ok(path) = model_dir.canonicalize() {
+        return Ok(path);
+    }
+    if model_dir.is_absolute() {
+        Ok(model_dir.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .map_err(|err| NetdiagError::Ml(format!("could not resolve current directory: {err}")))?
+            .join(model_dir))
+    }
+}
+
+fn lookup_model_cache(key: &ModelCacheKey) -> Option<RustMlModel> {
+    let cache = MODEL_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut cache = cache.lock().ok()?;
+    let index = cache.iter().position(|entry| &entry.key == key)?;
+    let entry = cache.remove(index);
+    let model = entry.model.clone();
+    cache.insert(0, entry);
+    Some(model)
+}
+
+fn insert_model_cache(key: ModelCacheKey, model: &RustMlModel) {
+    let cache = MODEL_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    cache.retain(|entry| entry.key != key);
+    cache.insert(
+        0,
+        ModelCacheEntry {
+            key,
+            model: model.clone(),
+        },
+    );
+    if cache.len() > MODEL_CACHE_CAPACITY {
+        cache.truncate(MODEL_CACHE_CAPACITY);
+    }
 }
 
 pub fn train_model_from_jsonl(
@@ -477,19 +700,22 @@ pub fn train_model_from_jsonl_with_options(
         Some(evaluate_model(&model, &validation_rows, &dataset_labels)?)
     };
     let mut manifest = build_model_manifest(
-        format!("jsonl:{}", dataset_path.display()),
-        training_rows.len(),
-        label_distribution(&training_rows),
-        false,
         &model,
-        Some(dataset_hash),
-        Some(ModelTrainingConfig {
-            validation_split: options.validation_split,
-            shuffle_seed: options.shuffle_seed,
-            stratified: options.stratified,
-            min_rows_per_label: options.min_rows_per_label,
-        }),
-    );
+        ModelManifestBuild {
+            training_source: format!("jsonl:{}", dataset_path.display()),
+            training_examples: training_rows.len(),
+            label_distribution: label_distribution(&training_rows),
+            synthetic_fallback: false,
+            dataset_hash_sha256: Some(dataset_hash),
+            training_config: Some(ModelTrainingConfig {
+                validation_split: options.validation_split,
+                shuffle_seed: options.shuffle_seed,
+                stratified: options.stratified,
+                min_rows_per_label: options.min_rows_per_label,
+            }),
+            uncertainty_thresholds: Some(uncertainty_thresholds_from_rows(&training_rows, &model)?),
+        },
+    )?;
     manifest.evaluation = evaluation;
     manifest.training_gate = Some(gate);
     write_model_bundle(model_dir, &model, &manifest)?;
@@ -558,10 +784,14 @@ pub fn export_feedback_training_dataset(
     })
 }
 
+#[cfg(test)]
 fn train_default_model() -> Result<RustMlModel> {
+    train_model_from_feature_rows(&synthetic_training_rows())
+}
+
+fn synthetic_training_rows() -> Vec<FeatureTrainingRow> {
     let mut rng = StdRng::seed_from_u64(2026);
     let mut rows = Vec::new();
-    let mut targets = Vec::new();
 
     for (label_idx, baseline) in BASELINES.iter().enumerate() {
         for _ in 0..130 {
@@ -575,12 +805,15 @@ fn train_default_model() -> Result<RustMlModel> {
                         .max(0.0)
                 })
                 .collect();
-            rows.push(row);
-            targets.push(label_idx);
+            rows.push(FeatureTrainingRow {
+                label: FaultLabel::from_index(label_idx)
+                    .expect("synthetic baseline indexes are aligned with FaultLabel::ALL"),
+                features: row,
+            });
         }
     }
 
-    fit_model(&rows, &targets)
+    rows
 }
 
 fn train_model_from_feature_rows(rows: &[FeatureTrainingRow]) -> Result<RustMlModel> {
@@ -789,11 +1022,16 @@ fn predict_label(model: &RustMlModel, features: &[f64]) -> Result<FaultLabel> {
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .map(|(idx, _)| idx)
         .unwrap_or(0);
-    Ok(classes
-        .get(best_idx)
-        .copied()
-        .map(FaultLabel::from_index)
-        .unwrap_or(FaultLabel::Normal))
+    let class_index = classes.get(best_idx).copied().ok_or_else(|| {
+        NetdiagError::Ml(format!(
+            "model returned probability index {best_idx} without a matching class"
+        ))
+    })?;
+    FaultLabel::from_index(class_index).ok_or_else(|| {
+        NetdiagError::Ml(format!(
+            "model returned unknown class index {class_index}; expected one of the six known labels"
+        ))
+    })
 }
 
 fn dense_confusion_matrix() -> BTreeMap<String, BTreeMap<String, usize>> {
@@ -997,40 +1235,98 @@ fn write_model_bundle(
     Ok(())
 }
 
-fn build_model_manifest(
-    training_source: impl Into<String>,
+struct ModelManifestBuild {
+    training_source: String,
     training_examples: usize,
     label_distribution: BTreeMap<String, usize>,
     synthetic_fallback: bool,
-    model: &RustMlModel,
     dataset_hash_sha256: Option<String>,
     training_config: Option<ModelTrainingConfig>,
-) -> ModelManifest {
-    ModelManifest {
+    uncertainty_thresholds: Option<ModelUncertaintyThresholds>,
+}
+
+fn build_model_manifest(model: &RustMlModel, build: ModelManifestBuild) -> Result<ModelManifest> {
+    Ok(ModelManifest {
         schema_version: "netdiag-model-manifest/v1".to_string(),
         model_name: "netdiag_fault_classifier".to_string(),
         model_kind: "linfa_multinomial_logistic_regression".to_string(),
         created_at: Utc::now(),
-        training_source: training_source.into(),
-        dataset_hash_sha256,
+        training_source: build.training_source,
+        dataset_hash_sha256: build.dataset_hash_sha256,
         dataset_id: None,
         dataset_manifest_hash_sha256: None,
         model_file: MODEL_FILE_NAME.to_string(),
         feature_names: FEATURES.iter().map(|name| (*name).to_string()).collect(),
-        labels: model
-            .model
-            .classes()
-            .iter()
-            .map(|class| FaultLabel::from_index(*class).as_str().to_string())
-            .collect(),
-        training_examples,
-        label_distribution,
+        labels: class_labels(model)?,
+        training_examples: build.training_examples,
+        label_distribution: build.label_distribution,
         feature_count: FEATURES.len(),
-        synthetic_fallback,
-        training_config,
+        synthetic_fallback: build.synthetic_fallback,
+        training_config: build.training_config,
         evaluation: None,
         training_gate: None,
+        uncertainty_thresholds: build.uncertainty_thresholds,
+    })
+}
+
+fn class_labels(model: &RustMlModel) -> Result<Vec<String>> {
+    model
+        .model
+        .classes()
+        .iter()
+        .map(|class| {
+            FaultLabel::from_index(*class)
+                .map(|label| label.as_str().to_string())
+                .ok_or_else(|| {
+                    NetdiagError::Ml(format!(
+                        "model manifest cannot represent unknown class index {class}"
+                    ))
+                })
+        })
+        .collect()
+}
+
+fn uncertainty_thresholds_from_rows(
+    rows: &[FeatureTrainingRow],
+    model: &RustMlModel,
+) -> Result<ModelUncertaintyThresholds> {
+    let mut thresholds = ModelUncertaintyThresholds::default();
+    if rows.is_empty() {
+        return Ok(thresholds);
     }
+
+    let mut max_distance = 0.0_f64;
+    for row in rows {
+        let scaled = scale_row(&row.features, &model.means, &model.stds)?;
+        max_distance =
+            max_distance.max(scaled.iter().map(|value| value * value).sum::<f64>().sqrt());
+    }
+    thresholds.max_feature_distance = (max_distance * 2.5).max(8.0);
+
+    for (idx, feature) in FEATURES.iter().enumerate() {
+        let min = rows
+            .iter()
+            .map(|row| row.features[idx])
+            .fold(f64::INFINITY, f64::min);
+        let max = rows
+            .iter()
+            .map(|row| row.features[idx])
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !min.is_finite() || !max.is_finite() {
+            continue;
+        }
+        let span = (max - min).abs();
+        let padding = (span * 0.25).max(model.stds.get(idx).copied().unwrap_or(1.0) * 4.0);
+        thresholds.feature_bounds.insert(
+            (*feature).to_string(),
+            FeatureBounds {
+                min: (min - padding).max(0.0),
+                max: max + padding,
+            },
+        );
+    }
+
+    Ok(thresholds)
 }
 
 fn label_distribution(rows: &[FeatureTrainingRow]) -> BTreeMap<String, usize> {
@@ -1242,12 +1538,7 @@ fn validate_model_manifest(manifest: &ModelManifest, model: &RustMlModel) -> Res
             "model manifest feature_names do not match inference features".to_string(),
         ));
     }
-    let expected_labels = model
-        .model
-        .classes()
-        .iter()
-        .map(|class| FaultLabel::from_index(*class).as_str().to_string())
-        .collect::<Vec<_>>();
+    let expected_labels = class_labels(model)?;
     if manifest.labels != expected_labels {
         return Err(NetdiagError::Ml(
             "model manifest labels do not match cached model classes".to_string(),
@@ -1389,6 +1680,83 @@ mod tests {
     }
 
     #[test]
+    fn diagnosis_status_serializes_as_standalone_status() {
+        assert_eq!(
+            serde_json::to_string(&DiagnosisStatus::OutOfDistribution).expect("json"),
+            "\"out_of_distribution\""
+        );
+    }
+
+    #[test]
+    fn uncertainty_marks_confident_in_domain_prediction_known() {
+        let assessment = assess_uncertainty(
+            &[
+                Prediction {
+                    label: FaultLabel::Congestion,
+                    prob: 0.91,
+                },
+                Prediction {
+                    label: FaultLabel::Normal,
+                    prob: 0.04,
+                },
+            ],
+            &vec![1.0; FEATURES.len()],
+            &vec![0.0; FEATURES.len()],
+            None,
+        );
+
+        assert_eq!(assessment.status, DiagnosisStatus::Known);
+    }
+
+    #[test]
+    fn uncertainty_marks_low_confidence_prediction_uncertain() {
+        let assessment = assess_uncertainty(
+            &[
+                Prediction {
+                    label: FaultLabel::Normal,
+                    prob: 0.32,
+                },
+                Prediction {
+                    label: FaultLabel::Congestion,
+                    prob: 0.30,
+                },
+                Prediction {
+                    label: FaultLabel::RandomLoss,
+                    prob: 0.20,
+                },
+            ],
+            &vec![1.0; FEATURES.len()],
+            &vec![0.0; FEATURES.len()],
+            None,
+        );
+
+        assert_eq!(assessment.status, DiagnosisStatus::Uncertain);
+        assert!(
+            assessment
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("max probability")),
+            "{:?}",
+            assessment.reasons
+        );
+    }
+
+    #[test]
+    fn uncertainty_marks_extreme_feature_distance_ood() {
+        let assessment = assess_uncertainty(
+            &[Prediction {
+                label: FaultLabel::Normal,
+                prob: 0.99,
+            }],
+            &vec![1.0; FEATURES.len()],
+            &vec![9.0; FEATURES.len()],
+            None,
+        );
+
+        assert_eq!(assessment.status, DiagnosisStatus::OutOfDistribution);
+    }
+
+    #[test]
     fn stratified_split_keeps_each_label_in_training() {
         let mut rows = Vec::new();
         for label in FaultLabel::ALL {
@@ -1511,6 +1879,7 @@ mod tests {
         assert_eq!(gate.dataset_rows, FaultLabel::ALL.len() * 3);
         assert_eq!(gate.training_rows, FaultLabel::ALL.len() * 2);
         assert_eq!(gate.validation_rows, FaultLabel::ALL.len());
+        assert!(manifest.uncertainty_thresholds.is_some());
     }
 
     #[test]
@@ -1533,8 +1902,19 @@ mod tests {
         let model_dir = temp.path().join("model");
         std::fs::create_dir_all(&model_dir).expect("model dir");
         let model = train_default_model().expect("model");
-        let mut manifest =
-            build_model_manifest("test", 1, BTreeMap::new(), false, &model, None, None);
+        let mut manifest = build_model_manifest(
+            &model,
+            ModelManifestBuild {
+                training_source: "test".to_string(),
+                training_examples: 1,
+                label_distribution: BTreeMap::new(),
+                synthetic_fallback: false,
+                dataset_hash_sha256: None,
+                training_config: None,
+                uncertainty_thresholds: None,
+            },
+        )
+        .expect("manifest");
         manifest.feature_count = FEATURES.len() + 1;
         save_json_atomic(model_dir.join(MODEL_FILE_NAME), &model).expect("model json");
         save_json_atomic(model_dir.join(MODEL_MANIFEST_FILE_NAME), &manifest)

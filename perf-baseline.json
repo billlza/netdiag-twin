@@ -1,11 +1,16 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-01T03:07:43.750649Z",
+  "generated_at": "2026-05-08T08:35:49.414735Z",
   "threshold_percent": 15.0,
   "scenarios": {
     "artifact_write_large_10k": {
       "max_millis": 250.0,
       "rows": 10000,
+      "iterations": 1
+    },
+    "evidence_bundle_export_cached_run": {
+      "max_millis": 250.0,
+      "rows": 480,
       "iterations": 1
     },
     "ingest_six_samples": {

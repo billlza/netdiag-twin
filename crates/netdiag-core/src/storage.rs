@@ -640,6 +640,8 @@ pub struct HilReviewOutcome {
     pub review: HilReview,
     pub recommendations: Vec<Recommendation>,
     pub status: String,
+    pub evidence_bundle_stale: bool,
+    pub next_step: Option<String>,
 }
 
 pub fn review_recommendation(
@@ -686,12 +688,28 @@ pub fn review_recommendation(
         .to_string();
     update_run_index_status(&location.artifact_root, run_id, status.as_str())?;
     crate::lab::sync_lab_review_artifacts(&location, &recommendations)?;
+    let (evidence_bundle_stale, next_step) = evidence_bundle_staleness_after_review(&location);
 
     Ok(HilReviewOutcome {
         review,
         recommendations,
         status,
+        evidence_bundle_stale,
+        next_step,
     })
+}
+
+fn evidence_bundle_staleness_after_review(location: &RunLocation) -> (bool, Option<String>) {
+    if location.lab_run_dir.is_some() {
+        return (false, None);
+    }
+    if location.run_dir.join("evidence_bundle.json").exists() {
+        return (
+            true,
+            Some("run evidence-bundle again after review".to_string()),
+        );
+    }
+    (false, None)
 }
 
 pub fn write_feedback(

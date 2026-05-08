@@ -1,10 +1,12 @@
 use crate::models::{
-    DiagnosisEvent, FaultLabel, HilState, Recommendation, RecommendationKind, WhatIfResult,
+    DiagnosisEvent, DiagnosisStatus, FaultLabel, HilState, Recommendation, RecommendationKind,
+    UncertaintyAssessment, WhatIfResult,
 };
 
 pub fn recommend_actions(
     rule_events: &[DiagnosisEvent],
     whatif: Option<&WhatIfResult>,
+    uncertainty: &UncertaintyAssessment,
 ) -> Vec<Recommendation> {
     let mut recommendations = Vec::new();
     for event in rule_events {
@@ -20,10 +22,11 @@ pub fn recommend_actions(
             source_event_id: Some(event.event_id.clone()),
             what_if_action_id: None,
             diagnosis_symptom: Some(symptom),
-            recommended_action: action_for_symptom(symptom).to_string(),
-            expected_effect: expected_effect(symptom, whatif),
+            diagnosis_status: Some(uncertainty.status),
+            recommended_action: status_aware_action(symptom, uncertainty),
+            expected_effect: status_aware_expected_effect(symptom, whatif, uncertainty),
             risk_level: risk_for_symptom(symptom).to_string(),
-            confidence: (event.evidence.confidence * 0.9).clamp(0.0, 1.0),
+            confidence: confidence_for_status(event.evidence.confidence, uncertainty.status),
             recommendation_need_approval: true,
             hil_state: HilState::Unreviewed,
             review: None,
@@ -52,12 +55,14 @@ pub fn recommend_actions(
                 source_event_id: None,
                 what_if_action_id: Some(whatif.action_id.clone()),
                 diagnosis_symptom: None,
+                diagnosis_status: Some(uncertainty.status),
                 recommended_action: format!(
-                    "Execute what-if action: {} ({})",
+                    "Verify what-if action with before/after telemetry before execution: {} ({})",
                     whatif.action_id, whatif.action_notes
                 ),
-                expected_effect: "Expected latency/throughput changes validated in simulation."
-                    .to_string(),
+                expected_effect:
+                    "Simulation is advisory; use lab verify-action after the change to prove observed impact."
+                        .to_string(),
                 risk_level: whatif
                     .proposed
                     .get("qoe_risk")
@@ -72,6 +77,46 @@ pub fn recommend_actions(
         }
     }
     recommendations
+}
+
+fn confidence_for_status(confidence: f64, status: DiagnosisStatus) -> f64 {
+    let multiplier = match status {
+        DiagnosisStatus::Known => 0.9,
+        DiagnosisStatus::Uncertain => 0.55,
+        DiagnosisStatus::OutOfDistribution => 0.35,
+    };
+    (confidence * multiplier).clamp(0.0, 1.0)
+}
+
+fn status_aware_action(symptom: FaultLabel, uncertainty: &UncertaintyAssessment) -> String {
+    match uncertainty.status {
+        DiagnosisStatus::Known => action_for_symptom(symptom).to_string(),
+        DiagnosisStatus::Uncertain => format!(
+            "Treat {} as a candidate root cause and collect additional telemetry before remediation: {}",
+            symptom.as_str(),
+            action_for_symptom(symptom)
+        ),
+        DiagnosisStatus::OutOfDistribution => format!(
+            "Escalate as out-of-distribution telemetry; keep {} as a candidate only and gather independent evidence before remediation.",
+            symptom.as_str()
+        ),
+    }
+}
+
+fn status_aware_expected_effect(
+    symptom: FaultLabel,
+    whatif: Option<&WhatIfResult>,
+    uncertainty: &UncertaintyAssessment,
+) -> String {
+    match uncertainty.status {
+        DiagnosisStatus::Known => expected_effect(symptom, whatif),
+        DiagnosisStatus::Uncertain => {
+            "Needs evidence: repeat collection or add corroborating sources before treating this as a confirmed fix.".to_string()
+        }
+        DiagnosisStatus::OutOfDistribution => {
+            "Needs evidence: the model abstained because telemetry is outside its training envelope.".to_string()
+        }
+    }
 }
 
 fn risk_for_symptom(symptom: FaultLabel) -> &'static str {

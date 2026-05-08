@@ -1,8 +1,8 @@
 # NetDiag Twin
 
-## Rust-native telemetry diagnosis and digital-twin validation
+## Rust-native reliability diagnosis and digital-twin validation
 
-NetDiag Twin is now a pure Rust desktop application and CLI for telemetry-driven network diagnosis. It compares evidence-first rules with Rust ML inference, runs graph-backed what-if validation over a digital twin topology, and writes reproducible run artifacts for human review and run-to-run comparison.
+NetDiag Twin is a Rust desktop application and CLI for SRE/platform teams that need fast telemetry-driven incident triage, network regression gates, evidence packages for handoff, and post-action verification. It compares evidence-first rules with Rust ML inference, abstains when telemetry is uncertain or out of distribution, runs graph-backed what-if analysis over a digital twin topology, and writes reproducible run artifacts for human review and run-to-run comparison.
 
 ## Product Flow
 
@@ -12,6 +12,10 @@ NetDiag Twin is now a pure Rust desktop application and CLI for telemetry-driven
 4. Rule vs ML Comparison
 5. Digital Twin / Topology View
 6. Evidence Console / Recommendation Report
+
+Typical service reliability workflows include before/after deploy network
+regression checks, platform incident evidence bundles, and lab gates for
+adapter or telemetry-source changes.
 
 ## Rust Workspace
 
@@ -125,7 +129,15 @@ cargo run -p netdiag-cli -- whatif <run_id> line reroute_path_b
 cargo run -p netdiag-cli -- whatif-policy <run_id> \
   --topology examples/topologies/ring.yaml \
   --policy examples/policies/reroute-path-b.yaml
+cargo run -p netdiag-cli -- lab verify-action <before_run_id> \
+  --after <after_run_id> \
+  --artifacts artifacts \
+  --recommendation-id <recommendation_id>
 ```
+
+What-if output is advisory. `lab verify-action` is the closed-loop check that
+compares observed before/after telemetry and records whether latency, loss, or
+throughput actually improved without quality degradation.
 
 Export a saved report:
 
@@ -155,10 +167,20 @@ cargo run -p netdiag-cli -- review <run_id> <recommendation_id> --state accepted
 Run a reproducible lab scenario with typed acceptance gates:
 
 ```bash
+cargo run -p netdiag-cli -- train \
+  --dataset artifacts/datasets/lab-training.jsonl \
+  --model-dir artifacts/model \
+  --validation-split 0.2 \
+  --stratified \
+  --min-rows-per-label 5
+shasum -a 256 artifacts/model/model_manifest.json artifacts/model/rust_logistic_model.json
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab validate <run_id> --artifacts artifacts
 ```
+
+Copy the manifest/model hashes into the scenario acceptance block when the lab
+gate must be pinned to a specific model bundle.
 
 Validate topology and policy YAML before giving it to a lab run:
 
@@ -216,9 +238,10 @@ Runs are written to `artifacts/runs/<run_id>/`:
 - `hil_feedback.json` after human review
 - `report.json`
 
-The Rust ML model cache is generated under `artifacts/model/` when needed.
-Lab scenarios reuse this shared model cache; they do not create an implicit
-per-lab-run model under `artifacts/lab-runs/.../model/`.
+Regular diagnosis may create a deterministic synthetic model under
+`artifacts/model/` for local smoke runs. Lab scenarios are stricter: they require
+an existing complete model bundle and never create an implicit per-lab-run model
+under `artifacts/lab-runs/.../model/`.
 
 Lab runs are written to `artifacts/lab-runs/<scenario_id>/<timestamp>/` and
 indexed in `artifacts/lab_run_index.json`. They include `scenario.yaml`,

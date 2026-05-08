@@ -1,4 +1,5 @@
 use crate::error::{IoContext, NetdiagError, Result};
+use crate::evidence_bundle::export_evidence_bundle;
 use crate::ingest::ingest_trace;
 use crate::ml::{infer, load_or_train_model};
 use crate::models::{PerfBudget, PerfBudgetEntry, TraceRecord};
@@ -142,6 +143,22 @@ pub fn run_perf_measurements(artifact_root: impl AsRef<Path>) -> Result<Vec<Perf
                     Some(("line", "reroute_path_b")),
                 )?);
             }
+            Ok(())
+        },
+    )?);
+
+    let evidence_pipeline = diagnose_file(&sample_paths[0], &root, None)?;
+    measurements.push(measure(
+        "evidence_bundle_export_cached_run",
+        480,
+        1,
+        || {
+            black_box(export_evidence_bundle(
+                &root,
+                &evidence_pipeline.run_id,
+                root.join("perf-evidence.zip"),
+                &[],
+            )?);
             Ok(())
         },
     )?);
@@ -355,6 +372,7 @@ fn min_budget_millis(name: &str) -> f64 {
         "whatif_synthetic_100" => 25.0,
         "artifact_write_large_10k" => 250.0,
         "pipeline_six_samples_cached_model" => 2_500.0,
+        "evidence_bundle_export_cached_run" => 250.0,
         _ => 100.0,
     }
 }

@@ -17,8 +17,8 @@ flowchart LR
 
 ## Crates
 
-- `netdiag-core`: strongly typed domain model, CSV/JSON ingest, telemetry windows, connectors, rules, Rust ML, graph-backed what-if simulation, recommendations, JSON artifacts.
-- `netdiag-cli`: regression and batch interface for diagnosis, connector smoke, HIL review, what-if execution, and report export.
+- `netdiag-core`: strongly typed domain model, CSV/JSON ingest, telemetry windows, connectors, rules, Rust ML with uncertainty/OOD assessment, graph-backed what-if simulation, recommendations, JSON artifacts.
+- `netdiag-cli`: regression and batch interface for diagnosis, connector smoke, HIL review, what-if execution, closed-loop action verification, and report export.
 - `netdiag-app`: native `eframe/egui` desktop UI with six product views.
 
 ## Data Flow
@@ -26,6 +26,10 @@ flowchart LR
 - Input traces are normalized to canonical telemetry fields and grouped into five-second windows.
 - Live collection profiles support local/website probes, HTTP/JSON lab gateways, Prometheus `query_range`, and Prometheus text exposition.
 - Rules emit `EvidenceRecord` values with supporting metrics, counter-evidence, approval requirement, and HIL state.
-- Rust ML uses `linfa-logistic` with deterministic synthetic training data plus structured evidence calibration.
-- Digital Twin uses built-in or imported topology JSON with nodes, links, latency, loss, and capacity metadata.
+- Rust ML uses `linfa-logistic` with deterministic training metadata, model/file hashes, and uncertainty thresholds stored in `model_manifest.json`.
+- Digital Twin uses built-in or imported topology JSON with nodes, links, latency, loss, and capacity metadata. What-if output is advisory until `lab verify-action` compares before/after telemetry.
 - Reports and review state remain local JSON artifacts under `artifacts/runs/<run_id>/`.
+
+NetDiag is positioned for SRE/platform workflows as much as network engineering:
+incident triage, deploy regression checks, lab gates for telemetry adapters, and
+evidence bundles for handoff.

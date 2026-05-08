@@ -36,8 +36,8 @@ impl FaultLabel {
         }
     }
 
-    pub fn from_index(index: usize) -> FaultLabel {
-        Self::ALL.get(index).copied().unwrap_or(FaultLabel::Normal)
+    pub fn from_index(index: usize) -> Option<FaultLabel> {
+        Self::ALL.get(index).copied()
     }
 
     pub fn index(self) -> usize {
@@ -45,6 +45,100 @@ impl FaultLabel {
             .iter()
             .position(|label| *label == self)
             .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosisStatus {
+    #[default]
+    Known,
+    Uncertain,
+    OutOfDistribution,
+}
+
+impl DiagnosisStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagnosisStatus::Known => "known",
+            DiagnosisStatus::Uncertain => "uncertain",
+            DiagnosisStatus::OutOfDistribution => "out_of_distribution",
+        }
+    }
+}
+
+impl fmt::Display for DiagnosisStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DiagnosisStatus {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "known" => Ok(DiagnosisStatus::Known),
+            "uncertain" => Ok(DiagnosisStatus::Uncertain),
+            "out_of_distribution" | "ood" => Ok(DiagnosisStatus::OutOfDistribution),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UncertaintyAssessment {
+    pub max_probability: f64,
+    pub probability_margin: f64,
+    pub entropy: f64,
+    pub feature_distance: f64,
+    #[serde(default)]
+    pub feature_bounds_violations: Vec<String>,
+    #[serde(default)]
+    pub status: DiagnosisStatus,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+impl Default for UncertaintyAssessment {
+    fn default() -> Self {
+        Self {
+            max_probability: 1.0,
+            probability_margin: 1.0,
+            entropy: 0.0,
+            feature_distance: 0.0,
+            feature_bounds_violations: Vec::new(),
+            status: DiagnosisStatus::Known,
+            reasons: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureBounds {
+    pub min: f64,
+    pub max: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUncertaintyThresholds {
+    pub min_max_probability: f64,
+    pub min_probability_margin: f64,
+    pub max_entropy: f64,
+    pub max_feature_distance: f64,
+    #[serde(default)]
+    pub feature_bounds: BTreeMap<String, FeatureBounds>,
+}
+
+impl Default for ModelUncertaintyThresholds {
+    fn default() -> Self {
+        Self {
+            min_max_probability: 0.5,
+            min_probability_margin: 0.08,
+            max_entropy: 0.92,
+            max_feature_distance: 8.0,
+            feature_bounds: BTreeMap::new(),
+        }
     }
 }
 
@@ -508,6 +602,8 @@ pub struct MlResult {
     pub features: BTreeMap<String, f64>,
     #[serde(default)]
     pub feature_quality: BTreeMap<String, MetricQuality>,
+    #[serde(default)]
+    pub uncertainty: UncertaintyAssessment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_manifest: Option<ModelManifest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,6 +639,8 @@ pub struct ModelManifest {
     pub evaluation: Option<ModelEvaluation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub training_gate: Option<ModelTrainingGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncertainty_thresholds: Option<ModelUncertaintyThresholds>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,6 +809,8 @@ pub struct Recommendation {
     pub what_if_action_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnosis_symptom: Option<FaultLabel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnosis_status: Option<DiagnosisStatus>,
     pub recommended_action: String,
     pub expected_effect: String,
     pub risk_level: String,
@@ -908,6 +1008,30 @@ pub struct RunComparison {
     pub measurement_quality_changes: Vec<MetricQualityChange>,
     pub quality_status_changed: bool,
     pub warning_count_delta: isize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionVerificationVerdict {
+    Verified,
+    NotVerified,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionVerification {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    pub before_run_id: String,
+    pub after_run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicted_what_if_effect: Option<TwinPolicyImpact>,
+    pub observed_comparison: RunComparison,
+    pub verdict: ActionVerificationVerdict,
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

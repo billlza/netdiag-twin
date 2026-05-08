@@ -1,3 +1,6 @@
-Use this directory for structured scenario definitions.
+Use this directory for structured scenario presets that support CLI and UI
+what-if workflows.
 
-Example: one JSON config per scenario (baseline and perturbation hints).
+Keep reusable action presets, topology references, and regression-gate metadata
+here. Full Lab acceptance scenarios live under `examples/scenarios/` because
+they include source bindings, model pinning, and validation gates.

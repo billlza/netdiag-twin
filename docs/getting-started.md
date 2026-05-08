@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.4.0 platform contract for SRE and platform
+This guide describes the stable v0.4.1 platform contract for SRE and platform
 teams: how telemetry becomes canonical `TraceRecord` rows, how live adapters
 map into the same pipeline, how ML abstention is reported, and where diagnosis,
 what-if, post-action verification, recommendation, and human-review artifacts
@@ -165,7 +165,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.4.0 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.4.1 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -186,7 +186,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.4.0 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.4.1 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -256,10 +256,12 @@ runs are stricter: they require a complete existing model bundle before any lab
 artifacts are written. Train or provision `artifacts/model/` before running
 production scenarios.
 
-Model inference now records `diagnosis_status` as `known`, `uncertain`, or
-`out_of_distribution`. `FaultLabel` remains the best known candidate among the
-six supported classes; when status is not `known`, reports and recommendations
-say candidate/needs evidence instead of presenting a confirmed root cause.
+Model inference records `diagnosis_status` as `known`, `uncertain`, or
+`out_of_distribution`, plus standardized uncertainty reason codes such as
+`ambiguous` and `insufficient_evidence`. `FaultLabel` remains the best known
+candidate among the six supported classes; the report also carries a fused
+`diagnosis_decision` so strong rule evidence can confirm a known event-type
+fault even when ML marks the sample outside its training envelope.
 
 `run_index.json` is the Evidence Console index. New runs also write
 `connector_health.json`, which records source kind, profile name, rows,
@@ -297,6 +299,7 @@ cargo run -p netdiag-cli -- train \
   --stratified \
   --min-rows-per-label 5
 shasum -a 256 artifacts/model/model_manifest.json artifacts/model/rust_logistic_model.json
+cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml --mode live
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
@@ -325,6 +328,17 @@ scenarios should train a model first and pin it with
 `required_model_file_hash` when reproducibility matters. Acceptance defaults to
 `allowed_diagnosis_statuses: ["known"]`; uncertain or out-of-distribution lab
 fixtures must opt in explicitly and should usually disable rule/ML agreement.
+Known-fault scenarios should set `expected_label` or
+`acceptance.expected_root_cause`. OOD-only scenarios may omit both fields when
+the allowed diagnosis status is explicitly `out_of_distribution` or `uncertain`,
+so the scenario does not pretend an unknown failure is one of the six known
+labels.
+
+Run `lab calibrate` after collecting accepted lab runs from representative
+equipment. It updates `artifacts/model/model_manifest.json` with thresholds
+derived from accepted known/OOD runs, preserving feature bounds already stored in
+the manifest. Use `--dry-run` to inspect the proposed thresholds without writing
+the manifest.
 
 Each lab run writes:
 
@@ -369,9 +383,25 @@ cargo run -p netdiag-cli -- lab verify-action <before_run_id> \
 
 The output schema is `netdiag-action-verification/v1`. It records predicted
 what-if effect, observed comparison deltas, verdict
-`verified | not_verified | inconclusive`, and reasons. The default verified
-threshold is at least 5% better latency, loss, or throughput with no quality
-degradation.
+`verified | not_verified | inconclusive`, and reasons. Without a scenario
+policy, the default verified threshold is at least 5% better latency, loss, or
+throughput with no quality degradation. When the before-run is an indexed Lab
+run, `verify-action` reads `scenario.yaml` and uses the explicit objective:
+
+```yaml
+verification:
+  objective:
+    latency_p95_delta_pct: "<= -5"
+    throughput_delta_pct: ">= 0"
+    packet_loss_delta_pct: "<= 0"
+  fail_if:
+    latency_p95_delta_pct: "> 20"
+    throughput_delta_pct: "< -10"
+```
+
+All objective conditions must pass. Any matching `fail_if` condition makes the
+change `not_verified`; missing objective metrics make the result
+`inconclusive`.
 
 ## Dataset Registry
 

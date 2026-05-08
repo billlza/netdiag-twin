@@ -26,8 +26,9 @@ flowchart LR
 - Input traces are normalized to canonical telemetry fields and grouped into five-second windows.
 - Live collection profiles support local/website probes, HTTP/JSON lab gateways, Prometheus `query_range`, and Prometheus text exposition.
 - Rules emit `EvidenceRecord` values with supporting metrics, counter-evidence, approval requirement, and HIL state.
-- Rust ML uses `linfa-logistic` with deterministic training metadata, model/file hashes, and uncertainty thresholds stored in `model_manifest.json`.
-- Digital Twin uses built-in or imported topology JSON with nodes, links, latency, loss, and capacity metadata. What-if output is advisory until `lab verify-action` compares before/after telemetry.
+- Rust ML uses `linfa-logistic` with deterministic training metadata, model/file hashes, uncertainty reason codes, and lab-calibrated thresholds stored in `model_manifest.json`.
+- Reports carry a fused `diagnosis_decision` from rule evidence, ML uncertainty, and quality signals instead of treating ML status as the only diagnosis status.
+- Digital Twin uses built-in or imported topology JSON with nodes, links, latency, loss, and capacity metadata. What-if output is advisory until `lab verify-action` compares before/after telemetry against the scenario objective.
 - Reports and review state remain local JSON artifacts under `artifacts/runs/<run_id>/`.
 
 NetDiag is positioned for SRE/platform workflows as much as network engineering:

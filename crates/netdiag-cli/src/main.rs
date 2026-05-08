@@ -14,8 +14,9 @@ use netdiag_core::dataset::{
 use netdiag_core::evidence_bundle::export_evidence_bundle;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
-    LabPreflightMode, LabPreflightOptions, LabRunOptions, preflight_lab_scenario, run_lab_batch,
-    run_lab_scenario, summarize_lab_runs, validate_lab_run, verify_action,
+    LabPreflightMode, LabPreflightOptions, LabRunOptions, calibrate_lab_uncertainty,
+    preflight_lab_scenario, run_lab_batch, run_lab_scenario, summarize_lab_runs, validate_lab_run,
+    verify_action,
 };
 use netdiag_core::ml::{
     TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
@@ -252,6 +253,12 @@ enum LabCommand {
     Summary {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+    },
+    Calibrate {
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     VerifyAction {
         before_run_id: String,
@@ -500,6 +507,12 @@ fn run(args: Args) -> anyhow::Result<()> {
             LabCommand::Summary { artifacts } => {
                 let report = summarize_lab_runs(&artifacts)
                     .with_context(|| format!("lab summary failed for {}", artifacts.display()))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            LabCommand::Calibrate { artifacts, dry_run } => {
+                let report = calibrate_lab_uncertainty(&artifacts, dry_run).with_context(|| {
+                    format!("lab calibration failed for {}", artifacts.display())
+                })?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
             LabCommand::VerifyAction {

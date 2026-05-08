@@ -7,7 +7,7 @@ use crate::models::{
     WhatIfResult,
 };
 use crate::recommendation::recommend_actions;
-use crate::report::{Report, RuleMlComparison, compare_rule_ml, render_report};
+use crate::report::{Report, RuleMlComparison, compare_rule_ml, decide_diagnosis, render_report};
 use crate::rules::diagnose_rules;
 use crate::storage::{connector_health_from_ingest, read_json, run_dir, save_json_atomic};
 use crate::telemetry::summarize_ingest;
@@ -139,13 +139,15 @@ fn diagnose_ingest_with_whatif_and_model_dir_with_policy(
             run_simulated_whatif_with_policy(&telemetry.overall, &request.topology, &request.action)
         })
         .transpose()?;
+    let diagnosis_decision = decide_diagnosis(&diagnosis_events, &ml_result);
     let recommendations =
-        recommend_actions(&diagnosis_events, what_if.as_ref(), &ml_result.uncertainty);
+        recommend_actions(&diagnosis_events, what_if.as_ref(), &diagnosis_decision);
     let report = render_report(
         &run_id,
         &telemetry,
         &diagnosis_events,
         &ml_result,
+        &diagnosis_decision,
         what_if.clone(),
         &recommendations,
     );

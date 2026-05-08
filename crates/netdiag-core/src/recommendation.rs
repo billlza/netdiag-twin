@@ -1,12 +1,12 @@
 use crate::models::{
-    DiagnosisEvent, DiagnosisStatus, FaultLabel, HilState, Recommendation, RecommendationKind,
-    UncertaintyAssessment, WhatIfResult,
+    DiagnosisDecision, DiagnosisEvent, DiagnosisStatus, FaultLabel, HilState, Recommendation,
+    RecommendationKind, WhatIfResult,
 };
 
 pub fn recommend_actions(
     rule_events: &[DiagnosisEvent],
     whatif: Option<&WhatIfResult>,
-    uncertainty: &UncertaintyAssessment,
+    decision: &DiagnosisDecision,
 ) -> Vec<Recommendation> {
     let mut recommendations = Vec::new();
     for event in rule_events {
@@ -22,11 +22,11 @@ pub fn recommend_actions(
             source_event_id: Some(event.event_id.clone()),
             what_if_action_id: None,
             diagnosis_symptom: Some(symptom),
-            diagnosis_status: Some(uncertainty.status),
-            recommended_action: status_aware_action(symptom, uncertainty),
-            expected_effect: status_aware_expected_effect(symptom, whatif, uncertainty),
+            diagnosis_status: Some(decision.status),
+            recommended_action: status_aware_action(symptom, decision.status),
+            expected_effect: status_aware_expected_effect(symptom, whatif, decision.status),
             risk_level: risk_for_symptom(symptom).to_string(),
-            confidence: confidence_for_status(event.evidence.confidence, uncertainty.status),
+            confidence: confidence_for_status(event.evidence.confidence, decision.status),
             recommendation_need_approval: true,
             hil_state: HilState::Unreviewed,
             review: None,
@@ -55,7 +55,7 @@ pub fn recommend_actions(
                 source_event_id: None,
                 what_if_action_id: Some(whatif.action_id.clone()),
                 diagnosis_symptom: None,
-                diagnosis_status: Some(uncertainty.status),
+                diagnosis_status: Some(decision.status),
                 recommended_action: format!(
                     "Verify what-if action with before/after telemetry before execution: {} ({})",
                     whatif.action_id, whatif.action_notes
@@ -88,8 +88,8 @@ fn confidence_for_status(confidence: f64, status: DiagnosisStatus) -> f64 {
     (confidence * multiplier).clamp(0.0, 1.0)
 }
 
-fn status_aware_action(symptom: FaultLabel, uncertainty: &UncertaintyAssessment) -> String {
-    match uncertainty.status {
+fn status_aware_action(symptom: FaultLabel, status: DiagnosisStatus) -> String {
+    match status {
         DiagnosisStatus::Known => action_for_symptom(symptom).to_string(),
         DiagnosisStatus::Uncertain => format!(
             "Treat {} as a candidate root cause and collect additional telemetry before remediation: {}",
@@ -106,9 +106,9 @@ fn status_aware_action(symptom: FaultLabel, uncertainty: &UncertaintyAssessment)
 fn status_aware_expected_effect(
     symptom: FaultLabel,
     whatif: Option<&WhatIfResult>,
-    uncertainty: &UncertaintyAssessment,
+    status: DiagnosisStatus,
 ) -> String {
-    match uncertainty.status {
+    match status {
         DiagnosisStatus::Known => expected_effect(symptom, whatif),
         DiagnosisStatus::Uncertain => {
             "Needs evidence: repeat collection or add corroborating sources before treating this as a confirmed fix.".to_string()

@@ -4,7 +4,7 @@ use crate::models::{
     DiagnosisStatus, FaultLabel, FeatureBounds, FeatureImportance, HilFeedbackRecord, HilState,
     LabelMetrics, MetricProvenance, MetricQuality, MlResult, ModelEvaluation, ModelManifest,
     ModelTrainingConfig, ModelTrainingGate, ModelUncertaintyThresholds, Prediction, Recommendation,
-    RecommendationKind, TelemetryWindow, TraceRecord, UncertaintyAssessment,
+    RecommendationKind, TelemetryWindow, TraceRecord, UncertaintyAssessment, UncertaintyReasonCode,
 };
 use crate::report::Report;
 use crate::storage::{list_run_locations, read_json, save_json_atomic};
@@ -240,6 +240,7 @@ pub fn infer_with_quality_from_model_dir_with_policy(
         &ranking,
         &weighted_features,
         &scaled,
+        &feature_quality,
         model_manifest.as_ref(),
     );
 
@@ -348,6 +349,7 @@ fn assess_uncertainty(
     ranking: &[Prediction],
     weighted_features: &[f64],
     scaled_features: &[f64],
+    feature_quality: &BTreeMap<String, MetricQuality>,
     manifest: Option<&ModelManifest>,
 ) -> UncertaintyAssessment {
     let thresholds = manifest
@@ -385,41 +387,77 @@ fn assess_uncertainty(
     }
 
     let mut reasons = Vec::new();
+    let mut reason_codes = Vec::new();
+    let add_code = |codes: &mut Vec<UncertaintyReasonCode>, code| {
+        if !codes.contains(&code) {
+            codes.push(code);
+        }
+    };
+    let insufficient_features = feature_quality
+        .iter()
+        .filter(|(_, quality)| matches!(quality, MetricQuality::Fallback | MetricQuality::Missing))
+        .map(|(feature, quality)| format!("{feature}:{}", quality.as_str()))
+        .collect::<Vec<_>>();
     let status = if !feature_bounds_violations.is_empty()
         || feature_distance > thresholds.max_feature_distance
     {
         if !feature_bounds_violations.is_empty() {
             reasons
                 .push("one or more features are outside the model training envelope".to_string());
+            add_code(&mut reason_codes, UncertaintyReasonCode::FeatureOutOfBounds);
         }
         if feature_distance > thresholds.max_feature_distance {
             reasons.push(format!(
                 "feature distance {:.4} exceeds threshold {:.4}",
                 feature_distance, thresholds.max_feature_distance
             ));
+            add_code(
+                &mut reason_codes,
+                UncertaintyReasonCode::ExtremeFeatureDistance,
+            );
         }
         DiagnosisStatus::OutOfDistribution
-    } else if max_probability < thresholds.min_max_probability
+    } else if !insufficient_features.is_empty()
+        || max_probability < thresholds.min_max_probability
         || probability_margin < thresholds.min_probability_margin
         || entropy > thresholds.max_entropy
     {
+        if !insufficient_features.is_empty() {
+            reasons.push(format!(
+                "insufficient evidence from feature quality: {}",
+                insufficient_features.join(", ")
+            ));
+            add_code(
+                &mut reason_codes,
+                UncertaintyReasonCode::InsufficientEvidence,
+            );
+        }
         if max_probability < thresholds.min_max_probability {
             reasons.push(format!(
                 "max probability {:.4} is below threshold {:.4}",
                 max_probability, thresholds.min_max_probability
             ));
+            add_code(&mut reason_codes, UncertaintyReasonCode::LowMaxProbability);
+            add_code(&mut reason_codes, UncertaintyReasonCode::Ambiguous);
         }
         if probability_margin < thresholds.min_probability_margin {
             reasons.push(format!(
                 "probability margin {:.4} is below threshold {:.4}",
                 probability_margin, thresholds.min_probability_margin
             ));
+            add_code(
+                &mut reason_codes,
+                UncertaintyReasonCode::LowProbabilityMargin,
+            );
+            add_code(&mut reason_codes, UncertaintyReasonCode::Ambiguous);
         }
         if entropy > thresholds.max_entropy {
             reasons.push(format!(
                 "entropy {:.4} exceeds threshold {:.4}",
                 entropy, thresholds.max_entropy
             ));
+            add_code(&mut reason_codes, UncertaintyReasonCode::HighEntropy);
+            add_code(&mut reason_codes, UncertaintyReasonCode::Ambiguous);
         }
         DiagnosisStatus::Uncertain
     } else {
@@ -438,6 +476,7 @@ fn assess_uncertainty(
         feature_bounds_violations,
         status,
         reasons,
+        reason_codes,
     }
 }
 
@@ -1702,6 +1741,7 @@ mod tests {
             ],
             &vec![1.0; FEATURES.len()],
             &vec![0.0; FEATURES.len()],
+            &BTreeMap::new(),
             None,
         );
 
@@ -1727,10 +1767,16 @@ mod tests {
             ],
             &vec![1.0; FEATURES.len()],
             &vec![0.0; FEATURES.len()],
+            &BTreeMap::new(),
             None,
         );
 
         assert_eq!(assessment.status, DiagnosisStatus::Uncertain);
+        assert!(
+            assessment
+                .reason_codes
+                .contains(&UncertaintyReasonCode::Ambiguous)
+        );
         assert!(
             assessment
                 .reasons
@@ -1750,10 +1796,39 @@ mod tests {
             }],
             &vec![1.0; FEATURES.len()],
             &vec![9.0; FEATURES.len()],
+            &BTreeMap::new(),
             None,
         );
 
         assert_eq!(assessment.status, DiagnosisStatus::OutOfDistribution);
+        assert!(
+            assessment
+                .reason_codes
+                .contains(&UncertaintyReasonCode::ExtremeFeatureDistance)
+        );
+    }
+
+    #[test]
+    fn uncertainty_marks_missing_feature_quality_as_insufficient_evidence() {
+        let mut feature_quality = BTreeMap::new();
+        feature_quality.insert("latency_p95".to_string(), MetricQuality::Missing);
+        let assessment = assess_uncertainty(
+            &[Prediction {
+                label: FaultLabel::Congestion,
+                prob: 0.99,
+            }],
+            &vec![1.0; FEATURES.len()],
+            &vec![0.0; FEATURES.len()],
+            &feature_quality,
+            None,
+        );
+
+        assert_eq!(assessment.status, DiagnosisStatus::Uncertain);
+        assert!(
+            assessment
+                .reason_codes
+                .contains(&UncertaintyReasonCode::InsufficientEvidence)
+        );
     }
 
     #[test]

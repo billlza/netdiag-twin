@@ -12,18 +12,19 @@ use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model, 
 use crate::models::{
     ActionVerification, ActionVerificationVerdict, ConnectorHealthSnapshot, ConnectorHealthStatus,
     CorroborationDecision, CorroborationSignal, DiagnosisEvent, DiagnosisStatus, EvidenceRecord,
-    EvidenceRef, FaultLabel, HilReviewSummary, HilState, IngestResult, MetricQuality,
-    MultiSourceEvidenceSummary, Recommendation, RunComparison, Severity, SourceEvidenceSummary,
-    TimeWindow, TwinPolicyImpact,
+    EvidenceRef, FaultLabel, HilReviewSummary, HilState, IngestResult, MetricQuality, MlResult,
+    ModelManifest, ModelUncertaintyThresholds, MultiSourceEvidenceSummary, Recommendation,
+    RunComparison, Severity, SourceEvidenceSummary, TimeWindow, TwinPolicyImpact,
 };
 use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_existing_model_dir};
 use crate::recommendation::recommend_actions;
 use crate::report::Report;
-use crate::report::{compare_rule_ml, render_report};
+use crate::report::{compare_rule_ml, decide_diagnosis, render_report};
 use crate::storage::{
     RunLocation, compare_runs, connector_health_from_ingest, read_connector_health, read_json,
     resolve_stored_path, run_artifacts, run_dir, save_json, write_connector_health,
 };
+use crate::telemetry::quantile;
 use crate::twin::{
     TopologyFormat, import_policy_action, import_topology, policy_action, topology_model,
     validate_policy_action_for_topology, validate_policy_action_shape, validate_topology_model,
@@ -42,7 +43,8 @@ pub struct LabScenario {
     pub schema: String,
     pub id: String,
     pub name: String,
-    pub expected_label: FaultLabel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_label: Option<FaultLabel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
     #[serde(default)]
@@ -53,6 +55,8 @@ pub struct LabScenario {
     pub what_if: Option<LabWhatIf>,
     #[serde(default)]
     pub acceptance: LabAcceptance,
+    #[serde(default, skip_serializing_if = "LabVerification::is_empty")]
+    pub verification: LabVerification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +141,20 @@ impl Default for LabCollection {
 pub struct LabWhatIf {
     pub topology: String,
     pub policy: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabVerification {
+    #[serde(default)]
+    pub objective: BTreeMap<String, String>,
+    #[serde(default)]
+    pub fail_if: BTreeMap<String, String>,
+}
+
+impl LabVerification {
+    fn is_empty(&self) -> bool {
+        self.objective.is_empty() && self.fail_if.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +309,8 @@ pub struct LabAcceptanceReport {
     pub schema: String,
     pub scenario_id: String,
     pub run_id: String,
-    pub expected_label: FaultLabel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_label: Option<FaultLabel>,
     #[serde(default)]
     pub actual_rule_labels: Vec<String>,
     pub actual_ml_top: String,
@@ -317,7 +336,8 @@ pub struct LabRunComparison {
     pub schema: String,
     pub scenario_id: String,
     pub run_id: String,
-    pub expected_label: FaultLabel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_label: Option<FaultLabel>,
     #[serde(default)]
     pub actual_rule_labels: Vec<String>,
     pub actual_ml_top: String,
@@ -371,6 +391,8 @@ pub struct LabSummaryReport {
     #[serde(default)]
     pub quality: BTreeMap<String, usize>,
     #[serde(default)]
+    pub diagnosis_statuses: BTreeMap<String, usize>,
+    #[serde(default)]
     pub failures: Vec<LabSummaryFailure>,
 }
 
@@ -400,6 +422,24 @@ pub struct LabSummaryFailure {
     pub scenario_id: String,
     #[serde(default)]
     pub failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LabCalibrationReport {
+    pub schema: String,
+    pub generated_at: DateTime<Utc>,
+    pub artifact_root: String,
+    pub model_manifest_path: String,
+    pub known_runs: usize,
+    pub uncertain_runs: usize,
+    pub out_of_distribution_runs: usize,
+    pub skipped_runs: usize,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_thresholds: Option<ModelUncertaintyThresholds>,
+    pub calibrated_thresholds: ModelUncertaintyThresholds,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -468,6 +508,13 @@ pub fn validate_lab_scenario(scenario: &LabScenario) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn scenario_expected_label(scenario: &LabScenario) -> Option<FaultLabel> {
+    scenario
+        .acceptance
+        .expected_root_cause
+        .or(scenario.expected_label)
 }
 
 pub fn preflight_lab_scenario(
@@ -1022,16 +1069,18 @@ pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Resul
     let corroboration_signals = collect_corroboration_signals(&loaded_sources);
     apply_corroboration_signals(&mut pipeline.diagnosis_events, &corroboration_signals);
     pipeline.comparison = compare_rule_ml(&pipeline.diagnosis_events, &pipeline.ml_result);
+    let diagnosis_decision = decide_diagnosis(&pipeline.diagnosis_events, &pipeline.ml_result);
     pipeline.recommendations = recommend_actions(
         &pipeline.diagnosis_events,
         pipeline.what_if.as_ref(),
-        &pipeline.ml_result.uncertainty,
+        &diagnosis_decision,
     );
     pipeline.report = render_report(
         &pipeline.run_id,
         &pipeline.telemetry,
         &pipeline.diagnosis_events,
         &pipeline.ml_result,
+        &diagnosis_decision,
         pipeline.what_if.clone(),
         &pipeline.recommendations,
     );
@@ -1176,6 +1225,7 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
     let mut by_scenario = BTreeMap::<String, LabSummaryAccumulator>::new();
     let mut scenario_names = BTreeMap::<String, String>::new();
     let mut quality = BTreeMap::<String, usize>::new();
+    let mut diagnosis_statuses = BTreeMap::<String, usize>::new();
     let mut failures = Vec::new();
     let mut passed = 0usize;
 
@@ -1210,12 +1260,24 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
         *quality
             .entry(acceptance.quality_status.as_str().to_string())
             .or_default() += 1;
-        let expected = acceptance.expected_label.as_str().to_string();
-        let rule_correct = acceptance
-            .actual_rule_labels
-            .iter()
-            .any(|label| label == &expected);
-        let ml_correct = acceptance.actual_ml_top == expected;
+        *diagnosis_statuses
+            .entry(acceptance.actual_diagnosis_status.as_str().to_string())
+            .or_default() += 1;
+        let expected = acceptance
+            .expected_label
+            .map(|label| label.as_str().to_string());
+        let expected_key = expected
+            .clone()
+            .unwrap_or_else(|| format!("status:{}", acceptance.actual_diagnosis_status.as_str()));
+        let rule_correct = expected.as_ref().is_some_and(|expected| {
+            acceptance
+                .actual_rule_labels
+                .iter()
+                .any(|label| label == expected)
+        });
+        let ml_correct = expected
+            .as_ref()
+            .is_some_and(|expected| acceptance.actual_ml_top == *expected);
         let rule_ml_agreement = comparison
             .as_ref()
             .map(|comparison| comparison.rule_ml_agreement)
@@ -1227,7 +1289,7 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
             });
         let quality_degraded = acceptance.quality_status != ConnectorHealthStatus::Ok;
         record_summary_sample(
-            by_label.entry(expected).or_default(),
+            by_label.entry(expected_key).or_default(),
             acceptance.passed,
             rule_correct,
             ml_correct,
@@ -1266,7 +1328,132 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
             })
             .collect(),
         quality,
+        diagnosis_statuses,
         failures,
+    })
+}
+
+pub fn calibrate_lab_uncertainty(
+    artifact_root: impl AsRef<Path>,
+    dry_run: bool,
+) -> Result<LabCalibrationReport> {
+    let artifact_root = artifact_root.as_ref();
+    let model_dir = artifact_root.join("model");
+    load_existing_model(&model_dir)?;
+    let model_manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
+    let mut manifest: ModelManifest =
+        serde_json::from_value(read_json(&model_manifest_path)?).map_err(NetdiagError::from)?;
+    let previous_thresholds = manifest.uncertainty_thresholds.clone();
+    let index = read_lab_run_index(artifact_root)?.ok_or_else(|| {
+        NetdiagError::InvalidTrace(format!(
+            "lab calibration requires {}, but no lab run index exists under {}",
+            artifact_root.join("lab_run_index.json").display(),
+            artifact_root.display()
+        ))
+    })?;
+
+    let mut known_max_probability = Vec::new();
+    let mut known_margin = Vec::new();
+    let mut known_entropy = Vec::new();
+    let mut known_distance = Vec::new();
+    let mut ood_distance = Vec::new();
+    let mut known_runs = 0usize;
+    let mut uncertain_runs = 0usize;
+    let mut out_of_distribution_runs = 0usize;
+    let mut skipped_runs = 0usize;
+
+    for entry in &index.runs {
+        let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path);
+        let acceptance = match read_json(&acceptance_path).and_then(|value| {
+            serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
+        }) {
+            Ok(acceptance) if acceptance.passed => acceptance,
+            Ok(_) | Err(_) => {
+                skipped_runs += 1;
+                continue;
+            }
+        };
+        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
+        let ml_result_path = run_dir(&lab_run_dir, &entry.run_id).join("ml_result.json");
+        let ml: MlResult = match read_json(&ml_result_path)
+            .and_then(|value| serde_json::from_value::<MlResult>(value).map_err(Into::into))
+        {
+            Ok(ml) => ml,
+            Err(_) => {
+                skipped_runs += 1;
+                continue;
+            }
+        };
+        match acceptance.actual_diagnosis_status {
+            DiagnosisStatus::Known => {
+                known_runs += 1;
+                known_max_probability.push(ml.uncertainty.max_probability);
+                known_margin.push(ml.uncertainty.probability_margin);
+                known_entropy.push(ml.uncertainty.entropy);
+                known_distance.push(ml.uncertainty.feature_distance);
+            }
+            DiagnosisStatus::Uncertain => {
+                uncertain_runs += 1;
+            }
+            DiagnosisStatus::OutOfDistribution => {
+                out_of_distribution_runs += 1;
+                ood_distance.push(ml.uncertainty.feature_distance);
+            }
+        }
+    }
+
+    if known_runs == 0 {
+        return Err(NetdiagError::InvalidTrace(
+            "lab calibration requires at least one accepted known-status lab run".to_string(),
+        ));
+    }
+    let mut warnings = Vec::new();
+    if out_of_distribution_runs == 0 {
+        warnings.push(
+            "no accepted out_of_distribution lab runs; feature-distance threshold uses known-run envelope only"
+                .to_string(),
+        );
+    }
+
+    let previous = previous_thresholds.clone().unwrap_or_default();
+    let known_distance_p95 = quantile(&known_distance, 0.95);
+    let max_feature_distance = (if let Some(min_ood_distance) = ood_distance
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .min_by(f64::total_cmp)
+        && min_ood_distance > known_distance_p95
+    {
+        (known_distance_p95 + min_ood_distance) / 2.0
+    } else {
+        known_distance_p95 * 1.25
+    })
+    .max(1.0);
+    let calibrated_thresholds = ModelUncertaintyThresholds {
+        min_max_probability: round4(quantile(&known_max_probability, 0.05).clamp(0.05, 0.99)),
+        min_probability_margin: round4(quantile(&known_margin, 0.05).clamp(0.0, 0.80)),
+        max_entropy: round4(quantile(&known_entropy, 0.95).clamp(0.05, 1.0)),
+        max_feature_distance: round4(max_feature_distance),
+        feature_bounds: previous.feature_bounds,
+    };
+    if !dry_run {
+        manifest.uncertainty_thresholds = Some(calibrated_thresholds.clone());
+        save_json(&model_manifest_path, &manifest)?;
+    }
+
+    Ok(LabCalibrationReport {
+        schema: "netdiag-lab-calibration/v1".to_string(),
+        generated_at: Utc::now(),
+        artifact_root: artifact_root.display().to_string(),
+        model_manifest_path: model_manifest_path.display().to_string(),
+        known_runs,
+        uncertain_runs,
+        out_of_distribution_runs,
+        skipped_runs,
+        applied: !dry_run,
+        previous_thresholds,
+        calibrated_thresholds,
+        warnings,
     })
 }
 
@@ -1390,7 +1577,8 @@ pub fn verify_action(
     let before_report: Report =
         serde_json::from_value(read_json(before_location.run_dir.join("report.json"))?)?;
     let predicted_what_if_effect = predicted_action_effect(&before_report, recommendation_id)?;
-    let (verdict, reasons) = action_verification_verdict(&comparison);
+    let verification_policy = verification_policy_for_run(artifact_root, before_run_id)?;
+    let (verdict, reasons) = action_verification_verdict(&comparison, verification_policy.as_ref());
     let verification = ActionVerification {
         schema: "netdiag-action-verification/v1".to_string(),
         generated_at: Utc::now(),
@@ -1451,8 +1639,89 @@ fn what_if_effect(what_if: &crate::models::WhatIfResult) -> TwinPolicyImpact {
         })
 }
 
+fn verification_policy_for_run(
+    artifact_root: &Path,
+    before_run_id: &str,
+) -> Result<Option<LabVerification>> {
+    let Ok(resolution) = resolve_lab_run_artifact_root(artifact_root, before_run_id) else {
+        return Ok(None);
+    };
+    let scenario_path = resolution
+        .index_entry
+        .as_ref()
+        .map(|entry| resolve_stored_path(artifact_root, &entry.scenario_path))
+        .or_else(|| {
+            let candidate = resolution.artifact_root.join("scenario.yaml");
+            candidate.exists().then_some(candidate)
+        });
+    let Some(scenario_path) = scenario_path else {
+        return Ok(None);
+    };
+    let scenario = load_lab_scenario(scenario_path)?;
+    Ok((!scenario.verification.is_empty()).then_some(scenario.verification))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MetricComparator {
+    Lt,
+    Le,
+    Eq,
+    Ge,
+    Gt,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MetricCondition {
+    comparator: MetricComparator,
+    threshold: f64,
+}
+
+fn parse_metric_condition(expr: &str) -> std::result::Result<MetricCondition, String> {
+    let expr = expr.trim();
+    for (prefix, comparator) in [
+        ("<=", MetricComparator::Le),
+        (">=", MetricComparator::Ge),
+        ("==", MetricComparator::Eq),
+        ("<", MetricComparator::Lt),
+        (">", MetricComparator::Gt),
+    ] {
+        if let Some(value) = expr.strip_prefix(prefix) {
+            let threshold = value.trim().parse::<f64>().map_err(|err| {
+                format!("invalid verification condition `{expr}` threshold: {err}")
+            })?;
+            return Ok(MetricCondition {
+                comparator,
+                threshold,
+            });
+        }
+    }
+    Err(format!(
+        "invalid verification condition `{expr}`; expected one of <=, >=, ==, <, >"
+    ))
+}
+
+fn metric_delta(comparison: &RunComparison, metric: &str) -> Option<f64> {
+    match metric {
+        "latency_p95_delta_pct" | "latency_delta_pct" => comparison.latency_p95_delta_pct,
+        "packet_loss_delta_pct" | "loss_delta_pct" => comparison.loss_delta_pct,
+        "throughput_delta_pct" => comparison.throughput_delta_pct,
+        _ => None,
+    }
+}
+
+fn condition_matches(value: f64, condition: MetricCondition) -> bool {
+    match condition.comparator {
+        MetricComparator::Lt => value < condition.threshold,
+        MetricComparator::Le => value <= condition.threshold,
+        MetricComparator::Eq => (value - condition.threshold).abs() <= f64::EPSILON,
+        MetricComparator::Ge => value >= condition.threshold,
+        MetricComparator::Gt => value > condition.threshold,
+    }
+}
+
 fn action_verification_verdict(
     comparison: &RunComparison,
+    policy: Option<&LabVerification>,
 ) -> (ActionVerificationVerdict, Vec<String>) {
     let mut reasons = Vec::new();
     if comparison.right.quality_status > comparison.left.quality_status {
@@ -1473,6 +1742,58 @@ fn action_verification_verdict(
     }
     if !reasons.is_empty() {
         return (ActionVerificationVerdict::Inconclusive, reasons);
+    }
+
+    if let Some(policy) = policy
+        && !policy.is_empty()
+    {
+        for (metric, expr) in &policy.fail_if {
+            let condition = match parse_metric_condition(expr) {
+                Ok(condition) => condition,
+                Err(err) => return (ActionVerificationVerdict::Inconclusive, vec![err]),
+            };
+            let Some(value) = metric_delta(comparison, metric) else {
+                continue;
+            };
+            if condition_matches(value, condition) {
+                return (
+                    ActionVerificationVerdict::NotVerified,
+                    vec![format!(
+                        "verification fail_if matched: {metric}={value:.4} {expr}"
+                    )],
+                );
+            }
+        }
+
+        if !policy.objective.is_empty() {
+            for (metric, expr) in &policy.objective {
+                let condition = match parse_metric_condition(expr) {
+                    Ok(condition) => condition,
+                    Err(err) => return (ActionVerificationVerdict::Inconclusive, vec![err]),
+                };
+                let Some(value) = metric_delta(comparison, metric) else {
+                    return (
+                        ActionVerificationVerdict::Inconclusive,
+                        vec![format!("verification objective metric {metric} is missing")],
+                    );
+                };
+                if !condition_matches(value, condition) {
+                    return (
+                        ActionVerificationVerdict::NotVerified,
+                        vec![format!(
+                            "verification objective was not met: {metric}={value:.4} expected {expr}"
+                        )],
+                    );
+                }
+            }
+            return (
+                ActionVerificationVerdict::Verified,
+                vec![
+                    "observed before/after telemetry met the scenario verification objective"
+                        .to_string(),
+                ],
+            );
+        }
     }
 
     let has_metric = comparison.latency_p95_delta_pct.is_some()
@@ -1732,10 +2053,7 @@ pub fn validate_lab_report(
     report: &Report,
     context: &LabValidationContext,
 ) -> Result<LabAcceptanceReport> {
-    let expected = scenario
-        .acceptance
-        .expected_root_cause
-        .unwrap_or(scenario.expected_label);
+    let expected = scenario_expected_label(scenario);
     let rule_labels = report
         .root_causes
         .iter()
@@ -1820,71 +2138,81 @@ pub fn validate_lab_report(
             report.diagnosis_status, allowed
         ));
     }
-    if expected == FaultLabel::Normal {
-        let non_normal = rule_labels
-            .iter()
-            .filter(|label| label.as_str() != FaultLabel::Normal.as_str())
-            .cloned()
-            .collect::<Vec<_>>();
-        if !non_normal.is_empty() {
-            failures.push(format!(
-                "expected normal but non-normal rule labels were {}",
-                non_normal.join(", ")
-            ));
-        }
-        if let Some(root) = report
-            .root_causes
-            .iter()
-            .find(|root| root.symptom == FaultLabel::Normal.as_str())
-            && root.confidence < scenario.acceptance.min_rule_confidence
-        {
-            failures.push(format!(
-                "normal rule confidence was {:.3}, below {:.3}",
-                root.confidence, scenario.acceptance.min_rule_confidence
-            ));
-        }
-    } else {
-        let expected_label = expected.as_str();
-        let matching = report
-            .root_causes
-            .iter()
-            .find(|root| root.symptom == expected_label);
-        if let Some(root) = matching {
-            if root_is_suspected_corroboration(root)
-                && !scenario.acceptance.allow_suspected_corroboration
+    if let Some(expected) = expected {
+        if expected == FaultLabel::Normal {
+            let non_normal = rule_labels
+                .iter()
+                .filter(|label| label.as_str() != FaultLabel::Normal.as_str())
+                .cloned()
+                .collect::<Vec<_>>();
+            if !non_normal.is_empty() {
+                failures.push(format!(
+                    "expected normal but non-normal rule labels were {}",
+                    non_normal.join(", ")
+                ));
+            }
+            if let Some(root) = report
+                .root_causes
+                .iter()
+                .find(|root| root.symptom == FaultLabel::Normal.as_str())
+                && root.confidence < scenario.acceptance.min_rule_confidence
             {
                 failures.push(format!(
-                        "expected label {expected_label} was raised only as corroboration suspected fault"
-                    ));
-            }
-            if root.confidence < scenario.acceptance.min_rule_confidence {
-                failures.push(format!(
-                    "rule confidence for {expected_label} was {:.3}, below {:.3}",
+                    "normal rule confidence was {:.3}, below {:.3}",
                     root.confidence, scenario.acceptance.min_rule_confidence
                 ));
             }
         } else {
-            failures.push(format!(
-                "expected label {expected_label} was absent from rule labels"
-            ));
+            let expected_label = expected.as_str();
+            let matching = report
+                .root_causes
+                .iter()
+                .find(|root| root.symptom == expected_label);
+            if let Some(root) = matching {
+                if root_is_suspected_corroboration(root)
+                    && !scenario.acceptance.allow_suspected_corroboration
+                {
+                    failures.push(format!(
+                            "expected label {expected_label} was raised only as corroboration suspected fault"
+                        ));
+                }
+                if root.confidence < scenario.acceptance.min_rule_confidence {
+                    failures.push(format!(
+                        "rule confidence for {expected_label} was {:.3}, below {:.3}",
+                        root.confidence, scenario.acceptance.min_rule_confidence
+                    ));
+                }
+            } else {
+                failures.push(format!(
+                    "expected label {expected_label} was absent from rule labels"
+                ));
+            }
         }
+        if report.diagnosis_status == DiagnosisStatus::Known {
+            if report.rule_vs_ml.ml_top != expected.as_str() {
+                failures.push(format!(
+                    "ML top label was {}, expected {}",
+                    report.rule_vs_ml.ml_top,
+                    expected.as_str()
+                ));
+            }
+            if report.rule_vs_ml.ml_top_prob < scenario.acceptance.min_ml_probability {
+                failures.push(format!(
+                    "ML probability was {:.3}, below {:.3}",
+                    report.rule_vs_ml.ml_top_prob, scenario.acceptance.min_ml_probability
+                ));
+            }
+        }
+    } else if report.diagnosis_status == DiagnosisStatus::Known {
+        failures.push(
+            "known lab acceptance requires expected_label or acceptance.expected_root_cause"
+                .to_string(),
+        );
     }
-    if report.diagnosis_status == DiagnosisStatus::Known {
-        if report.rule_vs_ml.ml_top != expected.as_str() {
-            failures.push(format!(
-                "ML top label was {}, expected {}",
-                report.rule_vs_ml.ml_top,
-                expected.as_str()
-            ));
-        }
-        if report.rule_vs_ml.ml_top_prob < scenario.acceptance.min_ml_probability {
-            failures.push(format!(
-                "ML probability was {:.3}, below {:.3}",
-                report.rule_vs_ml.ml_top_prob, scenario.acceptance.min_ml_probability
-            ));
-        }
-    }
-    if scenario.acceptance.require_rule_ml_agreement && !report.rule_vs_ml.agreement {
+    if scenario.acceptance.require_rule_ml_agreement
+        && report.diagnosis_status == DiagnosisStatus::Known
+        && !report.rule_vs_ml.agreement
+    {
         failures.push("rule/ML agreement gate failed".to_string());
     }
     for (field, required_quality) in &scenario.acceptance.allowed_quality {
@@ -2514,12 +2842,10 @@ fn multi_source_evidence(
     primary_health: &ConnectorHealthSnapshot,
     corroboration_signals: &[CorroborationSignal],
 ) -> MultiSourceEvidenceSummary {
-    let expected = scenario
-        .acceptance
-        .expected_root_cause
-        .unwrap_or(scenario.expected_label)
-        .as_str()
-        .to_string();
+    let expected = scenario_expected_label(scenario)
+        .or(report.diagnosis_decision.primary_label)
+        .map(|label| label.as_str().to_string())
+        .unwrap_or_else(|| report.diagnosis_status.as_str().to_string());
     let primary_evidence = if report.root_causes.is_empty() {
         vec!["rules did not find a non-normal root cause".to_string()]
     } else {
@@ -2775,8 +3101,8 @@ fn default_required_artifacts() -> Vec<String> {
 mod tests {
     use super::*;
     use crate::models::{
-        DistributionStats, ModelManifest, OverallTelemetry, RunHistoryEntry, ThroughputStats,
-        WhatIfResult,
+        DistributionStats, MlResult, ModelManifest, OverallTelemetry, Prediction, RunHistoryEntry,
+        ThroughputStats, UncertaintyAssessment, WhatIfResult,
     };
     use crate::report::{Report, RootCause, RuleMlComparison};
     use std::collections::BTreeSet;
@@ -2790,7 +3116,7 @@ mod tests {
             schema: "netdiag-lab-scenario/v1".to_string(),
             id: "test-scenario".to_string(),
             name: "Test Scenario".to_string(),
-            expected_label: expected,
+            expected_label: Some(expected),
             topology: None,
             data_sources: vec![LabDataSource {
                 name: Some("primary".to_string()),
@@ -2817,6 +3143,7 @@ mod tests {
                 required_model_file_hash: None,
                 allow_suspected_corroboration: false,
             },
+            verification: LabVerification::default(),
         }
     }
 
@@ -2838,6 +3165,7 @@ mod tests {
             measurement_quality: Vec::new(),
             diagnosis_status: DiagnosisStatus::Known,
             uncertainty: Default::default(),
+            diagnosis_decision: Default::default(),
             root_causes: roots,
             rule_vs_ml: RuleMlComparison {
                 rule_labels: rule_labels.clone(),
@@ -2912,6 +3240,8 @@ mod tests {
             status: "complete".to_string(),
             run_dir: format!("runs/{run_id}"),
             root_causes: Vec::new(),
+            diagnosis_status: DiagnosisStatus::Known,
+            uncertainty_reason_codes: Vec::new(),
             ml_top_label: None,
             ml_top_probability: None,
             model_kind: None,
@@ -2923,6 +3253,99 @@ mod tests {
             hil_summary: Default::default(),
             artifact_count: 0,
         }
+    }
+
+    fn calibration_ml_result(
+        run_id: &str,
+        status: DiagnosisStatus,
+        max_probability: f64,
+        probability_margin: f64,
+        entropy: f64,
+        feature_distance: f64,
+    ) -> MlResult {
+        MlResult {
+            method: "test".to_string(),
+            run_id: run_id.to_string(),
+            top_predictions: vec![Prediction {
+                label: FaultLabel::Congestion,
+                prob: max_probability,
+            }],
+            top_features: Vec::new(),
+            features: BTreeMap::new(),
+            feature_quality: BTreeMap::new(),
+            uncertainty: UncertaintyAssessment {
+                max_probability,
+                probability_margin,
+                entropy,
+                feature_distance,
+                status,
+                ..Default::default()
+            },
+            model_manifest: None,
+            model_manifest_hash: None,
+            model_file_hash: None,
+        }
+    }
+
+    fn write_lab_calibration_sample(
+        artifact_root: &Path,
+        scenario_id: &str,
+        run_id: &str,
+        status: DiagnosisStatus,
+        ml: MlResult,
+    ) {
+        let lab_run_dir = artifact_root
+            .join("lab-runs")
+            .join(scenario_id)
+            .join(run_id);
+        std::fs::create_dir_all(run_dir(&lab_run_dir, run_id)).expect("lab run dir");
+        let acceptance = LabAcceptanceReport {
+            schema: "netdiag-lab-acceptance/v1".to_string(),
+            scenario_id: scenario_id.to_string(),
+            run_id: run_id.to_string(),
+            expected_label: (status == DiagnosisStatus::Known).then_some(FaultLabel::Congestion),
+            actual_rule_labels: Vec::new(),
+            actual_ml_top: FaultLabel::Congestion.as_str().to_string(),
+            actual_ml_probability: ml.uncertainty.max_probability,
+            actual_diagnosis_status: status,
+            synthetic_model: false,
+            model_dataset_hash: None,
+            model_manifest_hash: Some("manifest".to_string()),
+            model_file_hash: Some("file".to_string()),
+            quality_status: ConnectorHealthStatus::Ok,
+            passed: true,
+            failures: Vec::new(),
+        };
+        save_json(lab_run_dir.join("acceptance.json"), &acceptance).expect("acceptance");
+        save_json(run_dir(&lab_run_dir, run_id).join("ml_result.json"), &ml).expect("ml result");
+        update_lab_run_index(
+            artifact_root,
+            LabRunIndexEntry {
+                run_id: run_id.to_string(),
+                scenario_id: scenario_id.to_string(),
+                scenario_name: scenario_id.to_string(),
+                created_at: Utc::now(),
+                lab_run_dir: stored_lab_index_path(artifact_root, &lab_run_dir),
+                pipeline_run_dir: stored_lab_index_path(
+                    artifact_root,
+                    &run_dir(&lab_run_dir, run_id),
+                ),
+                acceptance_path: stored_lab_index_path(
+                    artifact_root,
+                    &lab_run_dir.join("acceptance.json"),
+                ),
+                comparison_path: stored_lab_index_path(
+                    artifact_root,
+                    &lab_run_dir.join("comparison.json"),
+                ),
+                scenario_path: stored_lab_index_path(
+                    artifact_root,
+                    &lab_run_dir.join("scenario.yaml"),
+                ),
+                passed: true,
+            },
+        )
+        .expect("index");
     }
 
     fn run_comparison(
@@ -3320,11 +3743,72 @@ mod tests {
     }
 
     #[test]
+    fn lab_acceptance_allows_ood_without_expected_label() {
+        let mut scenario = scenario(FaultLabel::Normal, false);
+        scenario.expected_label = None;
+        scenario.acceptance.expected_root_cause = None;
+        scenario.acceptance.allowed_diagnosis_statuses = vec![DiagnosisStatus::OutOfDistribution];
+        scenario.acceptance.require_rule_ml_agreement = false;
+        let mut report = report("run-ood", Vec::new(), FaultLabel::Normal, None);
+        report.diagnosis_status = DiagnosisStatus::OutOfDistribution;
+        report.rule_vs_ml.diagnosis_status = DiagnosisStatus::OutOfDistribution;
+
+        let acceptance = validate_lab_report(
+            &scenario,
+            &report,
+            &LabValidationContext {
+                connector_health: Vec::new(),
+                artifact_keys: default_required_artifacts(),
+                model_manifest_hash: Some("manifest-test-hash".to_string()),
+                model_file_hash: Some("file-test-hash".to_string()),
+            },
+        )
+        .expect("acceptance");
+
+        assert!(acceptance.passed, "{:?}", acceptance.failures);
+        assert_eq!(acceptance.expected_label, None);
+    }
+
+    #[test]
+    fn lab_acceptance_rejects_known_status_without_expected_label() {
+        let mut scenario = scenario(FaultLabel::Normal, false);
+        scenario.expected_label = None;
+        scenario.acceptance.expected_root_cause = None;
+        scenario.acceptance.require_rule_ml_agreement = false;
+        let report = report(
+            "run-known",
+            vec![root(FaultLabel::DnsFailure, 0.95)],
+            FaultLabel::DnsFailure,
+            None,
+        );
+
+        let acceptance = validate_lab_report(
+            &scenario,
+            &report,
+            &LabValidationContext {
+                connector_health: Vec::new(),
+                artifact_keys: default_required_artifacts(),
+                model_manifest_hash: Some("manifest-test-hash".to_string()),
+                model_file_hash: Some("file-test-hash".to_string()),
+            },
+        )
+        .expect("acceptance");
+
+        assert!(!acceptance.passed);
+        assert!(
+            acceptance
+                .failures
+                .iter()
+                .any(|failure| failure.contains("requires expected_label"))
+        );
+    }
+
+    #[test]
     fn verify_action_verdict_accepts_five_percent_improvement_without_quality_degradation() {
         let comparison =
             run_comparison(Some(-5.2), Some(0.0), Some(0.0), ConnectorHealthStatus::Ok);
 
-        let (verdict, reasons) = action_verification_verdict(&comparison);
+        let (verdict, reasons) = action_verification_verdict(&comparison, None);
 
         assert_eq!(verdict, ActionVerificationVerdict::Verified);
         assert!(
@@ -3344,7 +3828,7 @@ mod tests {
             ConnectorHealthStatus::Degraded,
         );
 
-        let (verdict, reasons) = action_verification_verdict(&comparison);
+        let (verdict, reasons) = action_verification_verdict(&comparison, None);
 
         assert_eq!(verdict, ActionVerificationVerdict::Inconclusive);
         assert!(
@@ -3352,6 +3836,112 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("connector quality degraded")),
             "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn verify_action_verdict_requires_all_objective_conditions() {
+        let comparison =
+            run_comparison(Some(-6.0), Some(0.0), Some(1.0), ConnectorHealthStatus::Ok);
+        let policy = LabVerification {
+            objective: BTreeMap::from([
+                ("latency_p95_delta_pct".to_string(), "<= -5".to_string()),
+                ("throughput_delta_pct".to_string(), ">= 0".to_string()),
+                ("packet_loss_delta_pct".to_string(), "<= 0".to_string()),
+            ]),
+            fail_if: BTreeMap::new(),
+        };
+
+        let (verdict, reasons) = action_verification_verdict(&comparison, Some(&policy));
+
+        assert_eq!(verdict, ActionVerificationVerdict::Verified);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("verification objective"))
+        );
+    }
+
+    #[test]
+    fn verify_action_verdict_fails_on_policy_tradeoff() {
+        let comparison = run_comparison(
+            Some(-6.0),
+            Some(0.0),
+            Some(-30.0),
+            ConnectorHealthStatus::Ok,
+        );
+        let policy = LabVerification {
+            objective: BTreeMap::from([("latency_p95_delta_pct".to_string(), "<= -5".to_string())]),
+            fail_if: BTreeMap::from([("throughput_delta_pct".to_string(), "< -10".to_string())]),
+        };
+
+        let (verdict, reasons) = action_verification_verdict(&comparison, Some(&policy));
+
+        assert_eq!(verdict, ActionVerificationVerdict::NotVerified);
+        assert!(reasons.iter().any(|reason| reason.contains("fail_if")));
+    }
+
+    #[test]
+    fn verify_action_verdict_is_inconclusive_when_objective_metric_is_missing() {
+        let comparison = run_comparison(None, Some(0.0), Some(0.0), ConnectorHealthStatus::Ok);
+        let policy = LabVerification {
+            objective: BTreeMap::from([("latency_p95_delta_pct".to_string(), "<= -5".to_string())]),
+            fail_if: BTreeMap::new(),
+        };
+
+        let (verdict, reasons) = action_verification_verdict(&comparison, Some(&policy));
+
+        assert_eq!(verdict, ActionVerificationVerdict::Inconclusive);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("metric latency_p95_delta_pct is missing"))
+        );
+    }
+
+    #[test]
+    fn lab_calibration_updates_model_manifest_thresholds_from_accepted_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_calibration_sample(
+            temp.path(),
+            "known",
+            "known-run",
+            DiagnosisStatus::Known,
+            calibration_ml_result("known-run", DiagnosisStatus::Known, 0.82, 0.18, 0.42, 2.0),
+        );
+        write_lab_calibration_sample(
+            temp.path(),
+            "ood",
+            "ood-run",
+            DiagnosisStatus::OutOfDistribution,
+            calibration_ml_result(
+                "ood-run",
+                DiagnosisStatus::OutOfDistribution,
+                0.90,
+                0.30,
+                0.20,
+                10.0,
+            ),
+        );
+
+        let report = calibrate_lab_uncertainty(temp.path(), false).expect("calibration");
+
+        assert!(report.applied);
+        assert_eq!(report.known_runs, 1);
+        assert_eq!(report.out_of_distribution_runs, 1);
+        assert!(report.calibrated_thresholds.max_feature_distance > 2.0);
+        assert!(report.calibrated_thresholds.max_feature_distance < 10.0);
+        let manifest: ModelManifest = serde_json::from_value(
+            read_json(temp.path().join("model").join(MODEL_MANIFEST_FILE_NAME)).expect("manifest"),
+        )
+        .expect("manifest json");
+        assert_eq!(
+            manifest
+                .uncertainty_thresholds
+                .expect("thresholds")
+                .max_feature_distance,
+            report.calibrated_thresholds.max_feature_distance
         );
     }
 

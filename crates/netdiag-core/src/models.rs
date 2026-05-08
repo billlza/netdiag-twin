@@ -86,6 +86,38 @@ impl FromStr for DiagnosisStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncertaintyReasonCode {
+    Ambiguous,
+    InsufficientEvidence,
+    FeatureOutOfBounds,
+    ExtremeFeatureDistance,
+    LowMaxProbability,
+    LowProbabilityMargin,
+    HighEntropy,
+}
+
+impl UncertaintyReasonCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UncertaintyReasonCode::Ambiguous => "ambiguous",
+            UncertaintyReasonCode::InsufficientEvidence => "insufficient_evidence",
+            UncertaintyReasonCode::FeatureOutOfBounds => "feature_out_of_bounds",
+            UncertaintyReasonCode::ExtremeFeatureDistance => "extreme_feature_distance",
+            UncertaintyReasonCode::LowMaxProbability => "low_max_probability",
+            UncertaintyReasonCode::LowProbabilityMargin => "low_probability_margin",
+            UncertaintyReasonCode::HighEntropy => "high_entropy",
+        }
+    }
+}
+
+impl fmt::Display for UncertaintyReasonCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UncertaintyAssessment {
     pub max_probability: f64,
@@ -98,6 +130,8 @@ pub struct UncertaintyAssessment {
     pub status: DiagnosisStatus,
     #[serde(default)]
     pub reasons: Vec<String>,
+    #[serde(default)]
+    pub reason_codes: Vec<UncertaintyReasonCode>,
 }
 
 impl Default for UncertaintyAssessment {
@@ -109,6 +143,41 @@ impl Default for UncertaintyAssessment {
             feature_distance: 0.0,
             feature_bounds_violations: Vec::new(),
             status: DiagnosisStatus::Known,
+            reasons: Vec::new(),
+            reason_codes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosisCandidate {
+    pub label: FaultLabel,
+    pub source: String,
+    pub confidence: f64,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosisDecision {
+    #[serde(default)]
+    pub status: DiagnosisStatus,
+    pub status_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_label: Option<FaultLabel>,
+    #[serde(default)]
+    pub candidates: Vec<DiagnosisCandidate>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+impl Default for DiagnosisDecision {
+    fn default() -> Self {
+        Self {
+            status: DiagnosisStatus::Known,
+            status_source: "legacy".to_string(),
+            primary_label: None,
+            candidates: Vec::new(),
             reasons: Vec::new(),
         }
     }
@@ -934,6 +1003,10 @@ pub struct RunHistoryEntry {
     pub run_dir: String,
     #[serde(default)]
     pub root_causes: Vec<String>,
+    #[serde(default)]
+    pub diagnosis_status: DiagnosisStatus,
+    #[serde(default)]
+    pub uncertainty_reason_codes: Vec<UncertaintyReasonCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ml_top_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -974,6 +1047,10 @@ pub struct RunTimelineEvent {
     pub status: String,
     #[serde(default)]
     pub root_causes: Vec<String>,
+    #[serde(default)]
+    pub diagnosis_status: DiagnosisStatus,
+    #[serde(default)]
+    pub uncertainty_reason_codes: Vec<UncertaintyReasonCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ml_top_label: Option<String>,
     #[serde(default)]

@@ -2427,6 +2427,11 @@ impl NetDiagApp {
                         .size(12.0)
                         .color(health_status_color(event.quality_status)),
                     );
+                    ui.label(
+                        RichText::new(format!("diagnosis: {}", event.diagnosis_status.as_str()))
+                            .size(12.0)
+                            .color(MUTED),
+                    );
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
@@ -2448,6 +2453,15 @@ impl NetDiagApp {
                                 .size(12.0)
                                 .color(MUTED),
                         );
+                    }
+                    if !event.uncertainty_reason_codes.is_empty() {
+                        let reasons = event
+                            .uncertainty_reason_codes
+                            .iter()
+                            .map(|code| code.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.label(RichText::new(reasons).size(12.0).color(MUTED));
                     }
                 });
                 ui.add_space(4.0);
@@ -4655,7 +4669,10 @@ fn render_lab_acceptance(ui: &mut egui::Ui, acceptance: &LabAcceptanceReport) {
         ui.label(
             RichText::new(format!(
                 "{} · ML {} {:.2}",
-                acceptance.expected_label.as_str(),
+                acceptance
+                    .expected_label
+                    .map(|label| label.as_str())
+                    .unwrap_or(acceptance.actual_diagnosis_status.as_str()),
                 acceptance.actual_ml_top,
                 acceptance.actual_ml_probability
             ))

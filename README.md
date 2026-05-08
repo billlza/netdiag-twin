@@ -136,8 +136,10 @@ cargo run -p netdiag-cli -- lab verify-action <before_run_id> \
 ```
 
 What-if output is advisory. `lab verify-action` is the closed-loop check that
-compares observed before/after telemetry and records whether latency, loss, or
-throughput actually improved without quality degradation.
+compares observed before/after telemetry. By default it still accepts a clear
+5% improvement with no quality degradation; Lab scenarios can now define a
+`verification.objective` and `verification.fail_if` policy when a change has a
+specific latency/loss/throughput target.
 
 Export a saved report:
 
@@ -174,13 +176,17 @@ cargo run -p netdiag-cli -- train \
   --stratified \
   --min-rows-per-label 5
 shasum -a 256 artifacts/model/model_manifest.json artifacts/model/rust_logistic_model.json
+cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab validate <run_id> --artifacts artifacts
 ```
 
 Copy the manifest/model hashes into the scenario acceptance block when the lab
-gate must be pinned to a specific model bundle.
+gate must be pinned to a specific model bundle. Known-fault scenarios should set
+`expected_label` or `acceptance.expected_root_cause`; OOD-only scenarios can
+omit both when `allowed_diagnosis_statuses` explicitly contains only
+`out_of_distribution` or `uncertain`.
 
 Validate topology and policy YAML before giving it to a lab run:
 

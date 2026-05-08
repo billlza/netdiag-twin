@@ -396,6 +396,8 @@ pub fn list_run_timeline(
             sample: entry.sample,
             status: entry.status,
             root_causes: entry.root_causes,
+            diagnosis_status: entry.diagnosis_status,
+            uncertainty_reason_codes: entry.uncertainty_reason_codes,
             ml_top_label: entry.ml_top_label,
             quality_status: entry.quality_status,
         })
@@ -428,7 +430,7 @@ pub fn run_history_entry(
                 .count()
         })
         .unwrap_or(0);
-    let (root_causes, ml_top_label, ml_top_probability, model_kind, synthetic_model) = report
+    let history_fields = report
         .as_ref()
         .map(report_history_fields)
         .unwrap_or_default();
@@ -461,11 +463,13 @@ pub fn run_history_entry(
         created_at: index.created_at,
         status: index.status,
         run_dir: run_dir_path.display().to_string(),
-        root_causes,
-        ml_top_label,
-        ml_top_probability,
-        model_kind,
-        synthetic_model,
+        root_causes: history_fields.root_causes,
+        diagnosis_status: history_fields.diagnosis_status,
+        uncertainty_reason_codes: history_fields.uncertainty_reason_codes,
+        ml_top_label: history_fields.ml_top_label,
+        ml_top_probability: history_fields.ml_top_probability,
+        model_kind: history_fields.model_kind,
+        synthetic_model: history_fields.synthetic_model,
         measurement_quality,
         quality,
         quality_status,
@@ -945,20 +949,25 @@ fn missing_metric_names(provenance: &[MetricProvenance]) -> Vec<String> {
         .collect()
 }
 
-fn report_history_fields(
-    report: &Report,
-) -> (
-    Vec<String>,
-    Option<String>,
-    Option<f64>,
-    Option<String>,
-    bool,
-) {
+#[derive(Debug, Default)]
+struct ReportHistoryFields {
+    root_causes: Vec<String>,
+    diagnosis_status: crate::models::DiagnosisStatus,
+    uncertainty_reason_codes: Vec<crate::models::UncertaintyReasonCode>,
+    ml_top_label: Option<String>,
+    ml_top_probability: Option<f64>,
+    model_kind: Option<String>,
+    synthetic_model: bool,
+}
+
+fn report_history_fields(report: &Report) -> ReportHistoryFields {
     let root_causes = report
         .root_causes
         .iter()
         .map(|root| root.symptom.clone())
         .collect();
+    let diagnosis_status = report.diagnosis_status;
+    let uncertainty_reason_codes = report.uncertainty.reason_codes.clone();
     let top_prediction = report.rule_vs_ml.ml_top.clone();
     let ml_top_label = (!top_prediction.is_empty()).then_some(top_prediction);
     let ml_top_probability = Some(report.rule_vs_ml.ml_top_prob);
@@ -970,13 +979,15 @@ fn report_history_fields(
         .model_manifest
         .as_ref()
         .is_some_and(|manifest| manifest.synthetic_fallback);
-    (
+    ReportHistoryFields {
         root_causes,
+        diagnosis_status,
+        uncertainty_reason_codes,
         ml_top_label,
         ml_top_probability,
         model_kind,
         synthetic_model,
-    )
+    }
 }
 
 fn percent_delta(left: f64, right: f64) -> Option<f64> {

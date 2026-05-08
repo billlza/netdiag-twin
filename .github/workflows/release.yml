@@ -22,7 +22,7 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
@@ -289,7 +289,7 @@ jobs:
           mkdir -p target/pages
           cp target/release/appcast.xml target/pages/appcast.xml
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           fail_on_unmatched_files: true
@@ -297,11 +297,11 @@ jobs:
             target/release/NetDiag-Twin-*.dmg
             target/release/appcast.xml
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: target/pages
       - name: Deploy appcast to Pages
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
       - name: Validate published appcast
         run: |
           set -euo pipefail
@@ -312,7 +312,7 @@ jobs:
           grep -F "$dmg_url" "$RUNNER_TEMP/appcast.xml" >/dev/null
           curl -fsIL --retry 5 --retry-delay 3 "$dmg_url" >/dev/null
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: billlza/homebrew-netdiag-twin
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

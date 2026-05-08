@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod connectors;
 pub mod dataset;
 pub mod error;
@@ -7,8 +8,10 @@ pub mod lab;
 pub mod ml;
 pub mod models;
 pub mod perf_budget;
+pub mod pilot;
 pub mod pipeline;
 pub mod recommendation;
+pub mod reliability;
 pub mod report;
 pub mod rules;
 pub mod storage;

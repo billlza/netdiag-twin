@@ -18,6 +18,10 @@ regression checks, platform incident evidence bundles, lab gates for adapter or
 telemetry-source changes, and calibrated unknown/OOD checks before a model is
 trusted in a real environment.
 
+v0.4.3 adds pilot-ready reliability hardening: explicit artifact integrity
+checks, a benchmark report that pairs CI-friendly JSON with a human Markdown
+summary, and a safe real-device pilot flow for generic lab kits.
+
 ## Rust Workspace
 
 ```text
@@ -178,11 +182,10 @@ Run a reproducible lab scenario with typed acceptance gates:
 
 ```bash
 cargo run -p netdiag-cli -- train \
-  --dataset artifacts/datasets/lab-training.jsonl \
+  --dataset examples/datasets/pilot-smoke-training.jsonl \
   --model-dir artifacts/model \
-  --validation-split 0.2 \
-  --stratified \
-  --min-rows-per-label 5
+  --validation-split 0 \
+  --min-rows-per-label 1
 shasum -a 256 artifacts/model/model_manifest.json artifacts/model/rust_logistic_model.json
 cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
@@ -236,6 +239,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTFLAGS="-D warnings" cargo test --workspace
 scripts/check_perf_budget.sh
+scripts/check_architecture_guard.sh
+cargo run -p netdiag-cli -- benchmark run \
+  --artifacts target/benchmark-artifacts \
+  --output target/benchmark-report
 ```
 
 Golden tests cover all six sample traces:
@@ -253,6 +260,46 @@ intentional performance change:
 ```bash
 scripts/check_perf_budget.sh --update-baseline
 ```
+
+Run the reliability guard against an artifact root after it contains at least
+one run, or against a single run:
+
+```bash
+cargo run -p netdiag-cli -- reliability check --artifacts artifacts
+cargo run -p netdiag-cli -- reliability check --artifacts artifacts --run-id <run_id>
+```
+
+Run the bundled benchmark report:
+
+```bash
+cargo run -p netdiag-cli -- benchmark run \
+  --artifacts target/benchmark-artifacts \
+  --output target/benchmark-report
+```
+
+The command writes `benchmark_report.json` with schema
+`netdiag-benchmark-report/v1` and `benchmark_report.md` for release review.
+
+Run a CI-safe pilot smoke or adapt the generic lab kit manifest for real
+devices:
+
+```bash
+cargo run -p netdiag-cli -- train \
+  --dataset examples/datasets/pilot-smoke-training.jsonl \
+  --model-dir target/pilot-artifacts/model \
+  --validation-split 0 \
+  --min-rows-per-label 1
+cargo run -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
+  --artifacts target/pilot-artifacts
+cargo run -p netdiag-cli -- pilot run examples/pilots/loopback-mock.yaml \
+  --artifacts target/pilot-artifacts
+```
+
+Pilot runs default to read-only. Sources marked `active: true` require both
+manifest `safety.allow_active: true` and the CLI `--allow-active` flag. Pilot
+runs require an existing model bundle and never create a synthetic fallback.
+The bundled dataset is only a smoke fixture; real lab gates should train from
+representative accepted runs and use stricter per-label minimums.
 
 ## Artifacts
 

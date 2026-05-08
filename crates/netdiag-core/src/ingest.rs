@@ -87,6 +87,10 @@ pub fn ingest_trace(path: impl AsRef<Path>) -> Result<IngestResult> {
     normalize(raw_trace, sample)
 }
 
+pub fn ingest_json_value(value: Value, sample: impl Into<String>) -> Result<IngestResult> {
+    normalize(raw_trace_from_json(value), sample.into())
+}
+
 pub fn build_ingest_result(
     records: Vec<TraceRecord>,
     sample: impl Into<String>,
@@ -212,6 +216,10 @@ fn load_csv(path: &Path) -> Result<RawTrace> {
 fn load_json(path: &Path) -> Result<RawTrace> {
     let file = File::open(path).with_path(path)?;
     let value: Value = serde_json::from_reader(BufReader::new(file))?;
+    Ok(raw_trace_from_json(value))
+}
+
+fn raw_trace_from_json(value: Value) -> RawTrace {
     let rows = match value {
         Value::Array(items) => items,
         Value::Object(mut object) => object
@@ -242,11 +250,11 @@ fn load_json(path: &Path) -> Result<RawTrace> {
         }
         records.push(row);
     }
-    Ok(RawTrace {
+    RawTrace {
         rows: records,
         present_columns,
         warnings: Vec::new(),
-    })
+    }
 }
 
 fn normalize(mut raw_trace: RawTrace, sample: String) -> Result<IngestResult> {

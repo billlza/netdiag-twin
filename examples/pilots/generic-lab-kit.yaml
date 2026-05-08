@@ -1,0 +1,52 @@
+schema: netdiag-pilot/v1
+id: generic-lab-kit
+name: Generic lab kit pilot
+operator: lab-operator
+safety:
+  allow_active: false
+  retention_days: 14
+sources:
+  - name: openconfig-gnmi
+    kind: adapter_sample
+    endpoint: ../adapters/openconfig-gnmi/adapter.py
+    role: corroborating
+    active: false
+    metadata:
+      stack: OpenConfig/gNMI
+      device_scope: interfaces and counters
+  - name: snmp-if-mib
+    kind: adapter_sample
+    endpoint: ../adapters/snmp-if-mib/adapter.py
+    role: corroborating
+    active: false
+    metadata:
+      stack: SNMP IF-MIB
+      device_scope: interface counters
+  - name: frr-routing-state
+    kind: adapter_sample
+    endpoint: ../adapters/frr-routing-state/adapter.py
+    role: corroborating
+    active: false
+    metadata:
+      stack: FRR
+      device_scope: routing state
+  - name: iperf3-primary
+    kind: adapter_sample
+    endpoint: ../adapters/iperf3-http-json/adapter.py
+    role: primary
+    active: false
+    metadata:
+      stack: iperf3
+      device_scope: throughput and loss probe sample
+  - name: tc-netem
+    kind: adapter_sample
+    endpoint: ../adapters/tc-netem-lab/adapter.py
+    role: corroborating
+    active: false
+    metadata:
+      stack: tc/netem
+      device_scope: lab impairment metadata
+gates:
+  allowed_connector_status:
+    - ok
+    - degraded

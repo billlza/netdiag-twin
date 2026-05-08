@@ -1,0 +1,20 @@
+schema: netdiag-pilot/v1
+id: loopback-mock
+name: Loopback mock pilot
+operator: local
+safety:
+  allow_active: false
+  retention_days: 7
+sources:
+  - name: iperf3-sample
+    kind: adapter_sample
+    endpoint: ../adapters/iperf3-http-json/adapter.py
+    role: primary
+    active: false
+    metadata:
+      stack: iperf3 + adapter sample
+      purpose: CI-safe pilot smoke
+gates:
+  allowed_connector_status:
+    - ok
+    - degraded

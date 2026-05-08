@@ -165,7 +165,13 @@ fn top_level_run_location(artifact_root: &Path, run_id: &str) -> Option<RunLocat
         let lab_run_dir = artifact_root
             .join("scenario.yaml")
             .exists()
-            .then(|| artifact_root.to_path_buf());
+            .then(|| artifact_root.to_path_buf())
+            .or_else(|| {
+                artifact_root
+                    .join("pilot.yaml")
+                    .exists()
+                    .then(|| artifact_root.to_path_buf())
+            });
         RunLocation {
             artifact_root: artifact_root.to_path_buf(),
             run_dir: run_dir_path,

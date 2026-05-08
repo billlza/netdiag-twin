@@ -108,6 +108,8 @@ python3 -m venv .venv-jsonschema
 .venv-jsonschema/bin/python -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
 .venv-jsonschema/bin/python scripts/validate_adapter_samples.py
 scripts/check_perf_budget.sh
+scripts/check_architecture_guard.sh
+cargo run -p netdiag-cli -- benchmark run --artifacts target/benchmark-artifacts --output target/benchmark-report
 git diff --check
 bash -n scripts/*.sh
 ```
@@ -119,6 +121,8 @@ bash -n scripts/*.sh
 - 测试全通过。
 - adapter sample 同时通过 JSON schema 与 Rust ingest 校验。
 - 性能预算通过。
+- 架构 guard 通过，避免继续扩大核心大文件。
+- benchmark report 生成 `benchmark_report.json` 和 `benchmark_report.md`。
 - shell 脚本语法检查通过。
 
 如果任何一步失败，先修代码，不要跳过 gate。

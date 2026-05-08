@@ -14,6 +14,7 @@ flowchart LR
     H --> I
     I --> J["Report + evidence timeline + artifacts"]
     J --> K["Lab calibration and closed-loop verification"]
+    J --> L["Reliability, benchmark, and pilot reports"]
 ```
 
 ## Crates
@@ -33,6 +34,10 @@ flowchart LR
 - What-if output is advisory until `lab verify-action` compares before/after telemetry against the scenario objective. Verification artifacts record predicted deltas, observed deltas, and prediction error for later calibration.
 - Reports include an `evidence_timeline` that orders telemetry movement, rule events, ML uncertainty/OOD decisions, and corroborating source support for human handoff.
 - Reports and review state remain local JSON artifacts under `artifacts/runs/<run_id>/` or indexed lab run directories.
+- Reliability checks, benchmark reports, and real-device pilot reports are
+  intentionally separate modules. They compose existing ingestion, lab,
+  performance, and storage APIs instead of adding more orchestration to the
+  already-large Lab or connector modules.
 
 ## Calibration Loops
 
@@ -44,3 +49,10 @@ flowchart LR
 NetDiag is positioned for SRE/platform workflows as much as network engineering:
 incident triage, deploy regression checks, lab gates for telemetry adapters, and
 evidence bundles for handoff.
+
+## v0.4.3 Architecture Guard
+
+New reliability, benchmark, and pilot work must live behind narrow modules and
+CLI handlers. `scripts/check_architecture_guard.sh` protects the current
+complexity baselines for `lab.rs`, `connectors.rs`, CLI `main.rs`, and app
+`main.rs`, while also keeping the new modules small enough to review.

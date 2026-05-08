@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.4.2 platform contract for SRE and platform
+This guide describes the stable v0.4.3 platform contract for SRE and platform
 teams: how telemetry becomes canonical `TraceRecord` rows, how live adapters
 map into the same pipeline, how ML abstention is reported, and where diagnosis,
 what-if, post-action verification, recommendation, and human-review artifacts
@@ -34,6 +34,19 @@ Run the core golden contract tests:
 ```bash
 cargo test -p netdiag-core --test golden
 ```
+
+Run the v0.4.3 reliability and benchmark gates:
+
+```bash
+cargo run -p netdiag-cli -- benchmark run \
+  --artifacts target/benchmark-artifacts \
+  --output target/benchmark-report
+cargo run -p netdiag-cli -- reliability check \
+  --artifacts target/benchmark-artifacts/known-samples
+```
+
+`benchmark_report.json` is the CI-facing contract; `benchmark_report.md` is the
+human review artifact for release notes, mentor review, and lab handoff.
 
 ## Canonical Trace Schema
 
@@ -165,7 +178,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.4.2 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.4.3 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -186,7 +199,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.4.2 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.4.3 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -293,11 +306,10 @@ policy, collection windows, and acceptance gates.
 
 ```bash
 cargo run -p netdiag-cli -- train \
-  --dataset artifacts/datasets/lab-training.jsonl \
+  --dataset examples/datasets/pilot-smoke-training.jsonl \
   --model-dir artifacts/model \
-  --validation-split 0.2 \
-  --stratified \
-  --min-rows-per-label 5
+  --validation-split 0 \
+  --min-rows-per-label 1
 shasum -a 256 artifacts/model/model_manifest.json artifacts/model/rust_logistic_model.json
 cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
@@ -356,6 +368,45 @@ for scenario in examples/scenarios/ood-*.yaml; do
   cargo run -p netdiag-cli -- lab preflight "$scenario"
 done
 ```
+
+## Real-Device Pilot
+
+Pilot manifests use `netdiag-pilot/v1` and are intentionally separate from Lab
+scenario acceptance. A pilot inventories real or mock device sources, enforces a
+read-only default, runs the primary source through the normal diagnosis
+pipeline, stores connector health, and writes `pilot_report.json` with redacted
+source metadata.
+
+Start with the CI-safe mock pilot:
+
+```bash
+cargo run -p netdiag-cli -- train \
+  --dataset examples/datasets/pilot-smoke-training.jsonl \
+  --model-dir target/pilot-artifacts/model \
+  --validation-split 0 \
+  --min-rows-per-label 1
+cargo run -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
+  --artifacts target/pilot-artifacts
+cargo run -p netdiag-cli -- pilot run examples/pilots/loopback-mock.yaml \
+  --artifacts target/pilot-artifacts
+```
+
+The generic lab-kit example shows the intended real-device shape with
+OpenConfig/gNMI, SNMP IF-MIB, FRR routing state, iperf3, and tc/netem adapter
+samples:
+
+```bash
+cargo run -p netdiag-cli -- pilot preflight examples/pilots/generic-lab-kit.yaml \
+  --artifacts target/pilot-artifacts
+```
+
+Pilot sources are read-only unless a source sets `active: true`, the manifest
+sets `safety.allow_active: true`, and the operator also passes `--allow-active`
+on the CLI. Pilot runs require `<artifacts>/model` to contain an existing model
+bundle; they never create synthetic fallback models. Credential-like
+values are redacted from pilot inventory and saved payload snapshots. The
+bundled training dataset is a smoke fixture; real pilots should train from
+representative accepted runs and use stricter per-label minimums.
 
 Each lab run writes:
 

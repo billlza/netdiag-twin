@@ -43,6 +43,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+mod commands;
+
 #[derive(Debug, Parser)]
 #[command(name = "netdiag")]
 #[command(about = "NetDiag Twin Rust-native diagnostics CLI")]
@@ -195,6 +197,18 @@ enum Command {
         diagnose: bool,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+    },
+    Reliability {
+        #[command(subcommand)]
+        command: commands::reliability::ReliabilityCommand,
+    },
+    Benchmark {
+        #[command(subcommand)]
+        command: commands::benchmark::BenchmarkCommand,
+    },
+    Pilot {
+        #[command(subcommand)]
+        command: commands::pilot::PilotCommand,
     },
     PerfBudget {
         #[arg(long, default_value = "perf-baseline.json")]
@@ -892,6 +906,9 @@ fn run(args: Args) -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Reliability { command } => commands::reliability::run(command)?,
+        Command::Benchmark { command } => commands::benchmark::run(command)?,
+        Command::Pilot { command } => commands::pilot::run(command)?,
         Command::PerfBudget {
             baseline,
             output,

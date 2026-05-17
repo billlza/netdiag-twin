@@ -1,7 +1,7 @@
 use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::ConnectorHealthStatus;
 use crate::storage::{
-    RunLocation, list_run_locations, read_json, read_report, resolve_run_location, run_artifacts,
+    list_run_locations, read_json, read_report, resolve_run_location, run_artifacts,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -142,9 +142,9 @@ pub fn check_reliability(options: ReliabilityCheckOptions) -> Result<Reliability
     let mut checks = Vec::new();
     checks.push(check_artifact_root_exists(&artifact_root));
     let locations = if let Some(run_id) = &options.run_id {
-        vec![discover_run_location(&artifact_root, run_id)?]
+        vec![resolve_run_location(&artifact_root, run_id)?]
     } else {
-        discover_run_locations(&artifact_root)?
+        list_run_locations(&artifact_root)?
     };
     if locations.is_empty() {
         checks.push(ReliabilityCheck {
@@ -183,72 +183,6 @@ pub fn check_reliability(options: ReliabilityCheckOptions) -> Result<Reliability
         status,
         checks,
     })
-}
-
-fn discover_run_location(artifact_root: &Path, run_id: &str) -> Result<RunLocation> {
-    match resolve_run_location(artifact_root, run_id) {
-        Ok(location) => Ok(location),
-        Err(err) => scan_pilot_run_locations(artifact_root)?
-            .into_iter()
-            .find(|location| run_location_id(location) == run_id)
-            .ok_or(err),
-    }
-}
-
-fn discover_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
-    let mut locations = list_run_locations(artifact_root)?;
-    let mut seen = locations
-        .iter()
-        .map(|location| location.run_dir.display().to_string())
-        .collect::<BTreeSet<_>>();
-    for location in scan_pilot_run_locations(artifact_root)? {
-        if seen.insert(location.run_dir.display().to_string()) {
-            locations.push(location);
-        }
-    }
-    locations.sort_by(|left, right| left.run_dir.cmp(&right.run_dir));
-    Ok(locations)
-}
-
-fn scan_pilot_run_locations(artifact_root: &Path) -> Result<Vec<RunLocation>> {
-    let root = artifact_root.join("pilot-runs");
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut locations = Vec::new();
-    for pilot in fs::read_dir(&root).with_path(&root)?.flatten() {
-        let pilot_dir = pilot.path();
-        if !pilot_dir.is_dir() {
-            continue;
-        }
-        for run_set in fs::read_dir(&pilot_dir).with_path(&pilot_dir)?.flatten() {
-            let pilot_run_dir = run_set.path();
-            let runs_dir = pilot_run_dir.join("runs");
-            if !runs_dir.is_dir() {
-                continue;
-            }
-            for run in fs::read_dir(&runs_dir).with_path(&runs_dir)?.flatten() {
-                let run_dir = run.path();
-                if run_dir.join("manifest.json").exists() {
-                    locations.push(RunLocation {
-                        artifact_root: pilot_run_dir.clone(),
-                        run_dir,
-                        lab_run_dir: Some(pilot_run_dir.clone()),
-                        lab_index_root: Some(artifact_root.to_path_buf()),
-                    });
-                }
-            }
-        }
-    }
-    Ok(locations)
-}
-
-fn run_location_id(location: &RunLocation) -> &str {
-    location
-        .run_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("")
 }
 
 pub fn classify_connector_error(message: &str) -> ReliabilityReasonCode {

@@ -18,9 +18,13 @@ regression checks, platform incident evidence bundles, lab gates for adapter or
 telemetry-source changes, and calibrated unknown/OOD checks before a model is
 trusted in a real environment.
 
-v0.4.3 adds pilot-ready reliability hardening: explicit artifact integrity
+v0.5.0 adds pilot-ready reliability hardening: explicit artifact integrity
 checks, a benchmark report that pairs CI-friendly JSON with a human Markdown
 summary, and a safe real-device pilot flow for generic lab kits.
+
+The v0.5 direction is [Pilot Run Center](docs/pilot-run-center.md): a real-device
+trial loop that turns pilot manifests into preflight, collection, diagnosis,
+evidence bundle, review, and verification instead of more one-off commands.
 
 ## Rust Workspace
 
@@ -127,6 +131,23 @@ cargo run -p netdiag-cli -- collect --kind native-pcap --endpoint ./fixtures/ret
 cargo run -p netdiag-cli -- collect --kind system-counters --endpoint all --interval-secs 1
 ```
 
+Run the v0.5 Pilot Run Center loop from CLI:
+
+```bash
+cargo run -p netdiag-cli -- train \
+  --dataset examples/datasets/pilot-smoke-training.jsonl \
+  --model-dir artifacts/model \
+  --validation-split 0 \
+  --min-rows-per-label 1
+cargo run -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml --artifacts artifacts
+cargo run -p netdiag-cli -- pilot workflow examples/pilots/loopback-mock.yaml --artifacts artifacts
+```
+
+The desktop app exposes the same flow from the Lab page as `Pilot Run Center`.
+Use `examples/pilots/generic-lab-kit.yaml` to exercise the executable adapter
+contract, or `examples/pilots/connector-family-readonly.yaml` to review the
+read-only connector family manifest shape.
+
 Run a what-if action against an existing run:
 
 ```bash
@@ -212,6 +233,18 @@ for scenario in examples/scenarios/ood-*.yaml; do
 done
 ```
 
+Gate a trained model before promoting it for real pilots:
+
+```bash
+cargo run -p netdiag-cli -- benchmark run \
+  --artifacts target/benchmark-artifacts \
+  --output target/benchmark-report
+cargo run -p netdiag-cli -- pilot model-gate \
+  --model-dir artifacts/model \
+  --benchmark-report target/benchmark-report/benchmark_report.json \
+  --min-rows-per-label 10
+```
+
 Validate topology and policy YAML before giving it to a lab run:
 
 ```bash
@@ -234,6 +267,7 @@ cargo run -p netdiag-cli -- dataset split artifacts/datasets/feedback.jsonl --st
 ## Validation
 
 ```bash
+scripts/check_rust_quality.sh fast
 cargo fmt --check --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
@@ -244,6 +278,12 @@ cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
   --output target/benchmark-report
 ```
+
+The v0.5 strict release gate is documented in
+[docs/quality-gates.md](docs/quality-gates.md). It targets at least 90% line
+coverage with `cargo llvm-cov`, plus nextest, dependency checks, complexity
+ratchets, performance budget, and benchmark artifacts. The strict gate fails on
+rustc, clippy, and cargo-deny warnings, not just non-zero exit codes.
 
 Golden tests cover all six sample traces:
 
@@ -294,6 +334,11 @@ cargo run -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
 cargo run -p netdiag-cli -- pilot run examples/pilots/loopback-mock.yaml \
   --artifacts target/pilot-artifacts
 ```
+
+Pilot manifests can now use the same read-only connector family as CLI collect:
+`prometheus_query`, `prometheus_metrics`, `otlp_grpc`, `native_pcap`, and
+`system_counters`, with hyphenated aliases accepted for Lab/CLI parity. See
+`examples/pilots/connector-family-readonly.yaml` for the v0.5 source envelope.
 
 Pilot runs default to read-only. Sources marked `active: true` require both
 manifest `safety.allow_active: true` and the CLI `--allow-active` flag. Pilot

@@ -96,20 +96,14 @@ awk -F ' = ' '/^version =/ {gsub("\"", "", $2); print $2; exit}' Cargo.toml
 
 ## 3. 本地质量门禁
 
-发布前必须跑完这些命令：
+发布前必须跑完 strict gate。这个 gate 会固定使用并校验
+`cargo-nextest`、`cargo-llvm-cov`、`cargo-deny` 和 `cargo-machete`，并且把
+rustc/clippy/cargo-deny warning 当成发布阻断项：
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-RUSTFLAGS="-D warnings" cargo test --workspace
 python3 -m venv .venv-jsonschema
 .venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
-.venv-jsonschema/bin/python -m py_compile scripts/validate_adapter_samples.py examples/adapters/*/*.py
-.venv-jsonschema/bin/python scripts/validate_adapter_samples.py
-scripts/check_perf_budget.sh
-scripts/check_architecture_guard.sh
-cargo run -p netdiag-cli -- benchmark run --artifacts target/benchmark-artifacts --output target/benchmark-report
+scripts/check_rust_quality.sh strict
 git diff --check
 bash -n scripts/*.sh
 ```
@@ -118,7 +112,9 @@ bash -n scripts/*.sh
 
 - 0 clippy warnings。
 - 0 rustc warnings。
+- 0 cargo-deny warnings；新增 duplicate dependency 默认失败，现有 duplicate 必须在 `deny.toml` 中精确锁版本并写明原因。
 - 测试全通过。
+- v0.5 Pilot/CLI 发布关键面覆盖率至少 90%，workspace 覆盖率不能低于 ratchet floor。
 - adapter sample 同时通过 JSON schema 与 Rust ingest 校验。
 - 性能预算通过。
 - 架构 guard 通过，避免继续扩大核心大文件。

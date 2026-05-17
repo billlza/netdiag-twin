@@ -11,7 +11,6 @@ anyhow.workspace = true
 chrono.workspace = true
 eframe.workspace = true
 egui-remixicon = { version = "0.34.0", default-features = false }
-egui_extras.workspace = true
 netdiag-core = { path = "../netdiag-core" }
 reqwest.workspace = true
 rfd.workspace = true
@@ -22,7 +21,7 @@ serde_json.workspace = true
 ttf-parser = "0.25.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = "4.0.0"
+apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 keyring-core = "1.0.0"
 muda.workspace = true
 objc2 = "0.6.4"

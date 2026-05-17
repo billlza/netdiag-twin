@@ -25,6 +25,31 @@ def sample_if_mib() -> dict:
     }
 
 
+def preflight_report(args: argparse.Namespace) -> dict:
+    input_ok = args.input_json is None or args.input_json.is_file()
+    return {
+        "schema": "netdiag-adapter-preflight/v1",
+        "adapter": "snmp-if-mib",
+        "passed": input_ok,
+        "checks": [
+            {
+                "name": "input-json",
+                "status": "ok" if input_ok else "error",
+                "message": "offline sample mode"
+                if args.input_json is None
+                else str(args.input_json),
+            },
+            {
+                "name": "collection-mode",
+                "status": "ok",
+                "message": "read-only IF-MIB counter conversion",
+            },
+        ],
+        "health": {"status": "ok" if input_ok else "error", "source": args.sample},
+        "redaction": {"secrets": [], "fields": ["community", "auth_passphrase"]},
+    }
+
+
 def number(value: object, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -65,11 +90,17 @@ def record_from_if_mib(row: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-json", type=Path)
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--collect", action="store_true")
     parser.add_argument("--emit-sample", action="store_true")
     parser.add_argument("--sample", default="snmp-if-mib")
     parser.add_argument("--scenario-id", default="manual-snmp-if-mib")
     parser.add_argument("--ground-truth", default="normal")
     args = parser.parse_args()
+
+    if args.preflight:
+        print(json.dumps(preflight_report(args), indent=2))
+        return
 
     if args.emit_sample:
         rows = [sample_if_mib()]

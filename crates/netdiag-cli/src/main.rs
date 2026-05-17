@@ -11,6 +11,7 @@ use netdiag_core::dataset::{
     inspect_dataset_jsonl, register_dataset_jsonl, split_dataset_jsonl, validate_dataset_jsonl,
     validate_dataset_jsonl_with_options,
 };
+use netdiag_core::diagnose_file;
 use netdiag_core::evidence_bundle::export_evidence_bundle;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
@@ -38,7 +39,6 @@ use netdiag_core::twin::{
     import_topology, run_simulated_whatif, run_simulated_whatif_with_policy,
     validate_policy_action_for_topology, validate_policy_action_shape, validate_topology_model,
 };
-use netdiag_core::{Result as CoreResult, diagnose_file};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -1076,10 +1076,8 @@ fn load_mapping(
     }
 }
 
-#[allow(dead_code)]
-fn _core_result<T>(value: CoreResult<T>) -> CoreResult<T> {
-    value
-}
+#[cfg(test)]
+mod main_tests;
 
 #[cfg(test)]
 mod tests {

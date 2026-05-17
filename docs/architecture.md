@@ -50,9 +50,18 @@ NetDiag is positioned for SRE/platform workflows as much as network engineering:
 incident triage, deploy regression checks, lab gates for telemetry adapters, and
 evidence bundles for handoff.
 
-## v0.4.3 Architecture Guard
+## v0.5 Architecture Guard
 
 New reliability, benchmark, and pilot work must live behind narrow modules and
 CLI handlers. `scripts/check_architecture_guard.sh` protects the current
 complexity baselines for `lab.rs`, `connectors.rs`, CLI `main.rs`, and app
 `main.rs`, while also keeping the new modules small enough to review.
+
+For v0.5 Pilot Run Center work, source loading belongs in
+`netdiag-core::pilot::pilot_sources`, workflow in
+`netdiag-core::pilot::workflow`, promotion gates in
+`netdiag-core::pilot::promotion`, and desktop UI state in
+`netdiag-app::pilot_run_center`. None of those responsibilities should drift
+back into the Lab runner, connector monolith, CLI root dispatch, or app
+`main.rs`. The stricter `scripts/check_complexity.py` ratchets existing large
+files and keeps new Rust modules below the reviewable default budget.

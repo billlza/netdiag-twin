@@ -1,0 +1,89 @@
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Transitive through linfa-logistic -> argmin. Keep this explicit so the
+    # release gate still surfaces the ML-stack replacement work. Owner, expiry,
+    # and removal plan are enforced by scripts/check_deny_waivers.py.
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+exceptions = [
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+# New duplicate versions are release blockers. The explicit skips below are the
+# audited transitive duplicates in the current macOS release graph; each entry
+# must stay version-pinned so upstream convergence is visible in review.
+multiple-versions = "deny"
+wildcards = "allow"
+highlight = "all"
+skip = [
+    { crate = "bitflags@1.3.2", reason = "Transitive through pcap/CoreGraphics; retained until upstream moves to bitflags 2.x." },
+    { crate = "block2@0.5.1", reason = "Transitive through accesskit/winit objc2 0.5 stack; app UI also needs objc2 0.6 via current macOS crates." },
+    { crate = "calloop@0.13.0", reason = "Transitive through Linux Wayland UI stack; current winit graph also requires calloop 0.14." },
+    { crate = "calloop-wayland-source@0.3.0", reason = "Transitive through Linux Wayland UI stack; current winit graph also requires 0.4." },
+    { crate = "core-foundation@0.9.4", reason = "Transitive through legacy macOS helpers while newer GUI/security crates use 0.10." },
+    { crate = "cpufeatures@0.2.17", reason = "Transitive crypto dependency kept beside cpufeatures 0.3 until upstream crypto stacks converge." },
+    { crate = "errno@0.2.8", reason = "Transitive through pcap/system crates; retained until those crates move to errno 0.3." },
+    { crate = "foldhash@0.1.5", reason = "Transitive data/indexing stack duplicate; retained until upstream crates converge on foldhash 0.2." },
+    { crate = "getrandom@0.2.17", reason = "Transitive through rand 0.8-era ML dependencies; retained until linfa stack upgrades rand." },
+    { crate = "getrandom@0.3.4", reason = "Transitive through rand 0.9-era dependencies; retained beside getrandom 0.4 until upstream convergence." },
+    { crate = "hashbrown@0.15.5", reason = "Transitive data/indexing duplicate; retained until linfa/petgraph/egui dependency graph converges." },
+    { crate = "hashbrown@0.16.1", reason = "Transitive data/indexing duplicate; retained until linfa/petgraph/egui dependency graph converges." },
+    { crate = "itertools@0.13.0", reason = "Transitive ML/platform duplicate; retained until upstream crates converge on itertools 0.14." },
+    { crate = "jni-sys@0.3.1", reason = "Transitive Android/platform UI dependency retained beside newer jni-sys until upstream convergence." },
+    { crate = "linux-raw-sys@0.4.15", reason = "Transitive Linux system stack duplicate retained until rustix-era dependencies converge." },
+    { crate = "objc2@0.5.2", reason = "Transitive through accesskit/winit; retained beside objc2 0.6 required by current macOS UI/file-dialog crates." },
+    { crate = "objc2-app-kit@0.2.2", reason = "Transitive through accesskit/winit; retained beside objc2-app-kit 0.3 required by current macOS UI/file-dialog crates." },
+    { crate = "objc2-foundation@0.2.2", reason = "Transitive through accesskit/winit; retained beside objc2-foundation 0.3 required by current macOS UI/file-dialog crates." },
+    { crate = "objc2-ui-kit@0.2.2", reason = "Transitive through accesskit/winit; retained beside objc2-ui-kit 0.3 required by current macOS UI/file-dialog crates." },
+    { crate = "r-efi@5.3.0", reason = "Transitive platform dependency retained beside r-efi 6 until upstream getrandom/platform crates converge." },
+    { crate = "rand@0.8.6", reason = "Transitive through linfa/argmin ML stack; retained until the ML backend upgrades from rand 0.8." },
+    { crate = "rand@0.9.4", reason = "Transitive through telemetry/database dependencies; retained beside workspace rand 0.10 until upstream convergence." },
+    { crate = "rand_chacha@0.3.1", reason = "Transitive through rand 0.8-era ML dependencies; retained until linfa stack upgrades rand." },
+    { crate = "rand_core@0.6.4", reason = "Transitive through rand 0.8-era ML dependencies; retained until linfa stack upgrades rand." },
+    { crate = "rand_core@0.9.5", reason = "Transitive through rand 0.9-era dependencies; retained beside rand_core 0.10 until upstream convergence." },
+    { crate = "redox_syscall@0.4.1", reason = "Transitive platform crate retained until cross-platform dependencies converge on current redox_syscall." },
+    { crate = "redox_syscall@0.5.18", reason = "Transitive platform crate retained until cross-platform dependencies converge on current redox_syscall." },
+    { crate = "rustc-hash@1.1.0", reason = "Transitive UI/compiler helper retained beside rustc-hash 2 until upstream convergence." },
+    { crate = "rustix@0.38.44", reason = "Transitive Linux/system dependency retained beside rustix 1 until upstream pcap/platform crates converge." },
+    { crate = "smithay-client-toolkit@0.19.2", reason = "Transitive Linux Wayland UI stack retained beside 0.20 until upstream GUI crates converge." },
+    { crate = "thiserror@1.0.69", reason = "Transitive legacy dependency retained beside workspace/upstream thiserror 2 until upstream crates converge." },
+    { crate = "thiserror-impl@1.0.69", reason = "Transitive legacy dependency retained beside workspace/upstream thiserror 2 until upstream crates converge." },
+    { crate = "windows-sys@0.36.1", reason = "Transitive Windows platform crate retained for cross-target dependency graph compatibility." },
+    { crate = "windows-sys@0.52.0", reason = "Transitive Windows platform crate retained for cross-target dependency graph compatibility." },
+    { crate = "windows-sys@0.59.0", reason = "Transitive Windows platform crate retained for cross-target dependency graph compatibility." },
+    { crate = "windows_aarch64_msvc@0.36.1", reason = "Transitive Windows target crate retained beside newer windows target crates until upstream convergence." },
+    { crate = "windows_i686_gnu@0.36.1", reason = "Transitive Windows target crate retained beside newer windows target crates until upstream convergence." },
+    { crate = "windows_i686_msvc@0.36.1", reason = "Transitive Windows target crate retained beside newer windows target crates until upstream convergence." },
+    { crate = "windows_x86_64_gnu@0.36.1", reason = "Transitive Windows target crate retained beside newer windows target crates until upstream convergence." },
+    { crate = "windows_x86_64_msvc@0.36.1", reason = "Transitive Windows target crate retained beside newer windows target crates until upstream convergence." },
+    { crate = "wit-bindgen@0.51.0", reason = "Transitive WASM/component dependency retained beside wit-bindgen 0.57 until upstream convergence." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -24,6 +24,31 @@ def sample_notification() -> dict:
     }
 
 
+def preflight_report(args: argparse.Namespace) -> dict:
+    input_ok = args.input_json is None or args.input_json.is_file()
+    return {
+        "schema": "netdiag-adapter-preflight/v1",
+        "adapter": "openconfig-gnmi",
+        "passed": input_ok,
+        "checks": [
+            {
+                "name": "input-json",
+                "status": "ok" if input_ok else "error",
+                "message": "offline sample mode"
+                if args.input_json is None
+                else str(args.input_json),
+            },
+            {
+                "name": "collection-mode",
+                "status": "ok",
+                "message": "read-only normalized notification conversion",
+            },
+        ],
+        "health": {"status": "ok" if input_ok else "error", "source": args.sample},
+        "redaction": {"secrets": [], "fields": ["endpoint", "bearer_token"]},
+    }
+
+
 def number(value: object, default: float = 0.0) -> float:
     if value is None:
         return default
@@ -63,11 +88,17 @@ def record_from_notification(notification: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-json", type=Path)
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--collect", action="store_true")
     parser.add_argument("--emit-sample", action="store_true")
     parser.add_argument("--sample", default="openconfig-gnmi")
     parser.add_argument("--scenario-id", default="manual-openconfig-gnmi")
     parser.add_argument("--ground-truth", default="normal")
     args = parser.parse_args()
+
+    if args.preflight:
+        print(json.dumps(preflight_report(args), indent=2))
+        return
 
     if args.emit_sample:
         notifications = [sample_notification()]

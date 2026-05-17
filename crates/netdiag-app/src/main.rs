@@ -66,8 +66,11 @@ const RED: Color32 = Color32::from_rgb(232, 58, 53);
 const INK: Color32 = Color32::from_rgb(18, 28, 48);
 const MUTED: Color32 = Color32::from_rgb(78, 88, 118);
 
+#[cfg(test)]
+mod app_tests;
 #[cfg(target_os = "macos")]
 mod native_menu;
+mod pilot_run_center;
 
 #[cfg(target_os = "macos")]
 use native_menu::{NativeMenu, NativeMenuCommand};
@@ -371,6 +374,7 @@ struct NetDiagApp {
     lab_summary: Option<LabSummaryReport>,
     lab_job: Option<LabJob>,
     lab_status: Option<String>,
+    pilot_center: pilot_run_center::PilotRunCenterState,
     pending_delete_token: bool,
     pending_clear_runs: bool,
     pending_rebuild_model: bool,
@@ -513,6 +517,7 @@ impl NetDiagApp {
             lab_summary: None,
             lab_job: None,
             lab_status: None,
+            pilot_center: pilot_run_center::PilotRunCenterState::default(),
             pending_delete_token: false,
             pending_clear_runs: false,
             pending_rebuild_model: false,
@@ -1328,6 +1333,7 @@ impl eframe::App for NetDiagApp {
         self.poll_native_menu();
         self.poll_diagnosis_job(ui.ctx());
         self.poll_lab_job(ui.ctx());
+        self.pilot_center.poll(ui.ctx());
         self.poll_api_test_job(ui.ctx());
         self.poll_capture_session(ui.ctx());
         self.maybe_start_deferred_diagnosis(ui.ctx());
@@ -1895,6 +1901,17 @@ impl NetDiagApp {
             if let Some(status) = &self.lab_status {
                 ui.add_space(8.0);
                 ui.label(RichText::new(status).size(13.0).color(INK));
+            }
+        });
+
+        ui.add_space(16.0);
+        glass_frame(ui, |ui| {
+            if let Some(action) = self.pilot_center.render(ui, &self.artifacts_root) {
+                match action {
+                    pilot_run_center::PilotRunCenterAction::OpenPath(path) => {
+                        self.open_path_with_notice(&path);
+                    }
+                }
             }
         });
 
@@ -6511,54 +6528,4 @@ fn format_number(value: u64) -> String {
 
 fn short_id(run_id: &str) -> String {
     run_id.chars().take(18).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bundled_cjk_font_contains_required_chinese_glyphs() {
-        let face = ttf_parser::Face::parse(CJK_FONT_BYTES, 0).expect("bundled CJK font parses");
-
-        for ch in "概览诊断规则数字孪生设置导入仿真真实拥塞实验室".chars() {
-            assert!(
-                face.glyph_index(ch).is_some(),
-                "bundled CJK font is missing {ch}"
-            );
-        }
-    }
-
-    #[test]
-    fn compact_text_middle_truncates_long_values() {
-        let text = compact_text("sim.congestion.long.trace.name", 14);
-        assert!(text.contains('…'));
-        assert!(text.len() < "sim.congestion.long.trace.name".len());
-    }
-
-    #[test]
-    fn summary_card_rows_center_value_with_icon_when_no_caption() {
-        let rows = summary_card_text_rows(80.0, false);
-        assert_eq!(rows.caption_y, None);
-        assert_eq!(rows.label_y, 58.0);
-        assert_eq!(rows.value_y, 80.0);
-    }
-
-    #[test]
-    fn summary_card_rows_keep_trace_text_group_balanced() {
-        let rows = summary_card_text_rows(80.0, true);
-        assert_eq!(rows.label_y, 54.0);
-        assert_eq!(rows.value_y, 80.0);
-        assert_eq!(rows.caption_y, Some(106.0));
-        let group_center = (rows.label_y + rows.caption_y.unwrap()) / 2.0;
-        assert!((group_center - 80.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn startup_tab_round_trip_includes_lab() {
-        assert!(StartupTab::ALL.contains(&StartupTab::Lab));
-        assert_eq!(Tab::from(StartupTab::Lab), Tab::Lab);
-        assert_eq!(StartupTab::from(Tab::Lab), StartupTab::Lab);
-        assert_eq!(title_for_tab(Tab::Lab, Language::En), "Lab");
-    }
 }

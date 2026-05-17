@@ -1,0 +1,5 @@
+[waivers.RUSTSEC-2024-0436]
+owner = "netdiag-v0.5-release"
+expires = 2026-07-31
+rationale = "Transitive advisory through linfa-logistic 0.8.1 -> argmin -> paste. The current v0.5 model-promotion work still depends on the existing Rust logistic model bundle format."
+remediation = "Replace or upgrade the ML training backend so linfa-logistic no longer pulls argmin/paste, then remove this waiver and the deny.toml ignore entry before the expiry date."

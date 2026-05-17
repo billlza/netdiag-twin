@@ -12,6 +12,7 @@ sources:
     role: corroborating
     active: false
     metadata:
+      adapter_contract: netdiag-adapter/v1
       stack: OpenConfig/gNMI
       device_scope: interfaces and counters
   - name: snmp-if-mib
@@ -20,6 +21,7 @@ sources:
     role: corroborating
     active: false
     metadata:
+      adapter_contract: netdiag-adapter/v1
       stack: SNMP IF-MIB
       device_scope: interface counters
   - name: frr-routing-state
@@ -28,6 +30,7 @@ sources:
     role: corroborating
     active: false
     metadata:
+      adapter_contract: netdiag-adapter/v1
       stack: FRR
       device_scope: routing state
   - name: iperf3-primary
@@ -36,6 +39,7 @@ sources:
     role: primary
     active: false
     metadata:
+      adapter_contract: netdiag-adapter/v1
       stack: iperf3
       device_scope: throughput and loss probe sample
   - name: tc-netem
@@ -44,6 +48,7 @@ sources:
     role: corroborating
     active: false
     metadata:
+      adapter_contract: netdiag-adapter/v1
       stack: tc/netem
       device_scope: lab impairment metadata
 gates:

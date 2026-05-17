@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.4.3 platform contract for SRE and platform
+This guide describes the stable v0.5.0 platform contract for SRE and platform
 teams: how telemetry becomes canonical `TraceRecord` rows, how live adapters
 map into the same pipeline, how ML abstention is reported, and where diagnosis,
 what-if, post-action verification, recommendation, and human-review artifacts
@@ -35,7 +35,7 @@ Run the core golden contract tests:
 cargo test -p netdiag-core --test golden
 ```
 
-Run the v0.4.3 reliability and benchmark gates:
+Run the v0.5.0 reliability and benchmark gates:
 
 ```bash
 cargo run -p netdiag-cli -- benchmark run \
@@ -178,7 +178,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.4.3 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.5.0 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -199,7 +199,7 @@ percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
 ## pcap And Native Capture
 
-NetDiag v0.4.3 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.5.0 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a `.pcap` file or capture from a live interface.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
@@ -399,6 +399,13 @@ samples:
 cargo run -p netdiag-cli -- pilot preflight examples/pilots/generic-lab-kit.yaml \
   --artifacts target/pilot-artifacts
 ```
+
+Pilot manifests also support the same read-only connector families as
+`collect`: Prometheus query_range, Prometheus text exposition, OTLP gRPC,
+native pcap, and system counters. Use
+`examples/pilots/connector-family-readonly.yaml` as the v0.5 source-envelope
+template; static preflight validates endpoint shape, mapping files, pcap source
+shape, and system-counter configuration before any live collection.
 
 Pilot sources are read-only unless a source sets `active: true`, the manifest
 sets `safety.allow_active: true`, and the operator also passes `--allow-active`

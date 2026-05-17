@@ -1,12 +1,43 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 SAMPLE_TIME = "2026-05-07T09:00:00+00:00"
+
+
+def preflight_report(args: argparse.Namespace) -> dict:
+    input_ok = args.iperf_json is None or args.iperf_json.is_file()
+    live_required = args.iperf_json is None and not args.emit_sample
+    iperf_ok = not live_required or shutil.which("iperf3") is not None
+    passed = input_ok and iperf_ok
+    return {
+        "schema": "netdiag-adapter-preflight/v1",
+        "adapter": "iperf3-http-json",
+        "passed": passed,
+        "checks": [
+            {
+                "name": "iperf-json",
+                "status": "ok" if input_ok else "error",
+                "message": "offline sample mode"
+                if args.iperf_json is None
+                else str(args.iperf_json),
+            },
+            {
+                "name": "iperf3-binary",
+                "status": "ok" if iperf_ok else "error",
+                "message": "not required for fixture/sample mode"
+                if not live_required
+                else "required for live iperf3 collection",
+            },
+        ],
+        "health": {"status": "ok" if passed else "error", "source": args.sample},
+        "redaction": {"secrets": [], "fields": ["server"]},
+    }
 
 
 def record_from_iperf(payload: dict) -> dict:
@@ -81,6 +112,8 @@ def main() -> None:
     parser.add_argument("--server", default="127.0.0.1")
     parser.add_argument("--duration-secs", default=10, type=int)
     parser.add_argument("--udp", action="store_true")
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--collect", action="store_true")
     parser.add_argument("--emit-sample", action="store_true")
     parser.add_argument("--sample", default="iperf3-http-json")
     parser.add_argument("--scenario-id", default="manual-iperf3")
@@ -88,6 +121,10 @@ def main() -> None:
     parser.add_argument("--fault-end", default="")
     parser.add_argument("--ground-truth", default="normal")
     args = parser.parse_args()
+
+    if args.preflight:
+        print(json.dumps(preflight_report(args), indent=2))
+        return
 
     payload = sample_iperf_json(args.udp) if args.emit_sample else load_iperf_json(args)
     record = record_from_iperf(payload)

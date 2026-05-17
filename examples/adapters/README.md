@@ -33,6 +33,26 @@ The CI validator uses `--emit-sample`, so adapter schema checks do not require
 network access, `tc`, an `iperf3` server, SNMP/gNMI credentials, or long-running
 HTTP exporters.
 
+For v0.5 Pilot Run Center, adapters should converge on this executable
+contract:
+
+- `--preflight`: validate local binaries, credentials, input files, and endpoint
+  syntax without changing the device or lab.
+- `--collect`: collect one bounded read-only sample and emit the same
+  `netdiag-adapter-payload/v1` JSON schema as stdout.
+- `--emit-sample`: emit a deterministic offline sample for CI and schema drift
+  checks.
+
+The Generic Lab Kit adapters implement this contract now:
+
+```sh
+python3 scripts/validate_adapter_contract.py
+```
+
+Pilot keeps `adapter_sample` as a compatibility mode for older adapters, but
+Generic Lab Kit templates can be validated through preflight and collect before
+they are used in a real pilot.
+
 Templates:
 
 - `http-json-python`: expose a CSV/JSON trace as `GET /trace`.

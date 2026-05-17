@@ -20,6 +20,31 @@ def sample_frr() -> dict:
     }
 
 
+def preflight_report(args: argparse.Namespace) -> dict:
+    input_ok = args.input_json is None or args.input_json.is_file()
+    return {
+        "schema": "netdiag-adapter-preflight/v1",
+        "adapter": "frr-routing-state",
+        "passed": input_ok,
+        "checks": [
+            {
+                "name": "input-json",
+                "status": "ok" if input_ok else "error",
+                "message": "offline sample mode"
+                if args.input_json is None
+                else str(args.input_json),
+            },
+            {
+                "name": "collection-mode",
+                "status": "ok",
+                "message": "read-only routing-state conversion",
+            },
+        ],
+        "health": {"status": "ok" if input_ok else "error", "source": args.sample},
+        "redaction": {"secrets": [], "fields": ["router_id", "neighbor"]},
+    }
+
+
 def record_from_frr(row: dict) -> dict:
     route_churn = float(row.get("routes_changed", 0) or 0)
     adjacency_flaps = float(row.get("ospf_adjacency_flaps", 0) or 0) + float(
@@ -45,11 +70,17 @@ def record_from_frr(row: dict) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-json", type=Path)
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--collect", action="store_true")
     parser.add_argument("--emit-sample", action="store_true")
     parser.add_argument("--sample", default="frr-routing-state")
     parser.add_argument("--scenario-id", default="manual-frr-routing-state")
     parser.add_argument("--ground-truth", default="routing_state_change")
     args = parser.parse_args()
+
+    if args.preflight:
+        print(json.dumps(preflight_report(args), indent=2))
+        return
 
     if args.emit_sample:
         rows = [sample_frr()]

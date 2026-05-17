@@ -2,6 +2,9 @@ use netdiag_core::perf_budget::run_perf_measurements;
 use std::path::PathBuf;
 
 fn main() {
+    if std::env::args_os().any(|arg| arg == "--list") {
+        return;
+    }
     let artifact_root = std::env::var_os("NETDIAG_PERF_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

@@ -79,7 +79,7 @@ jobs:
         run: |
           rustup component add llvm-tools-preview
           cargo install cargo-binstall --locked
-          cargo binstall -y \
+          cargo binstall --locked -y \
             cargo-nextest@$CARGO_NEXTEST_VERSION \
             cargo-llvm-cov@$CARGO_LLVM_COV_VERSION \
             cargo-deny@$CARGO_DENY_VERSION \

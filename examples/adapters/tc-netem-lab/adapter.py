@@ -1,11 +1,42 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import shutil
 import subprocess
 from datetime import datetime, timezone, timedelta
 
 
 SAMPLE_TIME = datetime(2026, 5, 7, 9, 0, tzinfo=timezone.utc)
+
+
+def preflight_report(args: argparse.Namespace) -> dict:
+    interface_ok = bool(args.interface) or not args.apply
+    tc_ok = shutil.which("tc") is not None or not args.apply
+    passed = interface_ok and tc_ok
+    return {
+        "schema": "netdiag-adapter-preflight/v1",
+        "adapter": "tc-netem-lab",
+        "passed": passed,
+        "checks": [
+            {
+                "name": "interface",
+                "status": "ok" if interface_ok else "error",
+                "message": args.interface or "not required for read-only sample mode",
+            },
+            {
+                "name": "tc-binary",
+                "status": "ok" if tc_ok else "error",
+                "message": "required only when --apply is set",
+            },
+            {
+                "name": "active-change",
+                "status": "ok" if not args.apply else "warning",
+                "message": "read-only" if not args.apply else "will mutate qdisc with tc netem",
+            },
+        ],
+        "health": {"status": "ok" if passed else "error", "source": args.sample},
+        "redaction": {"secrets": [], "fields": ["interface"]},
+    }
 
 
 def maybe_apply_netem(args: argparse.Namespace) -> None:
@@ -70,15 +101,24 @@ def main() -> None:
     parser.add_argument("--throughput-mbps", default=50.0, type=float)
     parser.add_argument("--duration-secs", default=60, type=int)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--collect", action="store_true")
     parser.add_argument("--emit-sample", action="store_true")
     parser.add_argument("--sample", default="tc-netem-lab")
     parser.add_argument("--scenario-id", default="manual-netem")
     parser.add_argument("--ground-truth", default="congestion")
     args = parser.parse_args()
 
-    start = SAMPLE_TIME if args.emit_sample else datetime.now(timezone.utc)
+    if args.preflight:
+        print(json.dumps(preflight_report(args), indent=2))
+        return
+
+    read_only_sample = args.emit_sample or (
+        args.collect and not args.apply and not args.interface
+    )
+    start = SAMPLE_TIME if read_only_sample else datetime.now(timezone.utc)
     end = start + timedelta(seconds=args.duration_secs)
-    if args.emit_sample:
+    if read_only_sample:
         print(json.dumps(payload_from_args(args, start, end, args.interface or "lo"), indent=2))
         return
     if not args.interface:

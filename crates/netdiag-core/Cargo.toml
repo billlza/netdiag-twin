@@ -6,6 +6,9 @@ license.workspace = true
 version.workspace = true
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 chrono.workspace = true
 csv.workspace = true

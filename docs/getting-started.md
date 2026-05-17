@@ -400,6 +400,13 @@ cargo run -p netdiag-cli -- pilot preflight examples/pilots/generic-lab-kit.yaml
   --artifacts target/pilot-artifacts
 ```
 
+Pilot manifests also support the same read-only connector families as
+`collect`: Prometheus query_range, Prometheus text exposition, OTLP gRPC,
+native pcap, and system counters. Use
+`examples/pilots/connector-family-readonly.yaml` as the v0.5 source-envelope
+template; static preflight validates endpoint shape, mapping files, pcap source
+shape, and system-counter configuration before any live collection.
+
 Pilot sources are read-only unless a source sets `active: true`, the manifest
 sets `safety.allow_active: true`, and the operator also passes `--allow-active`
 on the CLI. Pilot runs require `<artifacts>/model` to contain an existing model

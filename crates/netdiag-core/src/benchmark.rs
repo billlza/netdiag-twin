@@ -255,40 +255,50 @@ fn run_ood_preflight_section(artifact_root: &Path) -> Result<BenchmarkSection> {
 
 fn run_adapter_validation_section() -> Result<BenchmarkSection> {
     timed_section("adapter schema and ingest", || {
-        let script = repo_root().join("scripts/validate_adapter_samples.py");
         let python = repo_root().join(".venv-jsonschema/bin/python");
         let python = if python.exists() {
             python
         } else {
             PathBuf::from("python3")
         };
-        let output = Command::new(python)
-            .arg(&script)
-            .current_dir(repo_root())
-            .output()
-            .map_err(|err| {
-                NetdiagError::Connector(format!("failed to run adapter validator: {err}"))
-            })?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let status = if output.status.success() {
-            ConnectorHealthStatus::Ok
-        } else {
-            ConnectorHealthStatus::Error
-        };
-        Ok(vec![BenchmarkCheck {
-            name: "validate_adapter_samples.py".to_string(),
-            status,
-            message: if output.status.success() {
-                "adapter samples passed schema and Rust ingest validation".to_string()
+        [
+            "validate_adapter_samples.py",
+            "validate_adapter_contract.py",
+        ]
+        .into_iter()
+        .map(|script_name| {
+            let script = repo_root().join("scripts").join(script_name);
+            let output = Command::new(&python)
+                .arg(&script)
+                .current_dir(repo_root())
+                .output()
+                .map_err(|err| {
+                    NetdiagError::Connector(format!(
+                        "failed to run adapter validator {script_name}: {err}"
+                    ))
+                })?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let status = if output.status.success() {
+                ConnectorHealthStatus::Ok
             } else {
-                "adapter sample validation failed".to_string()
-            },
-            details: Some(json!({
-                "stdout": stdout.lines().collect::<Vec<_>>(),
-                "stderr": stderr.lines().collect::<Vec<_>>(),
-            })),
-        }])
+                ConnectorHealthStatus::Error
+            };
+            Ok(BenchmarkCheck {
+                name: script_name.to_string(),
+                status,
+                message: if output.status.success() {
+                    "adapter contract passed schema and Rust ingest validation".to_string()
+                } else {
+                    "adapter contract validation failed".to_string()
+                },
+                details: Some(json!({
+                    "stdout": stdout.lines().collect::<Vec<_>>(),
+                    "stderr": stderr.lines().collect::<Vec<_>>(),
+                })),
+            })
+        })
+        .collect()
     })
 }
 

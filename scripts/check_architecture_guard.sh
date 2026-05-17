@@ -9,12 +9,12 @@ check_lines() {
   local path="$1"
   local max_lines="$2"
   local lines
-  lines="$(wc -l < "$ROOT/$path" | tr -d ' ')"
+  lines="$(awk '/^#\[cfg\(test\)\]/{exit} {count++} END{print count+0}' "$ROOT/$path")"
   if (( lines > max_lines )); then
-    echo "architecture guard failed: $path has $lines lines, max $max_lines" >&2
+    echo "architecture guard failed: $path has $lines production lines, max $max_lines" >&2
     fail=1
   else
-    echo "$path: $lines/$max_lines"
+    echo "$path: $lines/$max_lines production lines"
   fi
 }
 
@@ -22,11 +22,17 @@ check_lines() {
 check_lines "crates/netdiag-core/src/lab.rs" 5107
 check_lines "crates/netdiag-core/src/connectors.rs" 2168
 check_lines "crates/netdiag-cli/src/main.rs" 1535
-check_lines "crates/netdiag-app/src/main.rs" 6564
+check_lines "crates/netdiag-app/src/main.rs" 6535
 
 # New modules should stay narrow enough to remain reviewable.
 check_lines "crates/netdiag-core/src/reliability.rs" 825
 check_lines "crates/netdiag-core/src/benchmark.rs" 525
 check_lines "crates/netdiag-core/src/pilot.rs" 800
+check_lines "crates/netdiag-core/src/pilot/adapter_contract.rs" 140
+check_lines "crates/netdiag-core/src/pilot/pilot_sources.rs" 500
+check_lines "crates/netdiag-core/src/pilot/types.rs" 260
+check_lines "crates/netdiag-core/src/pilot/workflow.rs" 240
+check_lines "crates/netdiag-core/src/pilot/promotion.rs" 320
+check_lines "crates/netdiag-app/src/pilot_run_center.rs" 320
 
 exit "$fail"

@@ -71,11 +71,16 @@ fn keychain_entry() -> Result<keyring_core::Entry> {
 #[cfg(target_os = "macos")]
 fn ensure_keychain_store() -> Result<()> {
     static INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    INIT.get_or_init(|| keyring::use_named_store("keychain").map_err(|err| err.to_string()))
-        .as_ref()
-        .map_err(|err| anyhow::anyhow!(err.clone()))
-        .copied()
-        .context("failed to initialize macOS Keychain store")
+    INIT.get_or_init(|| {
+        let store =
+            apple_native_keyring_store::keychain::Store::new().map_err(|err| err.to_string())?;
+        keyring_core::set_default_store(store);
+        Ok(())
+    })
+    .as_ref()
+    .map_err(|err| anyhow::anyhow!(err.clone()))
+    .copied()
+    .context("failed to initialize macOS Keychain store")
 }
 
 #[cfg(any(test, not(target_os = "macos")))]

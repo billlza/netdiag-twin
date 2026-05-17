@@ -1,7 +1,6 @@
-use crate::connectors::{HttpJsonConfig, load_http_json};
+use self::pilot_sources::{LoadedPilotSource, check_source_static, load_pilot_source};
 use crate::error::{IoContext, NetdiagError, Result};
-use crate::evidence_bundle::{EvidenceBundleManifest, export_evidence_bundle};
-use crate::ingest::{ingest_json_value, ingest_trace};
+use crate::evidence_bundle::export_evidence_bundle;
 use crate::ml::{MODEL_MANIFEST_FILE_NAME, load_existing_model};
 use crate::models::{ConnectorHealthSnapshot, ConnectorHealthStatus, ModelManifest};
 use crate::pipeline::diagnose_ingest_with_whatif_and_existing_model_dir;
@@ -9,157 +8,27 @@ use crate::reliability::{
     ReliabilityCheck, ReliabilityReasonCode, check_reliability, redact_json_value, redact_string,
     write_text_atomic,
 };
-use crate::storage::{
-    connector_health_from_ingest, run_dir, save_json_atomic, write_connector_health,
-};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use crate::storage::{run_dir, save_json_atomic, write_connector_health};
+use chrono::Utc;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::path::Path;
 use uuid::Uuid;
+
+mod adapter_contract;
+mod pilot_sources;
+mod promotion;
+mod types;
+mod workflow;
+
+pub use promotion::*;
+pub use types::*;
+pub use workflow::*;
 
 const PILOT_SCHEMA: &str = "netdiag-pilot/v1";
 const PILOT_PREFLIGHT_SCHEMA: &str = "netdiag-pilot-preflight/v1";
 const PILOT_REPORT_SCHEMA: &str = "netdiag-pilot-report/v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotManifest {
-    pub schema: String,
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub operator: Option<String>,
-    #[serde(default)]
-    pub safety: PilotSafety,
-    #[serde(default)]
-    pub sources: Vec<PilotSource>,
-    #[serde(default)]
-    pub gates: PilotGates,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PilotSafety {
-    #[serde(default)]
-    pub allow_active: bool,
-    #[serde(default)]
-    pub retention_days: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotGates {
-    #[serde(default = "default_allowed_connector_status")]
-    pub allowed_connector_status: Vec<ConnectorHealthStatus>,
-}
-
-impl Default for PilotGates {
-    fn default() -> Self {
-        Self {
-            allowed_connector_status: default_allowed_connector_status(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotSource {
-    pub name: String,
-    pub kind: PilotSourceKind,
-    pub endpoint: String,
-    #[serde(default)]
-    pub role: PilotSourceRole,
-    #[serde(default)]
-    pub active: bool,
-    #[serde(default)]
-    pub bearer_token_env: Option<String>,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PilotSourceKind {
-    TraceFile,
-    AdapterSample,
-    HttpJson,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PilotSourceRole {
-    #[default]
-    Primary,
-    Corroborating,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotOptions {
-    pub artifacts: PathBuf,
-    #[serde(default)]
-    pub allow_active: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotPreflightReport {
-    pub schema: String,
-    pub generated_at: DateTime<Utc>,
-    pub pilot_id: String,
-    pub passed: bool,
-    #[serde(default)]
-    pub source_inventory: Vec<PilotSourceInventory>,
-    #[serde(default)]
-    pub checks: Vec<ReliabilityCheck>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotReport {
-    pub schema: String,
-    pub generated_at: DateTime<Utc>,
-    pub pilot_id: String,
-    pub pilot_name: String,
-    pub read_only: bool,
-    pub passed: bool,
-    pub run_id: String,
-    pub pilot_run_dir: String,
-    #[serde(default)]
-    pub source_inventory: Vec<PilotSourceInventory>,
-    #[serde(default)]
-    pub connector_health: Vec<ConnectorHealthSnapshot>,
-    pub diagnosis_summary: PilotDiagnosisSummary,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_bundle: Option<EvidenceBundleManifest>,
-    #[serde(default)]
-    pub checks: Vec<ReliabilityCheck>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotSourceInventory {
-    pub name: String,
-    pub kind: PilotSourceKind,
-    pub role: PilotSourceRole,
-    pub endpoint: String,
-    pub active: bool,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotDiagnosisSummary {
-    pub diagnosis_status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_label: Option<String>,
-    pub root_causes: Vec<String>,
-    pub recommendation_count: usize,
-}
-
-struct LoadedPilotSource {
-    source: PilotSource,
-    ingest: crate::models::IngestResult,
-    health: ConnectorHealthSnapshot,
-    redacted_payload: Option<Value>,
-}
 
 pub fn load_pilot_manifest(path: impl AsRef<Path>) -> Result<PilotManifest> {
     let path = path.as_ref();
@@ -299,7 +168,7 @@ pub fn run_pilot(path: impl AsRef<Path>, options: PilotOptions) -> Result<PilotR
         generated_at: Utc::now(),
         pilot_id: manifest.id.clone(),
         pilot_name: manifest.name.clone(),
-        read_only: !options.allow_active,
+        read_only: !manifest.sources.iter().any(|source| source.active),
         passed: false,
         run_id: pipeline.run_id.clone(),
         pilot_run_dir: pilot_run_dir.display().to_string(),
@@ -363,79 +232,6 @@ fn persist_redacted_source_payloads(
         }
     }
     Ok(())
-}
-
-fn load_pilot_source(source: &PilotSource, base_dir: &Path) -> Result<LoadedPilotSource> {
-    match source.kind {
-        PilotSourceKind::TraceFile => {
-            let path = resolve_path(base_dir, &source.endpoint);
-            let ingest = ingest_trace(&path)?;
-            let health =
-                connector_health_from_ingest("trace-file", &source.name, &source.name, &ingest);
-            Ok(LoadedPilotSource {
-                source: source.clone(),
-                ingest,
-                health,
-                redacted_payload: None,
-            })
-        }
-        PilotSourceKind::AdapterSample => {
-            let adapter = resolve_path(base_dir, &source.endpoint);
-            let adapter = adapter.canonicalize().with_path(&adapter)?;
-            let output = Command::new("python3")
-                .arg(&adapter)
-                .arg("--emit-sample")
-                .current_dir(adapter.parent().unwrap_or(base_dir))
-                .output()
-                .map_err(|err| {
-                    NetdiagError::Connector(format!("failed to run adapter sample: {err}"))
-                })?;
-            if !output.status.success() {
-                return Err(NetdiagError::Connector(format!(
-                    "adapter sample {} exited {}: {}",
-                    adapter.display(),
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
-            let payload: Value = serde_json::from_slice(&output.stdout)?;
-            let ingest = ingest_json_value(payload.clone(), safe_name(&source.name))?;
-            let mut payload = payload;
-            redact_json_value(&mut payload);
-            let health =
-                connector_health_from_ingest("adapter-sample", &source.name, &source.name, &ingest);
-            Ok(LoadedPilotSource {
-                source: source.clone(),
-                ingest,
-                health,
-                redacted_payload: Some(payload),
-            })
-        }
-        PilotSourceKind::HttpJson => {
-            let bearer_token = source
-                .bearer_token_env
-                .as_ref()
-                .and_then(|name| std::env::var(name).ok());
-            let loaded = load_http_json(&HttpJsonConfig {
-                endpoint: source.endpoint.clone(),
-                bearer_token,
-                timeout: Duration::from_secs(10),
-            })?;
-            let mut payload = loaded.payload.clone().unwrap_or_else(|| json!({}));
-            redact_json_value(&mut payload);
-            Ok(LoadedPilotSource {
-                source: source.clone(),
-                ingest: loaded.ingest.clone(),
-                health: connector_health_from_ingest(
-                    "http-json",
-                    &source.name,
-                    &loaded.sample,
-                    &loaded.ingest,
-                ),
-                redacted_payload: Some(payload),
-            })
-        }
-    }
 }
 
 fn check_artifact_directory(path: &Path) -> ReliabilityCheck {
@@ -555,36 +351,6 @@ fn check_pilot_safety(manifest: &PilotManifest, cli_allow_active: bool) -> Vec<R
     }]
 }
 
-fn check_source_static(source: &PilotSource, base_dir: &Path) -> ReliabilityCheck {
-    let path = resolve_path(base_dir, &source.endpoint);
-    let status = match source.kind {
-        PilotSourceKind::TraceFile | PilotSourceKind::AdapterSample => path.is_file(),
-        PilotSourceKind::HttpJson => {
-            source.endpoint.starts_with("http://") || source.endpoint.starts_with("https://")
-        }
-    };
-    ReliabilityCheck {
-        name: format!("source {} valid", source.name),
-        status: if status {
-            ConnectorHealthStatus::Ok
-        } else {
-            ConnectorHealthStatus::Error
-        },
-        run_id: None,
-        artifact: Some(redacted_endpoint(source)),
-        reason_codes: if status {
-            Vec::new()
-        } else {
-            vec![ReliabilityReasonCode::ArtifactMissing]
-        },
-        message: if status {
-            "source is statically valid".to_string()
-        } else {
-            "source endpoint is missing or invalid".to_string()
-        },
-    }
-}
-
 fn source_inventory(manifest: &PilotManifest) -> Vec<PilotSourceInventory> {
     manifest
         .sources
@@ -668,15 +434,6 @@ fn render_pilot_markdown(report: &PilotReport) -> String {
     body
 }
 
-fn resolve_path(base_dir: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        base_dir.join(path)
-    }
-}
-
 fn safe_name(value: &str) -> String {
     let safe = value
         .chars()
@@ -695,14 +452,59 @@ fn safe_name(value: &str) -> String {
     }
 }
 
-fn default_allowed_connector_status() -> Vec<ConnectorHealthStatus> {
-    vec![ConnectorHealthStatus::Ok, ConnectorHealthStatus::Degraded]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::benchmark::{BenchmarkEnvironment, BenchmarkReport};
+    use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
     use tempfile::tempdir;
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repo root")
+            .to_path_buf()
+    }
+
+    fn provision_test_model(artifacts: &Path) {
+        train_model_from_jsonl_with_options(
+            repo_root().join("examples/datasets/pilot-smoke-training.jsonl"),
+            artifacts.join("model"),
+            TrainingOptions {
+                min_rows_per_label: 1,
+                ..TrainingOptions::default()
+            },
+        )
+        .expect("trained smoke model");
+    }
+
+    fn write_passing_benchmark(path: &Path) {
+        let report = BenchmarkReport {
+            schema: "netdiag-benchmark-report/v1".to_string(),
+            generated_at: Utc::now(),
+            suite: "test".to_string(),
+            passed: true,
+            artifacts: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .display()
+                .to_string(),
+            output: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .display()
+                .to_string(),
+            environment: BenchmarkEnvironment {
+                os: "test".to_string(),
+                arch: "test".to_string(),
+                profile: "test".to_string(),
+            },
+            sections: Vec::new(),
+            reliability: None,
+        };
+        save_json_atomic(path, &report).expect("benchmark report");
+    }
 
     #[test]
     fn active_pilot_requires_double_opt_in() {
@@ -722,6 +524,8 @@ mod tests {
                 role: PilotSourceRole::Primary,
                 active: true,
                 bearer_token_env: None,
+                mapping: None,
+                collection: PilotCollection::default(),
                 metadata: BTreeMap::new(),
             }],
             gates: PilotGates::default(),
@@ -751,6 +555,8 @@ mod tests {
             role: PilotSourceRole::Primary,
             active: false,
             bearer_token_env: None,
+            mapping: None,
+            collection: PilotCollection::default(),
             metadata: BTreeMap::new(),
         });
         assert!(validate_pilot_manifest(&manifest).is_ok());
@@ -788,5 +594,147 @@ sources:
                 .endpoint
                 .contains("[redacted-env]")
         );
+    }
+
+    #[test]
+    fn manifest_accepts_connector_family_aliases() {
+        let temp = tempdir().expect("tempdir");
+        let mapping_path = temp.path().join("mapping.json");
+        fs::write(
+            &mapping_path,
+            serde_json::to_string(&crate::connectors::default_prometheus_mapping())
+                .expect("mapping json"),
+        )
+        .expect("mapping");
+        let manifest_path = temp.path().join("pilot.yaml");
+        fs::write(
+            &manifest_path,
+            format!(
+                r#"
+schema: netdiag-pilot/v1
+id: connector-pilot
+name: Connector pilot
+sources:
+  - name: prometheus
+    kind: prometheus-query
+    endpoint: http://127.0.0.1:9090
+    mapping: {}
+    role: primary
+  - name: otlp
+    kind: otlp-grpc
+    endpoint: 127.0.0.1:4317
+    mapping: {}
+    role: corroborating
+  - name: counters
+    kind: system-counters
+    endpoint: all
+    role: corroborating
+"#,
+                mapping_path.display(),
+                mapping_path.display()
+            ),
+        )
+        .expect("manifest");
+
+        let manifest = load_pilot_manifest(&manifest_path).expect("manifest");
+        assert_eq!(manifest.sources[0].kind, PilotSourceKind::PrometheusQuery);
+        assert_eq!(manifest.sources[1].kind, PilotSourceKind::OtlpGrpc);
+        assert_eq!(manifest.sources[2].kind, PilotSourceKind::SystemCounters);
+    }
+
+    #[test]
+    fn connector_family_manifest_preflights_without_live_collection() {
+        let temp = tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_test_model(&artifacts);
+
+        let report = preflight_pilot(
+            repo_root().join("examples/pilots/connector-family-readonly.yaml"),
+            PilotOptions {
+                artifacts,
+                allow_active: false,
+            },
+        )
+        .expect("preflight");
+
+        assert!(report.passed);
+        assert_eq!(report.source_inventory.len(), 5);
+        assert!(
+            report
+                .source_inventory
+                .iter()
+                .any(|source| source.kind == PilotSourceKind::OtlpGrpc)
+        );
+    }
+
+    #[test]
+    fn pilot_workflow_runs_generic_lab_kit_adapter_contracts() {
+        let temp = tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_test_model(&artifacts);
+
+        let report = run_pilot_workflow(
+            repo_root().join("examples/pilots/generic-lab-kit.yaml"),
+            PilotWorkflowOptions {
+                artifacts,
+                allow_active: false,
+                verification: None,
+            },
+        )
+        .expect("workflow");
+
+        assert!(report.passed);
+        assert_eq!(report.pilot_id, "generic-lab-kit");
+        assert!(
+            report
+                .phases
+                .iter()
+                .any(|phase| phase.name == "evidence_bundle"
+                    && phase.status == PilotWorkflowPhaseStatus::Passed)
+        );
+        assert!(
+            report
+                .pilot_run
+                .as_ref()
+                .and_then(|run| run.evidence_bundle.as_ref())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn model_promotion_gate_requires_evaluation_unless_explicitly_allowed() {
+        let temp = tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_test_model(&artifacts);
+        let benchmark_report = temp.path().join("benchmark_report.json");
+        write_passing_benchmark(&benchmark_report);
+
+        let strict = evaluate_model_promotion(ModelPromotionOptions {
+            model_dir: artifacts.join("model"),
+            benchmark_report: benchmark_report.clone(),
+            min_rows_per_label: 1,
+            min_accuracy: 0.9,
+            min_macro_f1: 0.9,
+            allow_missing_evaluation: false,
+        })
+        .expect("strict gate");
+        assert!(!strict.passed);
+        assert!(
+            strict
+                .gates
+                .iter()
+                .any(|gate| gate.name == "evaluation_present" && !gate.passed)
+        );
+
+        let allowed = evaluate_model_promotion(ModelPromotionOptions {
+            model_dir: artifacts.join("model"),
+            benchmark_report,
+            min_rows_per_label: 1,
+            min_accuracy: 0.9,
+            min_macro_f1: 0.9,
+            allow_missing_evaluation: true,
+        })
+        .expect("allowed gate");
+        assert!(allowed.passed);
     }
 }

@@ -1,0 +1,66 @@
+schema: netdiag-pilot/v1
+id: connector-family-readonly
+name: Connector family read-only pilot
+operator: platform-sre
+safety:
+  allow_active: false
+  retention_days: 14
+sources:
+  - name: prometheus-primary
+    kind: prometheus-query
+    endpoint: http://127.0.0.1:9090
+    mapping: ../mappings/prometheus-netdiag.json
+    role: primary
+    active: false
+    collection:
+      timeout_secs: 8
+      lookback_secs: 300
+      step_secs: 15
+    metadata:
+      stack: Prometheus
+      purpose: primary service telemetry
+  - name: node-exporter-corroboration
+    kind: prometheus-metrics
+    endpoint: http://127.0.0.1:9100/metrics
+    mapping: ../mappings/prometheus-netdiag.json
+    role: corroborating
+    active: false
+    metadata:
+      stack: Prometheus text exposition
+      purpose: host and interface corroboration
+  - name: otlp-lab-gateway
+    kind: otlp-grpc
+    endpoint: 127.0.0.1:4317
+    mapping: ../mappings/otlp-netdiag.json
+    role: corroborating
+    active: false
+    collection:
+      timeout_secs: 20
+    metadata:
+      stack: OpenTelemetry Collector
+      purpose: pushed lab metrics
+  - name: passive-pcap
+    kind: native-pcap
+    endpoint: iface:en0
+    role: corroborating
+    active: false
+    collection:
+      packet_limit: 1000
+      timeout_secs: 8
+    metadata:
+      stack: pcap
+      purpose: passive packet evidence
+  - name: local-interface-counters
+    kind: system-counters
+    endpoint: all
+    role: corroborating
+    active: false
+    collection:
+      interval_secs: 1
+    metadata:
+      stack: macOS netstat
+      purpose: host interface counters
+gates:
+  allowed_connector_status:
+    - ok
+    - degraded

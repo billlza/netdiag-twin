@@ -11,6 +11,8 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
+      - name: Silence Git default branch hint
+        run: git config --global init.defaultBranch main
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Python schema validator
@@ -27,10 +29,10 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
+      - name: Silence Git default branch hint
+        run: git config --global init.defaultBranch main
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
       - name: Install Python schema validator
         run: |
           python3 -m venv .venv-jsonschema
@@ -43,8 +45,8 @@ jobs:
           CARGO_NEXTEST_VERSION: "0.9.136"
         run: |
           rustup component add llvm-tools-preview
-          cargo install cargo-binstall --locked
-          cargo binstall --locked -y \
+          cargo install cargo-binstall --locked --quiet
+          cargo binstall --locked -y --log-level error \
             cargo-nextest@$CARGO_NEXTEST_VERSION \
             cargo-llvm-cov@$CARGO_LLVM_COV_VERSION \
             cargo-deny@$CARGO_DENY_VERSION \

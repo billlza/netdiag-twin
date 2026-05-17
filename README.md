@@ -18,7 +18,7 @@ regression checks, platform incident evidence bundles, lab gates for adapter or
 telemetry-source changes, and calibrated unknown/OOD checks before a model is
 trusted in a real environment.
 
-v0.4.3 adds pilot-ready reliability hardening: explicit artifact integrity
+v0.5.0 adds pilot-ready reliability hardening: explicit artifact integrity
 checks, a benchmark report that pairs CI-friendly JSON with a human Markdown
 summary, and a safe real-device pilot flow for generic lab kits.
 

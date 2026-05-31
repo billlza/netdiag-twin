@@ -45,6 +45,8 @@ The token is stored in macOS Keychain from the Settings UI; `NETDIAG_API_TOKEN`
 remains a development fallback. Tokens are never written to `settings.json`.
 The same token fallback is used for Prometheus endpoints that require bearer
 authentication.
+Pilot manifests are stricter: a source must declare `bearer_token_env` before
+NetDiag will attach a bearer token to that endpoint.
 
 ## Response Shape
 

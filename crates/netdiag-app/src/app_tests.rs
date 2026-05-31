@@ -44,3 +44,35 @@ fn startup_tab_round_trip_includes_lab() {
     assert_eq!(StartupTab::from(Tab::Lab), StartupTab::Lab);
     assert_eq!(title_for_tab(Tab::Lab, Language::En), "Lab");
 }
+
+#[test]
+fn pilot_run_center_skips_verification_when_after_run_is_empty() {
+    let state = pilot_run_center::PilotRunCenterState::default();
+    assert!(state.verification_options().is_none());
+}
+
+#[test]
+fn pilot_run_center_builds_after_run_verification_options() {
+    let mut state = pilot_run_center::PilotRunCenterState::default();
+    state.verification_after_run_id = " after-run-1 ".to_string();
+    state.verification_recommendation_id = " rec-1 ".to_string();
+    state.verification_policy_path = " examples/policies/reroute-path-b.yaml ".to_string();
+    state.verification_objective_path =
+        " examples/policies/verification-objective.yaml ".to_string();
+
+    let options = state.verification_options().expect("verification options");
+    assert_eq!(options.after_run_id, "after-run-1");
+    assert_eq!(options.recommendation_id.as_deref(), Some("rec-1"));
+    assert_eq!(
+        options.policy_path.as_deref(),
+        Some(std::path::Path::new(
+            "examples/policies/reroute-path-b.yaml"
+        ))
+    );
+    assert_eq!(
+        options.objective_path.as_deref(),
+        Some(std::path::Path::new(
+            "examples/policies/verification-objective.yaml"
+        ))
+    );
+}

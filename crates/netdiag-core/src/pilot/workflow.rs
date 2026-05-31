@@ -4,7 +4,7 @@ use super::{
 };
 use crate::error::Result;
 use crate::lab::{ActionVerificationOptions, verify_action_with_options};
-use crate::models::ActionVerification;
+use crate::models::{ActionVerification, ActionVerificationVerdict};
 use chrono::Utc;
 use persistence::save_workflow_report;
 use std::path::Path;
@@ -123,8 +123,8 @@ fn workflow_verification(
     )?;
     phases.push(phase(
         "verify",
-        PilotWorkflowPhaseStatus::Passed,
-        "after-run verification completed",
+        verification_phase_status(verification.verdict),
+        verification_phase_message(&verification),
     ));
     Ok(Some(verification))
 }
@@ -144,15 +144,38 @@ fn workflow_passed(pilot_run: &PilotReport, phases: &[PilotWorkflowPhase]) -> bo
             .all(|phase| !matches!(phase.status, PilotWorkflowPhaseStatus::Failed))
 }
 
+fn verification_phase_status(verdict: ActionVerificationVerdict) -> PilotWorkflowPhaseStatus {
+    match verdict {
+        ActionVerificationVerdict::Verified => PilotWorkflowPhaseStatus::Passed,
+        ActionVerificationVerdict::NotVerified | ActionVerificationVerdict::Inconclusive => {
+            PilotWorkflowPhaseStatus::Failed
+        }
+    }
+}
+
+fn verification_phase_message(verification: &ActionVerification) -> String {
+    let verdict = match verification.verdict {
+        ActionVerificationVerdict::Verified => "verified",
+        ActionVerificationVerdict::NotVerified => "not verified",
+        ActionVerificationVerdict::Inconclusive => "inconclusive",
+    };
+    let reason = verification
+        .reasons
+        .first()
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    format!("after-run verification {verdict}{reason}")
+}
+
 fn phase(
     name: &'static str,
     status: PilotWorkflowPhaseStatus,
-    message: &'static str,
+    message: impl Into<String>,
 ) -> PilotWorkflowPhase {
     PilotWorkflowPhase {
         name: name.to_string(),
         status,
-        message: message.to_string(),
+        message: message.into(),
     }
 }
 

@@ -2,6 +2,7 @@ use super::super::PilotDiagnosisSummary;
 use super::*;
 use crate::diagnose_file;
 use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
+use crate::models::ActionVerificationVerdict;
 use tempfile::tempdir;
 
 fn sample(name: &str) -> std::path::PathBuf {
@@ -212,7 +213,102 @@ fn workflow_verifies_after_run_from_global_artifacts_root() {
     assert_eq!(verification.after_run_id, after.run_id);
     assert!(verification_path.exists());
     assert!(report.phases.iter().any(|phase| {
-        phase.name == "verify" && phase.status == PilotWorkflowPhaseStatus::Passed
+        phase.name == "verify" && phase.status == verification_phase_status(verification.verdict)
+    }));
+}
+
+#[test]
+fn workflow_report_fails_when_verification_objective_is_not_met() {
+    let temp = tempdir().expect("tempdir");
+    let artifacts = temp.path().join("artifacts");
+    provision_test_model(&artifacts);
+    let after = diagnose_file(
+        sample("normal"),
+        &artifacts,
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("after run");
+    let objective_path = temp.path().join("objective.yaml");
+    std::fs::write(
+        &objective_path,
+        r#"
+objective:
+  throughput_delta_pct: ">= 1000"
+"#,
+    )
+    .expect("objective");
+
+    let report = run_pilot_workflow(
+        repo_root().join("examples/pilots/loopback-mock.yaml"),
+        PilotWorkflowOptions {
+            artifacts,
+            allow_active: false,
+            verification: Some(PilotWorkflowVerificationOptions {
+                after_run_id: after.run_id,
+                recommendation_id: None,
+                policy_path: None,
+                objective_path: Some(objective_path),
+            }),
+        },
+    )
+    .expect("workflow report");
+
+    let verification = report.verification.as_ref().expect("verification");
+    assert_eq!(verification.verdict, ActionVerificationVerdict::NotVerified);
+    assert!(!report.passed);
+    assert!(report.phases.iter().any(|phase| {
+        phase.name == "verify"
+            && phase.status == PilotWorkflowPhaseStatus::Failed
+            && phase.message.contains("not verified")
+    }));
+}
+
+#[test]
+fn workflow_report_fails_when_verification_metric_is_missing() {
+    let temp = tempdir().expect("tempdir");
+    let artifacts = temp.path().join("artifacts");
+    provision_test_model(&artifacts);
+    let after = diagnose_file(
+        sample("normal"),
+        &artifacts,
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("after run");
+    let objective_path = temp.path().join("missing-metric-objective.yaml");
+    std::fs::write(
+        &objective_path,
+        r#"
+objective:
+  missing_metric_delta_pct: "<= 0"
+"#,
+    )
+    .expect("objective");
+
+    let report = run_pilot_workflow(
+        repo_root().join("examples/pilots/loopback-mock.yaml"),
+        PilotWorkflowOptions {
+            artifacts,
+            allow_active: false,
+            verification: Some(PilotWorkflowVerificationOptions {
+                after_run_id: after.run_id,
+                recommendation_id: None,
+                policy_path: None,
+                objective_path: Some(objective_path),
+            }),
+        },
+    )
+    .expect("workflow report");
+
+    let verification = report.verification.as_ref().expect("verification");
+    assert_eq!(
+        verification.verdict,
+        ActionVerificationVerdict::Inconclusive
+    );
+    assert!(!report.passed);
+    assert!(report.phases.iter().any(|phase| {
+        phase.name == "verify"
+            && phase.status == PilotWorkflowPhaseStatus::Failed
+            && phase.message.contains("inconclusive")
     }));
 }
 
@@ -284,7 +380,53 @@ fn workflow_verification_records_completed_verify_phase() {
     assert_eq!(verification.after_run_id, after.run_id);
     assert_eq!(phases.len(), 1);
     assert_eq!(phases[0].name, "verify");
-    assert_eq!(phases[0].status, PilotWorkflowPhaseStatus::Passed);
+    assert_eq!(
+        phases[0].status,
+        verification_phase_status(verification.verdict)
+    );
+}
+
+#[test]
+fn workflow_verification_fails_phase_when_connector_quality_degrades() {
+    let temp = tempdir().expect("tempdir");
+    let before = diagnose_file(
+        sample("normal"),
+        temp.path(),
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("before run");
+    let after = diagnose_file(
+        sample("normal"),
+        temp.path(),
+        Some(("line", "reroute_path_b")),
+    )
+    .expect("after run");
+    mark_connector_health_degraded(temp.path(), &after.run_id);
+    let pilot_run = minimal_pilot_report(temp.path(), before.run_id.clone());
+    let mut phases = Vec::new();
+
+    let verification = workflow_verification(
+        &mut phases,
+        &pilot_run,
+        temp.path(),
+        Some(PilotWorkflowVerificationOptions {
+            after_run_id: after.run_id,
+            recommendation_id: None,
+            policy_path: None,
+            objective_path: None,
+        }),
+    )
+    .expect("verification")
+    .expect("verification report");
+
+    assert_eq!(
+        verification.verdict,
+        ActionVerificationVerdict::Inconclusive
+    );
+    assert_eq!(phases.len(), 1);
+    assert_eq!(phases[0].name, "verify");
+    assert_eq!(phases[0].status, PilotWorkflowPhaseStatus::Failed);
+    assert!(phases[0].message.contains("quality degraded"));
 }
 
 #[test]
@@ -359,4 +501,16 @@ fn workflow_options_round_trip_verification_paths() {
         verification.objective_path.as_deref(),
         Some(std::path::Path::new("objective.yaml"))
     );
+}
+
+fn mark_connector_health_degraded(artifact_root: &std::path::Path, run_id: &str) {
+    let path = crate::storage::run_dir(artifact_root, run_id).join("connector_health.json");
+    let raw = std::fs::read_to_string(&path).expect("connector health");
+    let mut value: serde_json::Value = serde_json::from_str(&raw).expect("connector health json");
+    value["status"] = serde_json::Value::String("degraded".to_string());
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).expect("connector health json"),
+    )
+    .expect("write degraded connector health");
 }

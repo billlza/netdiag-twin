@@ -69,6 +69,8 @@ Each source has a stable envelope:
 `mapping` is used by Prometheus and OTLP sources. If it is omitted, NetDiag uses
 the default canonical metric mapping. `collection` is optional and defaults to
 short read-only windows suitable for preflight and pilot smoke runs.
+Pilot manifests only send bearer tokens when the source explicitly declares
+`bearer_token_env`; they do not inherit a global token for every endpoint.
 
 Start from:
 

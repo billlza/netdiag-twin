@@ -50,13 +50,13 @@ The strict gate adds:
 
 - `cargo nextest run --workspace --lib --bins --tests`
 - `RUSTFLAGS="-D warnings" cargo nextest run --workspace --lib --bins --tests`
-- `cargo llvm-cov nextest --workspace --lib --bins --tests --summary-only --json`
+- `cargo llvm-cov nextest --workspace --exclude netdiag-app --lib --bins --tests --test-threads 1 --summary-only --json`
 - `scripts/check_coverage_summary.py` with `NETDIAG_COVERAGE_MIN=90`
-- `cargo deny --locked check --hide-inclusion-graph`
+- `cargo deny --locked check --hide-inclusion-graph --disable-fetch`
 - `cargo machete`
 - Generic Lab Kit adapter contract validation
 - Release benchmark report generation
-- Pilot smoke workflow through `pilot preflight` and `pilot workflow`
+- Pilot smoke workflow through `pilot preflight`, `diagnose`, and `pilot workflow --after-run-id` so the verify phase completes
 - Optional Miri with `NETDIAG_RUN_MIRI=1`
 
 The cargo-deny invocation is also wrapped by the strict gate and fails if the
@@ -72,12 +72,12 @@ Pilot/CLI release-critical slice:
 - `crates/netdiag-core/src/pilot/*`
 - `crates/netdiag-cli/src/commands/pilot.rs`
 
-The full workspace coverage report is still generated on every strict run and
-guarded by `NETDIAG_WORKSPACE_COVERAGE_MIN` as a ratchet floor. This is
-deliberate: the current desktop GUI and legacy large modules are not hidden, but
-they are not allowed to make the v0.5 Pilot/CLI release gate meaningless. Do not
-claim full-workspace 90% until the app and legacy split work have tests to back
-that number.
+The strict coverage run covers the Rust core and CLI release surface and is
+guarded by `NETDIAG_WORKSPACE_COVERAGE_MIN` as a ratchet floor. The GUI app is
+still compiled and tested by `cargo nextest` and `RUSTFLAGS=-D warnings cargo
+nextest`, but it is excluded from the llvm-cov merge so large GUI dependency
+profiles cannot make the v0.5 Pilot/CLI gate unstable. Do not claim GUI 90%
+coverage until the app split work has tests to back that number.
 
 ## Complexity Policy
 

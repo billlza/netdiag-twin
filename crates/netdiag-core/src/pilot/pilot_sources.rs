@@ -334,10 +334,21 @@ fn load_mapping(source: &PilotSource, base_dir: &Path) -> Result<BTreeMap<String
 }
 
 fn bearer_token(source: &PilotSource) -> Option<String> {
-    match &source.bearer_token_env {
-        Some(name) => std::env::var(name).ok(),
-        None => std::env::var("NETDIAG_API_TOKEN").ok(),
-    }
+    bearer_token_from_lookup(source, |name| std::env::var(name).ok())
+}
+
+fn bearer_token_from_lookup(
+    source: &PilotSource,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    source
+        .bearer_token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .and_then(lookup)
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
 fn timeout(source: &PilotSource) -> Duration {
@@ -585,6 +596,39 @@ mod tests {
         );
         assert_eq!(check.status, ConnectorHealthStatus::Error);
         assert!(check.message.contains("adapter file does not exist"));
+    }
+
+    #[test]
+    fn bearer_token_requires_explicit_source_env() {
+        let mut source = source(PilotSourceKind::HttpJson, "http://127.0.0.1:1");
+        let token = bearer_token_from_lookup(&source, |name| {
+            (name == "NETDIAG_API_TOKEN").then_some("global-secret".to_string())
+        });
+        assert_eq!(token, None);
+
+        source.bearer_token_env = Some("SOURCE_TOKEN".to_string());
+        let token = bearer_token_from_lookup(&source, |name| match name {
+            "SOURCE_TOKEN" => Some(" source-secret ".to_string()),
+            "NETDIAG_API_TOKEN" => Some("global-secret".to_string()),
+            _ => None,
+        });
+        assert_eq!(token.as_deref(), Some("source-secret"));
+    }
+
+    #[test]
+    fn bearer_token_ignores_empty_env_names_and_values() {
+        let mut source = source(PilotSourceKind::HttpJson, "http://127.0.0.1:1");
+        source.bearer_token_env = Some(" ".to_string());
+        assert_eq!(
+            bearer_token_from_lookup(&source, |_| Some("secret".to_string())),
+            None
+        );
+
+        source.bearer_token_env = Some("SOURCE_TOKEN".to_string());
+        assert_eq!(
+            bearer_token_from_lookup(&source, |_| Some("   ".to_string())),
+            None
+        );
     }
 
     #[test]

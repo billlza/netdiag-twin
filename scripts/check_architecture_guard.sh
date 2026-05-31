@@ -33,6 +33,8 @@ check_lines "crates/netdiag-core/src/pilot/pilot_sources.rs" 500
 check_lines "crates/netdiag-core/src/pilot/types.rs" 260
 check_lines "crates/netdiag-core/src/pilot/workflow.rs" 240
 check_lines "crates/netdiag-core/src/pilot/promotion.rs" 320
+check_lines "crates/netdiag-core/src/pilot/promotion/gates.rs" 240
 check_lines "crates/netdiag-app/src/pilot_run_center.rs" 320
+check_lines "crates/netdiag-app/src/pilot_run_center/view.rs" 180
 
 exit "$fail"

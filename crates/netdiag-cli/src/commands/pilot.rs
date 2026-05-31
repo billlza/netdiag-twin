@@ -185,7 +185,16 @@ mod tests {
                 "arch": "test",
                 "profile": "test"
             },
-            "sections": []
+            "sections": [{
+                "name": "ood benchmark preflight",
+                "status": "ok",
+                "elapsed_millis": 1.0,
+                "checks": [{
+                    "name": "ood-cpu-saturation",
+                    "status": "ok",
+                    "message": "static preflight passed"
+                }]
+            }]
         });
         std::fs::write(
             path,

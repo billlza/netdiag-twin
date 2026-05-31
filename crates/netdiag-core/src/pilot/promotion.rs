@@ -10,6 +10,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+mod gates;
+use gates::{evaluation_gates, known_label_coverage_gate, ood_coverage_gate, training_gate};
+
 const MODEL_PROMOTION_GATE_SCHEMA: &str = "netdiag-model-promotion-gate/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +83,7 @@ pub fn evaluate_model_promotion(options: ModelPromotionOptions) -> Result<ModelP
         },
     ));
     gates.push(training_gate(&manifest));
-    gates.push(label_distribution_gate(
+    gates.push(known_label_coverage_gate(
         &manifest,
         options.min_rows_per_label,
     ));
@@ -90,6 +93,7 @@ pub fn evaluate_model_promotion(options: ModelPromotionOptions) -> Result<ModelP
         options.min_macro_f1,
         options.allow_missing_evaluation,
     ));
+    gates.push(ood_coverage_gate(&benchmark));
     gates.push(gate(
         "benchmark_report",
         benchmark.passed,
@@ -121,114 +125,11 @@ pub fn evaluate_model_promotion(options: ModelPromotionOptions) -> Result<ModelP
     Ok(report)
 }
 
-fn training_gate(manifest: &ModelManifest) -> ModelPromotionGate {
-    match &manifest.training_gate {
-        Some(training_gate) if training_gate.passed => gate(
-            "training_gate",
-            true,
-            format!(
-                "training gate passed with {} training rows",
-                training_gate.training_rows
-            ),
-        ),
-        Some(training_gate) => gate(
-            "training_gate",
-            false,
-            format!(
-                "training gate failed: {}",
-                training_gate.failures.join("; ")
-            ),
-        ),
-        None => gate("training_gate", false, "training_gate is required"),
-    }
-}
-
-fn label_distribution_gate(
-    manifest: &ModelManifest,
-    min_rows_per_label: usize,
+pub(super) fn gate(
+    name: impl Into<String>,
+    passed: bool,
+    message: impl Into<String>,
 ) -> ModelPromotionGate {
-    let missing = manifest
-        .labels
-        .iter()
-        .filter_map(|label| {
-            let rows = manifest.label_distribution.get(label).copied().unwrap_or(0);
-            (rows < min_rows_per_label).then(|| format!("{label}={rows}"))
-        })
-        .collect::<Vec<_>>();
-    gate(
-        "label_distribution",
-        missing.is_empty(),
-        if missing.is_empty() {
-            format!("all labels have at least {min_rows_per_label} rows")
-        } else {
-            format!(
-                "labels below min_rows_per_label {min_rows_per_label}: {}",
-                missing.join(", ")
-            )
-        },
-    )
-}
-
-fn evaluation_gates(
-    manifest: &ModelManifest,
-    min_accuracy: f64,
-    min_macro_f1: f64,
-    allow_missing_evaluation: bool,
-) -> Vec<ModelPromotionGate> {
-    let Some(evaluation) = &manifest.evaluation else {
-        return vec![gate(
-            "evaluation_present",
-            allow_missing_evaluation,
-            if allow_missing_evaluation {
-                "evaluation is missing but explicitly allowed"
-            } else {
-                "evaluation is required for model promotion"
-            },
-        )];
-    };
-    vec![
-        gate("evaluation_present", true, "evaluation is present"),
-        gate(
-            "evaluation_degraded",
-            !evaluation.degraded,
-            if evaluation.degraded {
-                "evaluation is marked degraded"
-            } else {
-                "evaluation is not degraded"
-            },
-        ),
-        gate(
-            "evaluation_labels",
-            evaluation.missing_validation_labels.is_empty(),
-            if evaluation.missing_validation_labels.is_empty() {
-                "all labels were present in validation".to_string()
-            } else {
-                format!(
-                    "missing validation labels: {}",
-                    evaluation.missing_validation_labels.join(", ")
-                )
-            },
-        ),
-        gate(
-            "accuracy",
-            evaluation.accuracy >= min_accuracy,
-            format!(
-                "accuracy {:.4} requires >= {:.4}",
-                evaluation.accuracy, min_accuracy
-            ),
-        ),
-        gate(
-            "macro_f1",
-            evaluation.macro_f1 >= min_macro_f1,
-            format!(
-                "macro_f1 {:.4} requires >= {:.4}",
-                evaluation.macro_f1, min_macro_f1
-            ),
-        ),
-    ]
-}
-
-fn gate(name: impl Into<String>, passed: bool, message: impl Into<String>) -> ModelPromotionGate {
     ModelPromotionGate {
         name: name.into(),
         passed,

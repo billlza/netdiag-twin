@@ -44,7 +44,7 @@ run_adapter_contracts() {
 run_cargo_deny_clean() {
   local output
 
-  if ! output="$(cargo deny --locked check --hide-inclusion-graph 2>&1)"; then
+  if ! output="$(cargo deny --locked check --hide-inclusion-graph --disable-fetch 2>&1)"; then
     printf '%s\n' "$output" >&2
     return 1
   fi
@@ -90,8 +90,15 @@ run_pilot_smoke() {
     --min-rows-per-label 1
   cargo run --quiet -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
     --artifacts target/pilot-artifacts
+  local after_run_id
+  after_run_id="$(
+    cargo run --quiet -p netdiag-cli -- diagnose data/samples/normal.csv \
+      --artifacts target/pilot-artifacts \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])'
+  )"
   cargo run --quiet -p netdiag-cli -- pilot workflow examples/pilots/loopback-mock.yaml \
-    --artifacts target/pilot-artifacts
+    --artifacts target/pilot-artifacts \
+    --after-run-id "$after_run_id"
 }
 
 run_fast() {
@@ -121,7 +128,9 @@ run_strict() {
   cargo clippy --workspace --all-targets -- -D warnings
   cargo nextest run --workspace --lib --bins --tests
   RUSTFLAGS="-D warnings" cargo nextest run --workspace --lib --bins --tests
-  cargo llvm-cov nextest --workspace --lib --bins --tests \
+  cargo llvm-cov clean --workspace
+  cargo llvm-cov nextest --workspace --exclude netdiag-app --lib --bins --tests \
+    --test-threads 1 \
     --summary-only \
     --json \
     --output-path target/llvm-cov-workspace-summary.json

@@ -455,7 +455,9 @@ fn safe_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::benchmark::{BenchmarkEnvironment, BenchmarkReport};
+    use crate::benchmark::{
+        BenchmarkCheck, BenchmarkEnvironment, BenchmarkReport, BenchmarkSection,
+    };
     use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
     use tempfile::tempdir;
 
@@ -500,7 +502,17 @@ mod tests {
                 arch: "test".to_string(),
                 profile: "test".to_string(),
             },
-            sections: Vec::new(),
+            sections: vec![BenchmarkSection {
+                name: "ood benchmark preflight".to_string(),
+                status: ConnectorHealthStatus::Ok,
+                elapsed_millis: 1.0,
+                checks: vec![BenchmarkCheck {
+                    name: "ood-cpu-saturation".to_string(),
+                    status: ConnectorHealthStatus::Ok,
+                    message: "static preflight passed".to_string(),
+                    details: None,
+                }],
+            }],
             reliability: None,
         };
         save_json_atomic(path, &report).expect("benchmark report");

@@ -327,11 +327,31 @@ fn passed_or_failed_maps_boolean_gate_results() {
 }
 
 #[test]
-fn workflow_passed_requires_pilot_and_all_phases_to_pass() {
+fn workflow_passed_rejects_failed_phases_and_pending_verification() {
     let temp = tempdir().expect("tempdir");
     let mut pilot_run = minimal_pilot_report(temp.path(), "before".to_string());
     let passed = vec![phase("diagnose", PilotWorkflowPhaseStatus::Passed, "ok")];
     assert!(workflow_passed(&pilot_run, &passed));
+
+    let pending_review = vec![
+        phase("diagnose", PilotWorkflowPhaseStatus::Passed, "ok"),
+        phase(
+            "review",
+            PilotWorkflowPhaseStatus::Pending,
+            "waiting for human review",
+        ),
+    ];
+    assert!(workflow_passed(&pilot_run, &pending_review));
+
+    let pending_verify = vec![
+        phase("diagnose", PilotWorkflowPhaseStatus::Passed, "ok"),
+        phase(
+            "verify",
+            PilotWorkflowPhaseStatus::Pending,
+            "no after-run configured yet",
+        ),
+    ];
+    assert!(!workflow_passed(&pilot_run, &pending_verify));
 
     let failed_phase = vec![phase(
         "diagnose",
@@ -471,6 +491,7 @@ fn workflow_verification_reports_pending_when_no_after_run_is_configured() {
     assert_eq!(phases.len(), 1);
     assert_eq!(phases[0].status, PilotWorkflowPhaseStatus::Pending);
     assert_eq!(phases[0].message, "no after-run configured yet");
+    assert!(!workflow_passed(&pilot_run, &phases));
 }
 
 #[test]

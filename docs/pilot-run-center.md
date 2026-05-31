@@ -72,6 +72,11 @@ short read-only windows suitable for preflight and pilot smoke runs.
 Pilot manifests only send bearer tokens when the source explicitly declares
 `bearer_token_env`; they do not inherit a global token for every endpoint.
 
+`pilot workflow` is the closed-loop command. It can still record a partial
+workflow without `--after-run-id`, but that report leaves the `verify` phase
+`pending` and the CLI exits non-zero. A workflow only passes when collection,
+diagnosis, evidence export, and after-run verification gates all pass.
+
 Start from:
 
 - `examples/pilots/loopback-mock.yaml` for CI-safe adapter smoke.

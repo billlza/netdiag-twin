@@ -138,10 +138,16 @@ fn passed_or_failed(passed: bool) -> PilotWorkflowPhaseStatus {
 }
 
 fn workflow_passed(pilot_run: &PilotReport, phases: &[PilotWorkflowPhase]) -> bool {
-    pilot_run.passed
-        && phases
-            .iter()
-            .all(|phase| !matches!(phase.status, PilotWorkflowPhaseStatus::Failed))
+    pilot_run.passed && phases.iter().all(phase_allows_workflow_success)
+}
+
+fn phase_allows_workflow_success(phase: &PilotWorkflowPhase) -> bool {
+    match phase.status {
+        PilotWorkflowPhaseStatus::Passed => true,
+        PilotWorkflowPhaseStatus::Failed => false,
+        PilotWorkflowPhaseStatus::Pending => phase.name != "verify",
+        PilotWorkflowPhaseStatus::Skipped => true,
+    }
 }
 
 fn verification_phase_status(verdict: ActionVerificationVerdict) -> PilotWorkflowPhaseStatus {

@@ -469,6 +469,10 @@ mod tests {
             .to_path_buf()
     }
 
+    fn sample(name: &str) -> std::path::PathBuf {
+        repo_root().join("data/samples").join(format!("{name}.csv"))
+    }
+
     fn provision_test_model(artifacts: &Path) {
         train_model_from_jsonl_with_options(
             repo_root().join("examples/datasets/pilot-smoke-training.jsonl"),
@@ -684,19 +688,31 @@ sources:
         let temp = tempdir().expect("tempdir");
         let artifacts = temp.path().join("artifacts");
         provision_test_model(&artifacts);
+        let after = crate::diagnose_file(
+            sample("normal"),
+            &artifacts,
+            Some(("line", "reroute_path_b")),
+        )
+        .expect("after run");
 
         let report = run_pilot_workflow(
             repo_root().join("examples/pilots/generic-lab-kit.yaml"),
             PilotWorkflowOptions {
                 artifacts,
                 allow_active: false,
-                verification: None,
+                verification: Some(PilotWorkflowVerificationOptions {
+                    after_run_id: after.run_id,
+                    recommendation_id: None,
+                    policy_path: None,
+                    objective_path: None,
+                }),
             },
         )
         .expect("workflow");
 
         assert!(report.passed);
         assert_eq!(report.pilot_id, "generic-lab-kit");
+        assert!(report.verification.is_some());
         assert!(
             report
                 .phases

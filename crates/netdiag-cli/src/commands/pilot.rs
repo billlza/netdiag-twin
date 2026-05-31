@@ -149,6 +149,7 @@ pub fn run(command: PilotCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netdiag_core::diagnose_file;
     use netdiag_core::ml::{TrainingOptions, train_model_from_jsonl_with_options};
     use tempfile::tempdir;
 
@@ -158,6 +159,10 @@ mod tests {
             .and_then(std::path::Path::parent)
             .expect("repo root")
             .to_path_buf()
+    }
+
+    fn sample(name: &str) -> PathBuf {
+        repo_root().join("data/samples").join(format!("{name}.csv"))
     }
 
     fn provision_model(artifacts: &std::path::Path) {
@@ -232,16 +237,42 @@ mod tests {
     }
 
     #[test]
-    fn workflow_command_succeeds_for_generic_lab_kit_manifest() {
+    fn workflow_command_fails_without_after_run_verification() {
         let temp = tempdir().expect("tempdir");
         let artifacts = temp.path().join("artifacts");
         provision_model(&artifacts);
+
+        let error = run(PilotCommand::Workflow {
+            pilot: repo_root().join("examples/pilots/generic-lab-kit.yaml"),
+            artifacts,
+            allow_active: false,
+            after_run_id: None,
+            recommendation_id: None,
+            policy: None,
+            objective: None,
+        })
+        .expect_err("workflow should not pass with pending verification");
+
+        assert!(error.to_string().contains("pilot workflow gates failed"));
+    }
+
+    #[test]
+    fn workflow_command_succeeds_with_after_run_verification() {
+        let temp = tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_model(&artifacts);
+        let after = diagnose_file(
+            sample("normal"),
+            &artifacts,
+            Some(("line", "reroute_path_b")),
+        )
+        .expect("after run");
 
         run(PilotCommand::Workflow {
             pilot: repo_root().join("examples/pilots/generic-lab-kit.yaml"),
             artifacts,
             allow_active: false,
-            after_run_id: None,
+            after_run_id: Some(after.run_id),
             recommendation_id: None,
             policy: None,
             objective: None,

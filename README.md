@@ -18,9 +18,10 @@ regression checks, platform incident evidence bundles, lab gates for adapter or
 telemetry-source changes, and calibrated unknown/OOD checks before a model is
 trusted in a real environment.
 
-v0.5.1 adds pilot-ready reliability hardening: explicit artifact integrity
-checks, a benchmark report that pairs CI-friendly JSON with a human Markdown
-summary, and a safe real-device pilot flow for generic lab kits.
+v0.5.2 adds the model-promotion OOD behavior gate: `pilot model-gate` now
+requires a fresh lab calibration artifact that matches the promoted
+model/dataset hashes, confirms calibrated thresholds were applied, and enforces
+OOD false-positive, OOD false-negative, and rule/ML disagreement hotspot limits.
 
 The v0.5 direction is [Pilot Run Center](docs/pilot-run-center.md): a real-device
 trial loop that turns pilot manifests into preflight, collection, diagnosis,
@@ -242,15 +243,21 @@ Gate a trained model before promoting it for real pilots:
 cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
   --output target/benchmark-report
+cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 cargo run -p netdiag-cli -- pilot model-gate \
   --model-dir artifacts/model \
   --benchmark-report target/benchmark-report/benchmark_report.json \
-  --min-rows-per-label 10
+  --calibration-report artifacts/lab_calibration_report.json \
+  --min-rows-per-label 10 \
+  --max-ood-false-positive-rate 0.05 \
+  --max-ood-false-negative-rate 0.05 \
+  --max-rule-ml-disagreement-hotspot-rate 0.10
 ```
 
-In v0.5.1, `pilot model-gate` checks known-label coverage and explicit OOD
-benchmark preflight coverage. A full OOD behavior gate is intentionally kept as
-the next release item.
+In v0.5.2, `pilot model-gate` combines known-label coverage, explicit OOD
+benchmark preflight coverage, and behavior-level calibration gates. The
+calibration artifact must be `applied: true`, fresh, hash-matched to the model
+bundle, and internally consistent with recomputed OOD FP/FN and hotspot rates.
 
 Validate topology and policy YAML before giving it to a lab run:
 

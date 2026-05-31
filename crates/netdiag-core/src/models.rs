@@ -183,13 +183,13 @@ impl Default for DiagnosisDecision {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeatureBounds {
     pub min: f64,
     pub max: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelUncertaintyThresholds {
     pub min_max_probability: f64,
     pub min_probability_margin: f64,

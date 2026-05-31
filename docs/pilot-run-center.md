@@ -121,9 +121,10 @@ A model should become active for real pilots only after:
 - The promoted manifest records dataset hash, model hash, training gate, and
   evaluation summary.
 
-The v0.5.1 gate enforces known-label coverage and explicit OOD benchmark
-preflight coverage. A behavior-level OOD gate remains a v0.5.2+ follow-up and
-should not be treated as covered by preflight alone.
+The v0.5.2 gate enforces known-label coverage, explicit OOD benchmark preflight
+coverage, and behavior-level OOD calibration. Promotion requires a fresh
+`lab_calibration_report.json` whose model manifest hash, model file hash,
+dataset hash, and calibrated thresholds match the bundle being promoted.
 
 Run the gate with:
 
@@ -131,9 +132,13 @@ Run the gate with:
 cargo run -p netdiag-cli -- pilot model-gate \
   --model-dir artifacts/model \
   --benchmark-report target/benchmark-report/benchmark_report.json \
+  --calibration-report artifacts/lab_calibration_report.json \
   --min-rows-per-label 10 \
   --min-accuracy 0.90 \
-  --min-macro-f1 0.90
+  --min-macro-f1 0.90 \
+  --max-ood-false-positive-rate 0.05 \
+  --max-ood-false-negative-rate 0.05 \
+  --max-rule-ml-disagreement-hotspot-rate 0.10
 ```
 
 ## Refactor Boundaries

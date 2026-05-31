@@ -12,10 +12,9 @@ use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model, 
 use crate::models::{
     ActionVerification, ActionVerificationVerdict, ConnectorHealthSnapshot, ConnectorHealthStatus,
     CorroborationDecision, CorroborationSignal, DiagnosisEvent, DiagnosisStatus, EvidenceRecord,
-    EvidenceRef, FaultLabel, FeatureBounds, HilReviewSummary, HilState, IngestResult,
-    MetricQuality, MlResult, ModelManifest, ModelUncertaintyThresholds, MultiSourceEvidenceSummary,
-    Recommendation, RunComparison, RunManifest, Severity, SourceEvidenceSummary, TimeWindow,
-    TwinPolicyImpact,
+    EvidenceRef, FaultLabel, HilReviewSummary, HilState, IngestResult, MetricQuality,
+    MultiSourceEvidenceSummary, Recommendation, RunComparison, RunManifest, Severity,
+    SourceEvidenceSummary, TimeWindow, TwinPolicyImpact,
 };
 use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_existing_model_dir};
 use crate::recommendation::recommend_actions;
@@ -27,7 +26,6 @@ use crate::storage::{
     RunLocation, compare_runs, connector_health_from_ingest, read_connector_health, read_json,
     resolve_stored_path, run_artifacts, run_dir, save_json, write_connector_health,
 };
-use crate::telemetry::quantile;
 use crate::twin::{
     TopologyFormat, import_policy_action, import_topology, policy_action, topology_model,
     validate_policy_action_for_topology, validate_policy_action_shape, validate_topology_model,
@@ -40,6 +38,12 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
+
+mod calibration;
+pub use calibration::{
+    LabCalibrationDistribution, LabCalibrationHotspot, LabCalibrationLabelStats,
+    LabCalibrationOodStats, LabCalibrationReport, calibrate_lab_uncertainty,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabScenario {
@@ -432,72 +436,6 @@ pub struct LabSummaryFailure {
     pub scenario_id: String,
     #[serde(default)]
     pub failures: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabCalibrationReport {
-    pub schema: String,
-    pub generated_at: DateTime<Utc>,
-    pub artifact_root: String,
-    pub model_manifest_path: String,
-    pub evaluated_runs: usize,
-    pub known_runs: usize,
-    pub uncertain_runs: usize,
-    pub out_of_distribution_runs: usize,
-    pub skipped_runs: usize,
-    #[serde(default)]
-    pub per_label: BTreeMap<String, LabCalibrationLabelStats>,
-    pub ood: LabCalibrationOodStats,
-    #[serde(default)]
-    pub rule_ml_disagreement_hotspots: Vec<LabCalibrationHotspot>,
-    pub feature_distance_distribution: LabCalibrationDistribution,
-    #[serde(default)]
-    pub suggested_rule_thresholds: BTreeMap<String, f64>,
-    pub applied: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_thresholds: Option<ModelUncertaintyThresholds>,
-    pub calibrated_thresholds: ModelUncertaintyThresholds,
-    #[serde(default)]
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LabCalibrationLabelStats {
-    pub runs: usize,
-    pub rule_correct: usize,
-    pub ml_correct: usize,
-    pub rule_accuracy: f64,
-    pub ml_accuracy: f64,
-    pub known_rate: f64,
-    pub uncertain_rate: f64,
-    pub out_of_distribution_rate: f64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LabCalibrationOodStats {
-    pub expected_ood_runs: usize,
-    pub expected_known_runs: usize,
-    pub false_positive_runs: usize,
-    pub false_negative_runs: usize,
-    pub false_positive_rate: f64,
-    pub false_negative_rate: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabCalibrationHotspot {
-    pub scenario_id: String,
-    pub scenario_name: String,
-    pub disagreements: usize,
-    pub runs: usize,
-    pub rate: f64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LabCalibrationDistribution {
-    pub count: usize,
-    pub p50: f64,
-    pub p95: f64,
-    pub max: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1392,271 +1330,6 @@ pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryR
     })
 }
 
-pub fn calibrate_lab_uncertainty(
-    artifact_root: impl AsRef<Path>,
-    dry_run: bool,
-) -> Result<LabCalibrationReport> {
-    let artifact_root = artifact_root.as_ref();
-    let model_dir = artifact_root.join("model");
-    load_existing_model(&model_dir)?;
-    let model_manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
-    let mut manifest: ModelManifest =
-        serde_json::from_value(read_json(&model_manifest_path)?).map_err(NetdiagError::from)?;
-    let previous_thresholds = manifest.uncertainty_thresholds.clone();
-    let index = read_lab_run_index(artifact_root)?.ok_or_else(|| {
-        NetdiagError::InvalidTrace(format!(
-            "lab calibration requires {}, but no lab run index exists under {}",
-            artifact_root.join("lab_run_index.json").display(),
-            artifact_root.display()
-        ))
-    })?;
-
-    let mut known_max_probability = Vec::new();
-    let mut known_margin = Vec::new();
-    let mut known_entropy = Vec::new();
-    let mut known_distance = Vec::new();
-    let mut ood_distance = Vec::new();
-    let mut known_runs = 0usize;
-    let mut uncertain_runs = 0usize;
-    let mut out_of_distribution_runs = 0usize;
-    let mut skipped_runs = 0usize;
-    let mut evaluated_runs = 0usize;
-    let mut per_label = BTreeMap::<String, LabCalibrationLabelAccumulator>::new();
-    let mut expected_ood_runs = 0usize;
-    let mut expected_known_runs = 0usize;
-    let mut ood_false_positive_runs = 0usize;
-    let mut ood_false_negative_runs = 0usize;
-    let mut scenario_hotspots = BTreeMap::<String, LabCalibrationHotspotAccumulator>::new();
-    let mut feature_distances = Vec::new();
-    let mut rule_threshold_samples = BTreeMap::<String, Vec<f64>>::new();
-    let mut known_feature_values = BTreeMap::<String, Vec<f64>>::new();
-
-    for entry in &index.runs {
-        let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path);
-        let acceptance = match read_json(&acceptance_path).and_then(|value| {
-            serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
-        }) {
-            Ok(acceptance) => acceptance,
-            Err(_) => {
-                skipped_runs += 1;
-                continue;
-            }
-        };
-        evaluated_runs += 1;
-        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
-        let ml_result_path = run_dir(&lab_run_dir, &entry.run_id).join("ml_result.json");
-        let ml: MlResult = match read_json(&ml_result_path)
-            .and_then(|value| serde_json::from_value::<MlResult>(value).map_err(Into::into))
-        {
-            Ok(ml) => ml,
-            Err(_) => {
-                skipped_runs += 1;
-                continue;
-            }
-        };
-        if ml.uncertainty.feature_distance.is_finite() {
-            feature_distances.push(ml.uncertainty.feature_distance);
-        }
-
-        let comparison_path = resolve_stored_path(artifact_root, &entry.comparison_path);
-        if let Ok(comparison) = read_json(&comparison_path)
-            .and_then(|value| serde_json::from_value::<LabRunComparison>(value).map_err(Into::into))
-        {
-            let hotspot = scenario_hotspots
-                .entry(entry.scenario_id.clone())
-                .or_insert_with(|| LabCalibrationHotspotAccumulator {
-                    scenario_name: entry.scenario_name.clone(),
-                    ..Default::default()
-                });
-            hotspot.runs += 1;
-            if !comparison.rule_ml_agreement {
-                hotspot.disagreements += 1;
-            }
-        }
-
-        if let Some(expected_label) = acceptance.expected_label {
-            expected_known_runs += 1;
-            let label_key = expected_label.as_str().to_string();
-            let stats = per_label.entry(label_key.clone()).or_default();
-            stats.runs += 1;
-            match acceptance.actual_diagnosis_status {
-                DiagnosisStatus::Known => stats.known += 1,
-                DiagnosisStatus::Uncertain => stats.uncertain += 1,
-                DiagnosisStatus::OutOfDistribution => {
-                    stats.out_of_distribution += 1;
-                    ood_false_positive_runs += 1;
-                }
-            }
-            if acceptance
-                .actual_rule_labels
-                .iter()
-                .any(|label| label == expected_label.as_str())
-            {
-                stats.rule_correct += 1;
-            }
-            if acceptance.actual_ml_top == expected_label.as_str() {
-                stats.ml_correct += 1;
-            }
-            let events_path = run_dir(&lab_run_dir, &entry.run_id).join("diagnosis_events.json");
-            if let Ok(events) = read_json(&events_path).and_then(|value| {
-                serde_json::from_value::<Vec<DiagnosisEvent>>(value).map_err(Into::into)
-            }) {
-                rule_threshold_samples.entry(label_key).or_default().extend(
-                    events
-                        .iter()
-                        .filter(|event| event.evidence.symptom == expected_label)
-                        .map(|event| event.evidence.confidence)
-                        .filter(|value| value.is_finite()),
-                );
-            }
-        } else {
-            expected_ood_runs += 1;
-            if acceptance.actual_diagnosis_status == DiagnosisStatus::Known {
-                ood_false_negative_runs += 1;
-            }
-        }
-
-        if !acceptance.passed {
-            skipped_runs += 1;
-            continue;
-        }
-        match acceptance.actual_diagnosis_status {
-            DiagnosisStatus::Known => {
-                known_runs += 1;
-                known_max_probability.push(ml.uncertainty.max_probability);
-                known_margin.push(ml.uncertainty.probability_margin);
-                known_entropy.push(ml.uncertainty.entropy);
-                known_distance.push(ml.uncertainty.feature_distance);
-                for (name, value) in &ml.features {
-                    if value.is_finite() {
-                        known_feature_values
-                            .entry(name.clone())
-                            .or_default()
-                            .push(*value);
-                    }
-                }
-            }
-            DiagnosisStatus::Uncertain => {
-                uncertain_runs += 1;
-            }
-            DiagnosisStatus::OutOfDistribution => {
-                out_of_distribution_runs += 1;
-                ood_distance.push(ml.uncertainty.feature_distance);
-            }
-        }
-    }
-
-    if known_runs == 0 {
-        return Err(NetdiagError::InvalidTrace(
-            "lab calibration requires at least one accepted known-status lab run".to_string(),
-        ));
-    }
-    let mut warnings = Vec::new();
-    if out_of_distribution_runs == 0 {
-        warnings.push(
-            "no accepted out_of_distribution lab runs; feature-distance threshold uses known-run envelope only"
-                .to_string(),
-        );
-    }
-    if known_runs < FaultLabel::ALL.len() {
-        warnings.push(format!(
-            "only {known_runs} accepted known-status runs; calibrate with at least one accepted run per known label before treating thresholds as lab-grade"
-        ));
-    }
-    let covered_labels = FaultLabel::ALL
-        .iter()
-        .filter(|label| per_label.contains_key(label.as_str()))
-        .count();
-    let has_lab_grade_coverage = covered_labels == FaultLabel::ALL.len()
-        && out_of_distribution_runs > 0
-        && expected_ood_runs > 0;
-    if !has_lab_grade_coverage {
-        warnings.push(format!(
-            "calibration coverage is not lab-grade ({covered_labels}/{} labels, {out_of_distribution_runs} accepted OOD runs); thresholds are reported but model_manifest.json was not updated",
-            FaultLabel::ALL.len()
-        ));
-    }
-
-    let previous = previous_thresholds.clone().unwrap_or_default();
-    let calibrated_feature_bounds = calibrated_feature_bounds(&known_feature_values, &previous);
-    let known_distance_p95 = quantile(&known_distance, 0.95);
-    let max_feature_distance = (if let Some(min_ood_distance) = ood_distance
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .min_by(f64::total_cmp)
-        && min_ood_distance > known_distance_p95
-    {
-        (known_distance_p95 + min_ood_distance) / 2.0
-    } else {
-        known_distance_p95 * 1.25
-    })
-    .max(1.0);
-    let calibrated_thresholds = ModelUncertaintyThresholds {
-        min_max_probability: round4(quantile(&known_max_probability, 0.05).clamp(0.05, 0.99)),
-        min_probability_margin: round4(quantile(&known_margin, 0.05).clamp(0.0, 0.80)),
-        max_entropy: round4(quantile(&known_entropy, 0.95).clamp(0.05, 1.0)),
-        max_feature_distance: round4(max_feature_distance),
-        feature_bounds: calibrated_feature_bounds,
-    };
-    let per_label = per_label
-        .into_iter()
-        .map(|(label, stats)| (label, stats.into_stats()))
-        .collect::<BTreeMap<_, _>>();
-    let rule_ml_disagreement_hotspots = scenario_hotspots
-        .into_iter()
-        .filter_map(|(scenario_id, stats)| {
-            (stats.disagreements > 0).then(|| stats.into_hotspot(scenario_id))
-        })
-        .collect::<Vec<_>>();
-    let suggested_rule_thresholds = rule_threshold_samples
-        .into_iter()
-        .filter_map(|(label, samples)| {
-            (!samples.is_empty())
-                .then(|| (label, round4(quantile(&samples, 0.05).clamp(0.50, 0.95))))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let feature_distance_distribution = calibration_distribution(&feature_distances);
-    let ood = LabCalibrationOodStats {
-        expected_ood_runs,
-        expected_known_runs,
-        false_positive_runs: ood_false_positive_runs,
-        false_negative_runs: ood_false_negative_runs,
-        false_positive_rate: round4(
-            ood_false_positive_runs as f64 / expected_known_runs.max(1) as f64,
-        ),
-        false_negative_rate: round4(
-            ood_false_negative_runs as f64 / expected_ood_runs.max(1) as f64,
-        ),
-    };
-    let applied = !dry_run && has_lab_grade_coverage;
-    if applied {
-        manifest.uncertainty_thresholds = Some(calibrated_thresholds.clone());
-        save_json(&model_manifest_path, &manifest)?;
-    }
-
-    Ok(LabCalibrationReport {
-        schema: "netdiag-lab-calibration/v1".to_string(),
-        generated_at: Utc::now(),
-        artifact_root: artifact_root.display().to_string(),
-        model_manifest_path: model_manifest_path.display().to_string(),
-        evaluated_runs,
-        known_runs,
-        uncertain_runs,
-        out_of_distribution_runs,
-        skipped_runs,
-        per_label,
-        ood,
-        rule_ml_disagreement_hotspots,
-        feature_distance_distribution,
-        suggested_rule_thresholds,
-        applied,
-        previous_thresholds,
-        calibrated_thresholds,
-        warnings,
-    })
-}
-
 #[derive(Debug, Clone, Default)]
 struct LabSummaryAccumulator {
     runs: usize,
@@ -1665,97 +1338,6 @@ struct LabSummaryAccumulator {
     ml_correct: usize,
     quality_degraded: usize,
     rule_ml_disagreement: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-struct LabCalibrationLabelAccumulator {
-    runs: usize,
-    rule_correct: usize,
-    ml_correct: usize,
-    known: usize,
-    uncertain: usize,
-    out_of_distribution: usize,
-}
-
-impl LabCalibrationLabelAccumulator {
-    fn into_stats(self) -> LabCalibrationLabelStats {
-        let denominator = self.runs.max(1) as f64;
-        LabCalibrationLabelStats {
-            runs: self.runs,
-            rule_correct: self.rule_correct,
-            ml_correct: self.ml_correct,
-            rule_accuracy: round4(self.rule_correct as f64 / denominator),
-            ml_accuracy: round4(self.ml_correct as f64 / denominator),
-            known_rate: round4(self.known as f64 / denominator),
-            uncertain_rate: round4(self.uncertain as f64 / denominator),
-            out_of_distribution_rate: round4(self.out_of_distribution as f64 / denominator),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct LabCalibrationHotspotAccumulator {
-    scenario_name: String,
-    runs: usize,
-    disagreements: usize,
-}
-
-impl LabCalibrationHotspotAccumulator {
-    fn into_hotspot(self, scenario_id: String) -> LabCalibrationHotspot {
-        let denominator = self.runs.max(1) as f64;
-        LabCalibrationHotspot {
-            scenario_id,
-            scenario_name: self.scenario_name,
-            disagreements: self.disagreements,
-            runs: self.runs,
-            rate: round4(self.disagreements as f64 / denominator),
-        }
-    }
-}
-
-fn calibration_distribution(values: &[f64]) -> LabCalibrationDistribution {
-    let finite = values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    LabCalibrationDistribution {
-        count: finite.len(),
-        p50: round4(quantile(&finite, 0.50)),
-        p95: round4(quantile(&finite, 0.95)),
-        max: round4(finite.into_iter().fold(0.0, f64::max)),
-    }
-}
-
-fn calibrated_feature_bounds(
-    values: &BTreeMap<String, Vec<f64>>,
-    previous: &ModelUncertaintyThresholds,
-) -> BTreeMap<String, FeatureBounds> {
-    let mut bounds = previous.feature_bounds.clone();
-    for (name, samples) in values {
-        let finite = samples
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .collect::<Vec<_>>();
-        if finite.len() < 2 {
-            continue;
-        }
-        let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let span = (max - min)
-            .abs()
-            .max(max.abs().max(min.abs()) * 0.05)
-            .max(1e-6);
-        bounds.insert(
-            name.clone(),
-            FeatureBounds {
-                min: round4(min - span * 0.10),
-                max: round4(max + span * 0.10),
-            },
-        );
-    }
-    bounds
 }
 
 impl LabSummaryAccumulator {
@@ -3792,6 +3374,26 @@ mod tests {
         status: DiagnosisStatus,
         ml: MlResult,
     ) {
+        write_lab_calibration_sample_with_agreement(
+            artifact_root,
+            scenario_id,
+            run_id,
+            expected_label,
+            status,
+            ml,
+            true,
+        );
+    }
+
+    fn write_lab_calibration_sample_with_agreement(
+        artifact_root: &Path,
+        scenario_id: &str,
+        run_id: &str,
+        expected_label: Option<FaultLabel>,
+        status: DiagnosisStatus,
+        ml: MlResult,
+        rule_ml_agreement: bool,
+    ) {
         let lab_run_dir = artifact_root
             .join("lab-runs")
             .join(scenario_id)
@@ -3815,6 +3417,19 @@ mod tests {
             failures: Vec::new(),
         };
         save_json(lab_run_dir.join("acceptance.json"), &acceptance).expect("acceptance");
+        let comparison = LabRunComparison {
+            schema: "netdiag-lab-comparison/v1".to_string(),
+            scenario_id: scenario_id.to_string(),
+            run_id: run_id.to_string(),
+            expected_label,
+            actual_rule_labels: acceptance.actual_rule_labels.clone(),
+            actual_ml_top: acceptance.actual_ml_top.clone(),
+            diagnosis_status: status,
+            rule_ml_agreement,
+            quality_status: ConnectorHealthStatus::Ok,
+            previous_run_comparison: None,
+        };
+        save_json(lab_run_dir.join("comparison.json"), &comparison).expect("comparison");
         save_json(run_dir(&lab_run_dir, run_id).join("ml_result.json"), &ml).expect("ml result");
         update_lab_run_index(
             artifact_root,
@@ -4569,8 +4184,25 @@ mod tests {
         assert_eq!(report.ood.expected_ood_runs, 1);
         assert!(report.feature_distance_distribution.p95 >= 2.0);
         assert!(report.per_label.contains_key("congestion"));
+        assert_eq!(
+            report
+                .per_label
+                .get("congestion")
+                .expect("congestion")
+                .accepted_known_runs,
+            1
+        );
+        assert!(report.model_manifest_hash_sha256.is_some());
+        assert!(report.model_file_hash_sha256.is_some());
+        assert!(report.dataset_hash_sha256.is_some());
         assert!(report.calibrated_thresholds.max_feature_distance > 2.0);
         assert!(report.calibrated_thresholds.max_feature_distance < 10.0);
+        let persisted: LabCalibrationReport = serde_json::from_value(
+            read_json(temp.path().join("lab_calibration_report.json")).expect("report"),
+        )
+        .expect("calibration report");
+        assert_eq!(persisted.schema, "netdiag-lab-calibration/v1");
+        assert!(persisted.applied);
         let manifest: ModelManifest = serde_json::from_value(
             read_json(temp.path().join("model").join(MODEL_MANIFEST_FILE_NAME)).expect("manifest"),
         )
@@ -4581,6 +4213,59 @@ mod tests {
                 .expect("thresholds")
                 .max_feature_distance,
             report.calibrated_thresholds.max_feature_distance
+        );
+    }
+
+    #[test]
+    fn lab_calibration_reports_ood_behavior_and_disagreement_hotspots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_calibration_sample(
+            temp.path(),
+            "known",
+            "known-run",
+            Some(FaultLabel::Congestion),
+            DiagnosisStatus::Known,
+            calibration_ml_result("known-run", DiagnosisStatus::Known, 0.82, 0.18, 0.42, 2.0),
+        );
+        write_lab_calibration_sample_with_agreement(
+            temp.path(),
+            "false-positive",
+            "fp-run",
+            Some(FaultLabel::DnsFailure),
+            DiagnosisStatus::OutOfDistribution,
+            calibration_ml_result(
+                "fp-run",
+                DiagnosisStatus::OutOfDistribution,
+                0.40,
+                0.02,
+                0.90,
+                12.0,
+            ),
+            false,
+        );
+        write_lab_calibration_sample_with_agreement(
+            temp.path(),
+            "false-negative",
+            "fn-run",
+            None,
+            DiagnosisStatus::Known,
+            calibration_ml_result("fn-run", DiagnosisStatus::Known, 0.95, 0.44, 0.10, 1.0),
+            false,
+        );
+
+        let report = calibrate_lab_uncertainty(temp.path(), false).expect("calibration");
+
+        assert!(!report.applied);
+        assert_eq!(report.ood.false_positive_runs, 1);
+        assert_eq!(report.ood.false_negative_runs, 1);
+        assert_eq!(report.ood.false_positive_rate, 0.5);
+        assert_eq!(report.ood.false_negative_rate, 1.0);
+        assert!(
+            report
+                .rule_ml_disagreement_hotspots
+                .iter()
+                .any(|hotspot| hotspot.scenario_id == "false-positive" && hotspot.rate == 1.0)
         );
     }
 

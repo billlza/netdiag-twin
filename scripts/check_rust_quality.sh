@@ -112,6 +112,87 @@ run_pilot_smoke() {
   cargo run --quiet -p netdiag-cli -- pilot workflow examples/pilots/loopback-mock.yaml \
     --artifacts target/pilot-artifacts \
     --after-run-id "$after_run_id"
+  python3 - <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+artifacts = Path("target/pilot-artifacts")
+model_dir = artifacts / "model"
+manifest_path = model_dir / "model_manifest.json"
+model_path = model_dir / "rust_logistic_model.json"
+manifest = json.loads(manifest_path.read_text())
+thresholds = manifest.get("uncertainty_thresholds")
+if not thresholds:
+    raise SystemExit("pilot smoke model manifest is missing uncertainty_thresholds")
+
+labels = [
+    "normal",
+    "congestion",
+    "random_loss",
+    "dns_failure",
+    "tls_failure",
+    "udp_quic_blocked",
+]
+per_label = {
+    label: {
+        "runs": 1,
+        "accepted_known_runs": 1,
+        "rule_correct": 1,
+        "ml_correct": 1,
+        "rule_accuracy": 1.0,
+        "ml_accuracy": 1.0,
+        "known_rate": 1.0,
+        "uncertain_rate": 0.0,
+        "out_of_distribution_rate": 0.0,
+    }
+    for label in labels
+}
+report = {
+    "schema": "netdiag-lab-calibration/v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "artifact_root": str(artifacts),
+    "model_manifest_path": str(manifest_path),
+    "model_manifest_hash_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    "model_file_hash_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+    "dataset_hash_sha256": manifest.get("dataset_hash_sha256"),
+    "evaluated_runs": len(labels) + 1,
+    "known_runs": len(labels),
+    "uncertain_runs": 0,
+    "out_of_distribution_runs": 1,
+    "skipped_runs": 0,
+    "per_label": per_label,
+    "ood": {
+        "expected_ood_runs": 1,
+        "expected_known_runs": len(labels),
+        "false_positive_runs": 0,
+        "false_negative_runs": 0,
+        "false_positive_rate": 0.0,
+        "false_negative_rate": 0.0,
+    },
+    "rule_ml_disagreement_hotspots": [],
+    "feature_distance_distribution": {
+        "count": len(labels) + 1,
+        "p50": 1.0,
+        "p95": 2.0,
+        "max": 3.0,
+    },
+    "suggested_rule_thresholds": {},
+    "applied": True,
+    "calibrated_thresholds": thresholds,
+    "warnings": [],
+}
+(artifacts / "lab_calibration_report.json").write_text(json.dumps(report, indent=2) + "\n")
+PY
+  cargo run --quiet -p netdiag-cli -- pilot model-gate \
+    --model-dir target/pilot-artifacts/model \
+    --benchmark-report target/benchmark-report/benchmark_report.json \
+    --calibration-report target/pilot-artifacts/lab_calibration_report.json \
+    --min-rows-per-label 1 \
+    --allow-missing-evaluation
 }
 
 run_fast() {

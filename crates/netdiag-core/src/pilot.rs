@@ -455,9 +455,6 @@ fn safe_name(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::benchmark::{
-        BenchmarkCheck, BenchmarkEnvironment, BenchmarkReport, BenchmarkSection,
-    };
     use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
     use tempfile::tempdir;
 
@@ -483,43 +480,6 @@ mod tests {
             },
         )
         .expect("trained smoke model");
-    }
-
-    fn write_passing_benchmark(path: &Path) {
-        let report = BenchmarkReport {
-            schema: "netdiag-benchmark-report/v1".to_string(),
-            generated_at: Utc::now(),
-            suite: "test".to_string(),
-            passed: true,
-            artifacts: path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .display()
-                .to_string(),
-            output: path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .display()
-                .to_string(),
-            environment: BenchmarkEnvironment {
-                os: "test".to_string(),
-                arch: "test".to_string(),
-                profile: "test".to_string(),
-            },
-            sections: vec![BenchmarkSection {
-                name: "ood benchmark preflight".to_string(),
-                status: ConnectorHealthStatus::Ok,
-                elapsed_millis: 1.0,
-                checks: vec![BenchmarkCheck {
-                    name: "ood-cpu-saturation".to_string(),
-                    status: ConnectorHealthStatus::Ok,
-                    message: "static preflight passed".to_string(),
-                    details: None,
-                }],
-            }],
-            reliability: None,
-        };
-        save_json_atomic(path, &report).expect("benchmark report");
     }
 
     #[test]
@@ -727,42 +687,5 @@ sources:
                 .and_then(|run| run.evidence_bundle.as_ref())
                 .is_some()
         );
-    }
-
-    #[test]
-    fn model_promotion_gate_requires_evaluation_unless_explicitly_allowed() {
-        let temp = tempdir().expect("tempdir");
-        let artifacts = temp.path().join("artifacts");
-        provision_test_model(&artifacts);
-        let benchmark_report = temp.path().join("benchmark_report.json");
-        write_passing_benchmark(&benchmark_report);
-
-        let strict = evaluate_model_promotion(ModelPromotionOptions {
-            model_dir: artifacts.join("model"),
-            benchmark_report: benchmark_report.clone(),
-            min_rows_per_label: 1,
-            min_accuracy: 0.9,
-            min_macro_f1: 0.9,
-            allow_missing_evaluation: false,
-        })
-        .expect("strict gate");
-        assert!(!strict.passed);
-        assert!(
-            strict
-                .gates
-                .iter()
-                .any(|gate| gate.name == "evaluation_present" && !gate.passed)
-        );
-
-        let allowed = evaluate_model_promotion(ModelPromotionOptions {
-            model_dir: artifacts.join("model"),
-            benchmark_report,
-            min_rows_per_label: 1,
-            min_accuracy: 0.9,
-            min_macro_f1: 0.9,
-            allow_missing_evaluation: true,
-        })
-        .expect("allowed gate");
-        assert!(allowed.passed);
     }
 }

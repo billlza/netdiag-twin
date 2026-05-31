@@ -46,7 +46,7 @@ fn startup_tab_round_trip_includes_lab() {
 }
 
 #[test]
-fn pilot_run_center_skips_verification_when_after_run_is_empty() {
+fn pilot_run_center_records_pending_verification_when_after_run_is_empty() {
     let state = pilot_run_center::PilotRunCenterState::default();
     assert!(state.verification_options().is_none());
 }

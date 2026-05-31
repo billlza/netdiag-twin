@@ -121,6 +121,10 @@ A model should become active for real pilots only after:
 - The promoted manifest records dataset hash, model hash, training gate, and
   evaluation summary.
 
+The v0.5.1 gate enforces known-label coverage and explicit OOD benchmark
+preflight coverage. A behavior-level OOD gate remains a v0.5.2+ follow-up and
+should not be treated as covered by preflight alone.
+
 Run the gate with:
 
 ```bash

@@ -129,7 +129,7 @@ impl PilotRunCenterState {
             ui.label(RichText::new("After run ID").size(12.0).color(MUTED));
             ui.add(
                 egui::TextEdit::singleline(&mut self.verification_after_run_id)
-                    .hint_text("leave empty to skip verify")
+                    .hint_text("empty = partial workflow / pending verify")
                     .desired_width((ui.available_width() - 120.0).max(260.0)),
             );
         });

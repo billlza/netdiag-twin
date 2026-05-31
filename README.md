@@ -140,13 +140,16 @@ cargo run -p netdiag-cli -- train \
   --validation-split 0 \
   --min-rows-per-label 1
 cargo run -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml --artifacts artifacts
-cargo run -p netdiag-cli -- pilot workflow examples/pilots/loopback-mock.yaml --artifacts artifacts
+cargo run -p netdiag-cli -- pilot run examples/pilots/loopback-mock.yaml --artifacts artifacts
 ```
 
 The desktop app exposes the same flow from the Lab page as `Pilot Run Center`.
 Use `examples/pilots/generic-lab-kit.yaml` to exercise the executable adapter
 contract, or `examples/pilots/connector-family-readonly.yaml` to review the
 read-only connector family manifest shape.
+Use `pilot workflow --after-run-id <after_run_id>` when an after-run is
+available for closed-loop verification; without it, workflow reports remain
+partial with `verify` pending and exit non-zero.
 
 Run a what-if action against an existing run:
 
@@ -244,6 +247,10 @@ cargo run -p netdiag-cli -- pilot model-gate \
   --benchmark-report target/benchmark-report/benchmark_report.json \
   --min-rows-per-label 10
 ```
+
+In v0.5.1, `pilot model-gate` checks known-label coverage and explicit OOD
+benchmark preflight coverage. A full OOD behavior gate is intentionally kept as
+the next release item.
 
 Validate topology and policy YAML before giving it to a lab run:
 

@@ -42,19 +42,32 @@ run_adapter_contracts() {
 }
 
 run_cargo_deny_clean() {
+  local fetch_output
   local output
+
+  if ! fetch_output="$(cargo deny fetch db 2>&1)"; then
+    printf '%s\n' "$fetch_output" >&2
+    return 1
+  fi
+
+  if grep -E '(^|[[:space:]])warning(\[|:)' <<<"$fetch_output" >/dev/null; then
+    printf '%s\n' "$fetch_output" >&2
+    echo "cargo-deny advisory fetch emitted warnings; strict release gate requires clean output" >&2
+    return 1
+  fi
 
   if ! output="$(cargo deny --locked check --hide-inclusion-graph --disable-fetch 2>&1)"; then
     printf '%s\n' "$output" >&2
     return 1
   fi
 
-  if grep -E '(^|[[:space:]])warning\[' <<<"$output" >/dev/null; then
+  if grep -E '(^|[[:space:]])warning(\[|:)' <<<"$output" >/dev/null; then
     printf '%s\n' "$output" >&2
     echo "cargo-deny emitted warnings; strict release gate requires clean output" >&2
     return 1
   fi
 
+  printf '%s\n' "$fetch_output"
   printf '%s\n' "$output"
 }
 

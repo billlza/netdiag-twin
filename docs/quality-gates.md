@@ -52,15 +52,17 @@ The strict gate adds:
 - `RUSTFLAGS="-D warnings" cargo nextest run --workspace --lib --bins --tests`
 - `cargo llvm-cov nextest --workspace --exclude netdiag-app --lib --bins --tests --test-threads 1 --summary-only --json`
 - `scripts/check_coverage_summary.py` with `NETDIAG_COVERAGE_MIN=90`
-- `cargo deny --locked check --hide-inclusion-graph --disable-fetch`
+- `cargo deny fetch db`, then `cargo deny --locked check --hide-inclusion-graph --disable-fetch`
 - `cargo machete`
 - Generic Lab Kit adapter contract validation
 - Release benchmark report generation
 - Pilot smoke workflow through `pilot preflight`, `diagnose`, and `pilot workflow --after-run-id` so the verify phase completes
 - Optional Miri with `NETDIAG_RUN_MIRI=1`
 
-The cargo-deny invocation is also wrapped by the strict gate and fails if the
-command emits any `warning[...]` diagnostics. Duplicate dependencies are set to
+The cargo-deny invocation is also wrapped by the strict gate. It refreshes the
+RustSec advisory database before running the offline check so a stale or missing
+runner cache cannot mask the real dependency result, and it fails if either step
+emits warning diagnostics. Duplicate dependencies are set to
 `deny`; every current transitive duplicate must be an exact version-pinned
 `skip` entry with an audit reason in `deny.toml`, and
 `scripts/check_deny_waivers.py` rejects broad `skip-tree` entries.

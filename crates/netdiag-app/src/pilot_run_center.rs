@@ -1,10 +1,10 @@
-use super::{INK, MUTED, section_title, soft_button, soft_button_enabled};
+use super::{INK, MUTED, soft_button, soft_button_enabled};
 use eframe::egui::{self, RichText};
 use netdiag_core::pilot::{
     PilotOptions, PilotPreflightReport, PilotWorkflowOptions, PilotWorkflowReport,
     PilotWorkflowVerificationOptions, preflight_pilot, run_pilot_workflow,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -14,6 +14,7 @@ mod view;
 pub struct PilotRunCenterState {
     pub manifest_path: String,
     pub allow_active: bool,
+    pub allow_adapter_execution: bool,
     pub verification_after_run_id: String,
     pub verification_recommendation_id: String,
     pub verification_policy_path: String,
@@ -29,6 +30,7 @@ impl Default for PilotRunCenterState {
         Self {
             manifest_path: "examples/pilots/connector-family-readonly.yaml".to_string(),
             allow_active: false,
+            allow_adapter_execution: false,
             verification_after_run_id: String::new(),
             verification_recommendation_id: String::new(),
             verification_policy_path: String::new(),
@@ -41,7 +43,9 @@ impl Default for PilotRunCenterState {
     }
 }
 
-pub enum PilotRunCenterAction {
+pub(super) enum PilotRunCenterAction {
+    StartPreflight,
+    StartWorkflow,
     OpenPath(PathBuf),
 }
 
@@ -92,33 +96,9 @@ impl PilotRunCenterState {
         }
     }
 
-    pub fn render(
-        &mut self,
-        ui: &mut egui::Ui,
-        artifacts_root: &Path,
-    ) -> Option<PilotRunCenterAction> {
+    pub fn render(&mut self, ui: &mut egui::Ui) -> Option<PilotRunCenterAction> {
         let mut action = None;
-        section_title(ui, "Pilot Run Center");
-        ui.label(
-            RichText::new("Run a manifest through preflight, collection, diagnosis, evidence, review, and verification gates.")
-                .color(MUTED)
-                .size(13.0),
-        );
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Manifest").size(12.0).color(MUTED));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.manifest_path)
-                    .desired_width((ui.available_width() - 250.0).max(260.0)),
-            );
-            if soft_button(ui, "Choose").clicked() {
-                self.choose_manifest();
-            }
-        });
-        ui.checkbox(
-            &mut self.allow_active,
-            "Allow active probes when manifest also opts in",
-        );
+        view::render_manifest_controls(self, ui);
         ui.add_space(8.0);
         ui.label(
             RichText::new("After-run verification")
@@ -161,10 +141,10 @@ impl PilotRunCenterState {
         ui.horizontal(|ui| {
             let ready = self.job.is_none();
             if soft_button_enabled(ui, "Preflight", ready).clicked() {
-                self.start_preflight(artifacts_root.to_path_buf());
+                action = Some(PilotRunCenterAction::StartPreflight);
             }
             if soft_button_enabled(ui, "Run workflow", ready).clicked() {
-                self.start_workflow(artifacts_root.to_path_buf());
+                action = Some(PilotRunCenterAction::StartWorkflow);
             }
             if let Some(path) = self.latest_pilot_run_dir()
                 && soft_button(ui, "Open run").clicked()
@@ -197,7 +177,7 @@ impl PilotRunCenterState {
         self.manifest_path = path.display().to_string();
     }
 
-    fn start_preflight(&mut self, artifacts: PathBuf) {
+    pub(super) fn start_preflight(&mut self, artifacts: PathBuf) {
         if self.job.is_some() {
             return;
         }
@@ -212,6 +192,7 @@ impl PilotRunCenterState {
                 PilotOptions {
                     artifacts,
                     allow_active,
+                    allow_adapter_execution: false,
                 },
             )
             .map(PilotRunCenterOutcome::Preflight)
@@ -220,12 +201,13 @@ impl PilotRunCenterState {
         });
     }
 
-    fn start_workflow(&mut self, artifacts: PathBuf) {
+    pub(super) fn start_workflow(&mut self, artifacts: PathBuf) {
         if self.job.is_some() {
             return;
         }
         let manifest = PathBuf::from(self.manifest_path.trim());
         let allow_active = self.allow_active;
+        let allow_adapter_execution = self.allow_adapter_execution;
         let verification = self.verification_options();
         let (sender, receiver) = mpsc::channel();
         self.status = Some("Pilot workflow running".to_string());
@@ -236,6 +218,7 @@ impl PilotRunCenterState {
                 PilotWorkflowOptions {
                     artifacts,
                     allow_active,
+                    allow_adapter_execution,
                     verification,
                 },
             )

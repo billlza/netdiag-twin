@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -16,16 +17,26 @@ reqwest.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+# Linux alone enables the supported Wayland/X11 backends. The explicit winit
+# features preserve dynamic Wayland loading and font-free client decorations
+# without reintroducing the unmaintained ttf-parser path.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["wayland", "x11"] }
+winit.workspace = true
 
 [dev-dependencies]
-ttf-parser = "0.25.1"
+skrifa.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 keyring-core = "1.0.0"
 muda.workspace = true
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSWorkspace"] }
 objc2-foundation = "0.3.2"
 
 [package.metadata.bundle]

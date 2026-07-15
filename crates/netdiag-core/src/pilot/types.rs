@@ -1,10 +1,17 @@
 use crate::evidence_bundle::EvidenceBundleManifest;
-use crate::models::{ActionVerification, ConnectorHealthSnapshot, ConnectorHealthStatus};
+use crate::models::{ConnectorHealthSnapshot, ConnectorHealthStatus};
 use crate::reliability::ReliabilityCheck;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+mod collection;
+mod source_options;
+mod workflow;
+pub use collection::*;
+pub use source_options::*;
+pub use workflow::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PilotManifest {
@@ -25,6 +32,16 @@ pub struct PilotManifest {
 pub struct PilotSafety {
     #[serde(default)]
     pub allow_active: bool,
+    /// Manifest-relative directory containing trusted adapter code.
+    ///
+    /// Adapter endpoints are canonicalized and must remain inside this root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_execution_root: Option<String>,
+    /// Absolute Python executable explicitly trusted for adapter execution.
+    ///
+    /// Required on Windows, where inherited PATH ACLs are not assumed safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_python_interpreter: Option<String>,
     #[serde(default)]
     pub retention_days: Option<u32>,
 }
@@ -59,6 +76,8 @@ pub struct PilotSource {
     #[serde(default)]
     pub collection: PilotCollection,
     #[serde(default)]
+    pub adapter: PilotAdapterOptions,
+    #[serde(default)]
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -92,36 +111,13 @@ pub enum PilotSourceRole {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotCollection {
-    #[serde(default = "default_pilot_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_pilot_lookback_secs")]
-    pub lookback_secs: i64,
-    #[serde(default = "default_pilot_step_secs")]
-    pub step_secs: u64,
-    #[serde(default = "default_pilot_packet_limit")]
-    pub packet_limit: usize,
-    #[serde(default = "default_pilot_interval_secs")]
-    pub interval_secs: u64,
-}
-
-impl Default for PilotCollection {
-    fn default() -> Self {
-        Self {
-            timeout_secs: default_pilot_timeout_secs(),
-            lookback_secs: default_pilot_lookback_secs(),
-            step_secs: default_pilot_step_secs(),
-            packet_limit: default_pilot_packet_limit(),
-            interval_secs: default_pilot_interval_secs(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PilotOptions {
     pub artifacts: PathBuf,
     #[serde(default)]
     pub allow_active: bool,
+    /// Explicitly authorizes execution of trusted adapter code for this call.
+    #[serde(default)]
+    pub allow_adapter_execution: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,78 +173,6 @@ pub struct PilotDiagnosisSummary {
     pub recommendation_count: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PilotWorkflowOptions {
-    pub artifacts: PathBuf,
-    #[serde(default)]
-    pub allow_active: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification: Option<PilotWorkflowVerificationOptions>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotWorkflowVerificationOptions {
-    pub after_run_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommendation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy_path: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub objective_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotWorkflowReport {
-    pub schema: String,
-    pub generated_at: DateTime<Utc>,
-    pub pilot_id: String,
-    pub passed: bool,
-    #[serde(default)]
-    pub phases: Vec<PilotWorkflowPhase>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preflight: Option<PilotPreflightReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pilot_run: Option<PilotReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification: Option<ActionVerification>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PilotWorkflowPhase {
-    pub name: String,
-    pub status: PilotWorkflowPhaseStatus,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PilotWorkflowPhaseStatus {
-    Passed,
-    Failed,
-    Pending,
-    Skipped,
-}
-
 fn default_allowed_connector_status() -> Vec<ConnectorHealthStatus> {
     vec![ConnectorHealthStatus::Ok, ConnectorHealthStatus::Degraded]
-}
-
-fn default_pilot_timeout_secs() -> u64 {
-    10
-}
-
-fn default_pilot_lookback_secs() -> i64 {
-    300
-}
-
-fn default_pilot_step_secs() -> u64 {
-    15
-}
-
-fn default_pilot_packet_limit() -> usize {
-    256
-}
-
-fn default_pilot_interval_secs() -> u64 {
-    1
 }

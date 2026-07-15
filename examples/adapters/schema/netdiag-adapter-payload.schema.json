@@ -1,14 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://netdiag.local/schemas/netdiag-adapter-payload/v1",
+  "$id": "https://netdiag.local/schemas/netdiag-adapter-payload/v2",
   "title": "NetDiag Adapter Payload",
   "type": "object",
   "additionalProperties": true,
-  "required": ["schema", "sample", "protocol", "flow_count", "records", "experiment"],
+  "required": [
+    "schema",
+    "collection_mode",
+    "sample",
+    "protocol",
+    "flow_count",
+    "measurement_quality",
+    "records",
+    "experiment"
+  ],
   "properties": {
     "schema": {
       "type": "string",
-      "const": "netdiag-adapter-payload/v1"
+      "const": "netdiag-adapter-payload/v2"
+    },
+    "collection_mode": {
+      "type": "string",
+      "enum": ["sample", "live"]
     },
     "sample": {
       "type": "string",
@@ -21,6 +34,34 @@
     "flow_count": {
       "type": "integer",
       "minimum": 0
+    },
+    "measurement_quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "latency_ms",
+        "jitter_ms",
+        "packet_loss_rate",
+        "retransmission_rate",
+        "timeout_events",
+        "retry_events",
+        "throughput_mbps",
+        "dns_failure_events",
+        "tls_failure_events",
+        "quic_blocked_ratio"
+      ],
+      "properties": {
+        "latency_ms": { "$ref": "#/$defs/measurementQuality" },
+        "jitter_ms": { "$ref": "#/$defs/measurementQuality" },
+        "packet_loss_rate": { "$ref": "#/$defs/measurementQuality" },
+        "retransmission_rate": { "$ref": "#/$defs/measurementQuality" },
+        "timeout_events": { "$ref": "#/$defs/measurementQuality" },
+        "retry_events": { "$ref": "#/$defs/measurementQuality" },
+        "throughput_mbps": { "$ref": "#/$defs/measurementQuality" },
+        "dns_failure_events": { "$ref": "#/$defs/measurementQuality" },
+        "tls_failure_events": { "$ref": "#/$defs/measurementQuality" },
+        "quic_blocked_ratio": { "$ref": "#/$defs/measurementQuality" }
+      }
     },
     "records": {
       "type": "array",
@@ -48,14 +89,26 @@
           },
           "latency_ms": { "type": "number", "minimum": 0 },
           "jitter_ms": { "type": "number", "minimum": 0 },
-          "packet_loss_rate": { "type": "number", "minimum": 0 },
-          "retransmission_rate": { "type": "number", "minimum": 0 },
+          "packet_loss_rate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "retransmission_rate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
           "timeout_events": { "type": "number", "minimum": 0 },
           "retry_events": { "type": "number", "minimum": 0 },
           "throughput_mbps": { "type": "number", "minimum": 0 },
           "dns_failure_events": { "type": "number", "minimum": 0 },
           "tls_failure_events": { "type": "number", "minimum": 0 },
-          "quic_blocked_ratio": { "type": "number", "minimum": 0 }
+          "quic_blocked_ratio": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
         }
       }
     },
@@ -69,6 +122,12 @@
         "fault_end": { "type": "string" },
         "ground_truth": { "type": "string", "minLength": 1 }
       }
+    }
+  },
+  "$defs": {
+    "measurementQuality": {
+      "type": "string",
+      "enum": ["measured", "estimated", "fallback", "missing"]
     }
   }
 }

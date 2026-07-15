@@ -1,0 +1,99 @@
+name: Platform security
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Immutable commit to test; defaults to the caller event SHA."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  platform-security:
+    name: Platform security (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D warnings"
+      VCPKG_DISABLE_METRICS: "1"
+      NETDIAG_VCPKG_COMMIT: "f87344cac03158cbf1467264565f1fd36b382a24"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.checkout_ref || github.sha }}
+      - name: Verify immutable checkout
+        if: inputs.checkout_ref != ''
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || (echo "checkout_ref must be a full commit SHA" >&2 && exit 2)
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$EXPECTED_SHA" ]] || (echo "checked-out SHA mismatch: expected=$EXPECTED_SHA actual=$actual_sha" >&2 && exit 2)
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - name: Install the compile-only unsupported platform target
+        if: runner.os == 'Linux'
+        run: rustup target add --toolchain 1.95.0 wasm32-wasip1
+      - name: Restore pinned Windows libpcap binary cache
+        if: runner.os == 'Windows'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/netdiag-vcpkg-binary-cache
+          key: netdiag-vcpkg-${{ runner.os }}-${{ env.NETDIAG_VCPKG_COMMIT }}-${{ hashFiles('.github/vcpkg/*.cmake') }}
+      - name: Install Linux native test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes acl libpcap-dev
+      - name: Install pinned Windows libpcap test runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/netdiag-vcpkg-binary-cache
+        run: |
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "netdiag-vcpkg"
+          git -c init.defaultBranch=main init --quiet $vcpkgRoot
+          git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $vcpkgRoot fetch --quiet --depth=1 origin $env:NETDIAG_VCPKG_COMMIT
+          git -C $vcpkgRoot -c advice.detachedHead=false checkout --detach --quiet FETCH_HEAD
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          $triplet = "x64-windows-netdiag"
+          $overlay = Join-Path $env:GITHUB_WORKSPACE ".github\vcpkg"
+          & "$vcpkgRoot\vcpkg.exe" install "libpcap:$triplet" "--overlay-triplets=$overlay"
+          $installed = Join-Path $vcpkgRoot "installed\$triplet"
+          $importLibrary = Join-Path $installed "lib\wpcap.lib"
+          $runtimeLibrary = Join-Path $installed "bin\wpcap.dll"
+          if (!(Test-Path -PathType Leaf $importLibrary)) {
+            throw "vcpkg did not produce the required wpcap import library"
+          }
+          if (!(Test-Path -PathType Leaf $runtimeLibrary)) {
+            throw "vcpkg did not produce the required wpcap runtime library"
+          }
+          "LIB=$($installed)\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIBPCAP_VER=1.10.6" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$($installed)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Lint platform and consumer layers with warnings denied
+        run: cargo clippy --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features -- -D warnings
+      - name: Lint the fail-closed unsupported platform boundary
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p netdiag-platform --target wasm32-wasip1 --all-targets --all-features -- -D warnings
+      - name: Test full platform and consumer layers on Linux
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features
+      - name: Test Windows platform primitives with warnings denied
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p netdiag-platform --all-targets --all-features
+      - name: Test Windows fail-closed mutation contracts
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p netdiag-core --test windows_mutation_contract --all-features

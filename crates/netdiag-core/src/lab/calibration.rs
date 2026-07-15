@@ -1,19 +1,30 @@
-use super::{
-    LabAcceptanceReport, LabRunComparison, LabRunIndex, LabRunIndexEntry, read_lab_run_index,
-    round4,
-};
+use super::{LabAcceptanceReport, LabRunComparison, LabRunIndex, LabRunIndexEntry, round4};
 use crate::error::{NetdiagError, Result};
-use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model, sha256_file};
-use crate::models::{
-    DiagnosisEvent, DiagnosisStatus, FaultLabel, FeatureBounds, MlResult, ModelManifest,
-    ModelUncertaintyThresholds,
+use crate::ml::with_model_bundle_lock;
+use crate::models::{DiagnosisStatus, FaultLabel, MlResult, ModelUncertaintyThresholds};
+use crate::storage::typed_json::{
+    MAX_LAB_ACCEPTANCE_BYTES, MAX_LAB_COMPARISON_BYTES, MAX_ML_RESULT_BYTES,
+    read_required_stable_json_bounded,
 };
-use crate::storage::{read_json, resolve_stored_path, run_dir, save_json, save_json_atomic};
+use crate::storage::{resolve_stored_path, run_dir, save_json_atomic};
 use crate::telemetry::quantile;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+mod evidence_identity;
+mod model_identity;
+mod report;
+mod rule_events;
+mod thresholds;
+use evidence_identity::{
+    validate_acceptance_identity, validate_comparison_identity, validate_ml_identity,
+};
+use model_identity::{CalibrationModelIdentity, require_lab_run_index};
+use report::{CalibrationReportContext, build_report};
+use rule_events::read_rule_threshold_confidences;
+use thresholds::{calibrated_thresholds, calibration_distribution};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabCalibrationReport {
@@ -21,6 +32,9 @@ pub struct LabCalibrationReport {
     pub generated_at: DateTime<Utc>,
     pub artifact_root: String,
     pub model_manifest_path: String,
+    /// Manifest hash captured before calibration mutates uncertainty thresholds.
+    pub source_model_manifest_hash_sha256: String,
+    /// Current manifest hash after calibration has been applied, or the source hash for dry runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_manifest_hash_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,118 +108,59 @@ pub fn calibrate_lab_uncertainty(
     dry_run: bool,
 ) -> Result<LabCalibrationReport> {
     let artifact_root = artifact_root.as_ref();
+    crate::storage::ensure_artifact_root_owned(artifact_root)?;
     let model_dir = artifact_root.join("model");
-    load_existing_model(&model_dir)?;
-    let model_manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
-    let mut manifest: ModelManifest =
-        serde_json::from_value(read_json(&model_manifest_path)?).map_err(NetdiagError::from)?;
-    let dataset_hash_sha256 = manifest.dataset_hash_sha256.clone();
+    with_model_bundle_lock(&model_dir, || {
+        calibrate_lab_uncertainty_locked(artifact_root, dry_run, &model_dir)
+    })
+}
+
+fn calibrate_lab_uncertainty_locked(
+    artifact_root: &Path,
+    dry_run: bool,
+    model_dir: &Path,
+) -> Result<LabCalibrationReport> {
+    let (mut manifest, source_identity) = CalibrationModelIdentity::load(model_dir)?;
     let previous_thresholds = manifest.uncertainty_thresholds.clone();
     let index = require_lab_run_index(artifact_root)?;
-    let inputs = LabCalibrationInputs::collect(artifact_root, &index);
+    let inputs = LabCalibrationInputs::collect(artifact_root, &index, &source_identity)?;
     inputs.ensure_known_runs()?;
 
     let previous = previous_thresholds.clone().unwrap_or_default();
     let calibrated_thresholds = calibrated_thresholds(&inputs, &previous);
     let applied = !dry_run && inputs.has_lab_grade_coverage();
-    if applied {
+    source_identity.ensure_source_bundle_unchanged(model_dir)?;
+    let published_snapshot = if applied {
         manifest.uncertainty_thresholds = Some(calibrated_thresholds.clone());
-        save_json(&model_manifest_path, &manifest)?;
-    }
+        Some(source_identity.publish_manifest(model_dir, &manifest)?)
+    } else {
+        None
+    };
+    let model_manifest_path = published_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.manifest_path.as_path())
+        .unwrap_or_else(|| source_identity.source_manifest_path());
+    let current_manifest_hash_sha256 = published_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.model_manifest_hash_sha256.clone())
+        .unwrap_or_else(|| source_identity.source_manifest_hash_sha256.clone());
 
     let report = build_report(
         CalibrationReportContext {
             artifact_root,
-            model_dir: &model_dir,
-            model_manifest_path: &model_manifest_path,
-            dataset_hash_sha256,
+            model_manifest_path,
+            source_identity: &source_identity,
+            current_manifest_hash_sha256,
             previous_thresholds,
             calibrated_thresholds,
             applied,
         },
         inputs,
-    )?;
+    );
     if !dry_run {
         save_json_atomic(artifact_root.join("lab_calibration_report.json"), &report)?;
     }
     Ok(report)
-}
-
-struct CalibrationReportContext<'a> {
-    artifact_root: &'a Path,
-    model_dir: &'a Path,
-    model_manifest_path: &'a Path,
-    dataset_hash_sha256: Option<String>,
-    previous_thresholds: Option<ModelUncertaintyThresholds>,
-    calibrated_thresholds: ModelUncertaintyThresholds,
-    applied: bool,
-}
-
-fn require_lab_run_index(artifact_root: &Path) -> Result<LabRunIndex> {
-    read_lab_run_index(artifact_root)?.ok_or_else(|| {
-        NetdiagError::InvalidTrace(format!(
-            "lab calibration requires {}, but no lab run index exists under {}",
-            artifact_root.join("lab_run_index.json").display(),
-            artifact_root.display()
-        ))
-    })
-}
-
-fn calibrated_thresholds(
-    inputs: &LabCalibrationInputs,
-    previous: &ModelUncertaintyThresholds,
-) -> ModelUncertaintyThresholds {
-    let known_distance_p95 = quantile(&inputs.known_distance, 0.95);
-    ModelUncertaintyThresholds {
-        min_max_probability: round4(
-            quantile(&inputs.known_max_probability, 0.05).clamp(0.05, 0.99),
-        ),
-        min_probability_margin: round4(quantile(&inputs.known_margin, 0.05).clamp(0.0, 0.80)),
-        max_entropy: round4(quantile(&inputs.known_entropy, 0.95).clamp(0.05, 1.0)),
-        max_feature_distance: round4(max_feature_distance(inputs, known_distance_p95)),
-        feature_bounds: calibrated_feature_bounds(&inputs.known_feature_values, previous),
-    }
-}
-
-fn max_feature_distance(inputs: &LabCalibrationInputs, known_distance_p95: f64) -> f64 {
-    let from_ood = inputs
-        .ood_distance
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .min_by(f64::total_cmp)
-        .filter(|distance| *distance > known_distance_p95)
-        .map(|min_ood_distance| (known_distance_p95 + min_ood_distance) / 2.0);
-    from_ood.unwrap_or(known_distance_p95 * 1.25).max(1.0)
-}
-
-fn build_report(
-    context: CalibrationReportContext<'_>,
-    inputs: LabCalibrationInputs,
-) -> Result<LabCalibrationReport> {
-    Ok(LabCalibrationReport {
-        schema: "netdiag-lab-calibration/v1".to_string(),
-        generated_at: Utc::now(),
-        artifact_root: context.artifact_root.display().to_string(),
-        model_manifest_path: context.model_manifest_path.display().to_string(),
-        model_manifest_hash_sha256: Some(sha256_file(context.model_manifest_path)?),
-        model_file_hash_sha256: Some(sha256_file(&context.model_dir.join(MODEL_FILE_NAME))?),
-        dataset_hash_sha256: context.dataset_hash_sha256,
-        evaluated_runs: inputs.evaluated_runs,
-        known_runs: inputs.known_runs,
-        uncertain_runs: inputs.uncertain_runs,
-        out_of_distribution_runs: inputs.out_of_distribution_runs,
-        skipped_runs: inputs.skipped_runs,
-        per_label: inputs.per_label_stats(),
-        ood: inputs.ood_stats(),
-        rule_ml_disagreement_hotspots: inputs.hotspots(),
-        feature_distance_distribution: calibration_distribution(&inputs.feature_distances),
-        suggested_rule_thresholds: inputs.suggested_rule_thresholds(),
-        applied: context.applied,
-        previous_thresholds: context.previous_thresholds,
-        calibrated_thresholds: context.calibrated_thresholds,
-        warnings: inputs.warnings(),
-    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,63 +187,89 @@ struct LabCalibrationInputs {
 }
 
 impl LabCalibrationInputs {
-    fn collect(artifact_root: &Path, index: &LabRunIndex) -> Self {
+    fn collect(
+        artifact_root: &Path,
+        index: &LabRunIndex,
+        source_identity: &CalibrationModelIdentity,
+    ) -> Result<Self> {
         let mut inputs = Self::default();
         for entry in &index.runs {
-            let Some((acceptance, ml, lab_run_dir)) = inputs.load_run(artifact_root, entry) else {
-                continue;
-            };
-            inputs.add_comparison(artifact_root, entry);
-            inputs.add_expected_behavior(entry, &lab_run_dir, &acceptance);
+            let (acceptance, ml, lab_run_dir) =
+                inputs.load_run(artifact_root, entry, source_identity)?;
+            inputs.add_comparison(artifact_root, entry, &acceptance)?;
+            inputs.add_expected_behavior(entry, &lab_run_dir, &acceptance)?;
             if !acceptance.passed {
                 inputs.skipped_runs += 1;
                 continue;
             }
             inputs.add_accepted_status(&acceptance, &ml);
         }
-        inputs
+        Ok(inputs)
     }
 
     fn load_run(
         &mut self,
         artifact_root: &Path,
         entry: &LabRunIndexEntry,
-    ) -> Option<(LabAcceptanceReport, MlResult, std::path::PathBuf)> {
-        let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path);
-        let acceptance = match read_json(&acceptance_path).and_then(|value| {
-            serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
-        }) {
-            Ok(acceptance) => acceptance,
-            Err(_) => {
-                self.skipped_runs += 1;
-                return None;
-            }
-        };
+        source_identity: &CalibrationModelIdentity,
+    ) -> Result<(LabAcceptanceReport, MlResult, std::path::PathBuf)> {
+        let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path)?;
+        let acceptance = read_required_stable_json_bounded::<LabAcceptanceReport>(
+            &acceptance_path,
+            MAX_LAB_ACCEPTANCE_BYTES,
+            "lab acceptance report",
+        )
+        .map_err(|err| {
+            NetdiagError::InvalidTrace(format!(
+                "lab calibration could not read indexed acceptance artifact {}: {err}",
+                acceptance_path.display()
+            ))
+        })?;
+        validate_acceptance_identity(entry, &acceptance)?;
+        source_identity.validate_acceptance(entry, &acceptance)?;
         self.evaluated_runs += 1;
-        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
-        let ml_path = run_dir(&lab_run_dir, &entry.run_id).join("ml_result.json");
-        let ml = match read_json(&ml_path)
-            .and_then(|value| serde_json::from_value::<MlResult>(value).map_err(Into::into))
-        {
-            Ok(ml) => ml,
-            Err(_) => {
-                self.skipped_runs += 1;
-                return None;
-            }
-        };
+        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir)?;
+        let ml_path = run_dir(&lab_run_dir, &entry.run_id)?.join("ml_result.json");
+        let ml = read_required_stable_json_bounded::<MlResult>(
+            &ml_path,
+            MAX_ML_RESULT_BYTES,
+            "ML result",
+        )
+        .map_err(|err| {
+            NetdiagError::InvalidTrace(format!(
+                "lab calibration could not read indexed ml_result.json {}: {err}",
+                ml_path.display()
+            ))
+        })?;
+        validate_ml_identity(entry, &acceptance, &ml, source_identity)?;
         if ml.uncertainty.feature_distance.is_finite() {
             self.feature_distances.push(ml.uncertainty.feature_distance);
         }
-        Some((acceptance, ml, lab_run_dir))
+        Ok((acceptance, ml, lab_run_dir))
     }
 
-    fn add_comparison(&mut self, artifact_root: &Path, entry: &LabRunIndexEntry) {
-        let comparison_path = resolve_stored_path(artifact_root, &entry.comparison_path);
-        let Ok(comparison) = read_json(&comparison_path).and_then(|value| {
-            serde_json::from_value::<LabRunComparison>(value).map_err(Into::into)
-        }) else {
-            return;
-        };
+    fn add_comparison(
+        &mut self,
+        artifact_root: &Path,
+        entry: &LabRunIndexEntry,
+        acceptance: &LabAcceptanceReport,
+    ) -> Result<()> {
+        let comparison_path = resolve_stored_path(artifact_root, &entry.comparison_path)?;
+        let comparison = read_required_stable_json_bounded::<LabRunComparison>(
+            &comparison_path,
+            MAX_LAB_COMPARISON_BYTES,
+            "lab run comparison",
+        )
+        .map_err(|err| {
+            NetdiagError::InvalidTrace(format!(
+                "lab calibration could not read indexed comparison artifact {}: {err}",
+                comparison_path.display()
+            ))
+        })?;
+        validate_comparison_identity(entry, acceptance, &comparison)?;
+        if acceptance.expected_label.is_none() {
+            return Ok(());
+        }
         let hotspot = self
             .scenario_hotspots
             .entry(entry.scenario_id.clone())
@@ -300,6 +281,7 @@ impl LabCalibrationInputs {
         if !comparison.rule_ml_agreement {
             hotspot.disagreements += 1;
         }
+        Ok(())
     }
 
     fn add_expected_behavior(
@@ -307,15 +289,16 @@ impl LabCalibrationInputs {
         entry: &LabRunIndexEntry,
         lab_run_dir: &Path,
         acceptance: &LabAcceptanceReport,
-    ) {
+    ) -> Result<()> {
         if let Some(expected_label) = acceptance.expected_label {
-            self.add_expected_known(entry, lab_run_dir, acceptance, expected_label);
+            self.add_expected_known(entry, lab_run_dir, acceptance, expected_label)?;
         } else {
             self.expected_ood_runs += 1;
             if acceptance.actual_diagnosis_status == DiagnosisStatus::Known {
                 self.ood_false_negative_runs += 1;
             }
         }
+        Ok(())
     }
 
     fn add_expected_known(
@@ -324,7 +307,7 @@ impl LabCalibrationInputs {
         lab_run_dir: &Path,
         acceptance: &LabAcceptanceReport,
         expected_label: FaultLabel,
-    ) {
+    ) -> Result<()> {
         self.expected_known_runs += 1;
         let label_key = expected_label.as_str().to_string();
         let stats = self.per_label.entry(label_key.clone()).or_default();
@@ -350,7 +333,14 @@ impl LabCalibrationInputs {
         if acceptance.actual_ml_top == expected_label.as_str() {
             stats.ml_correct += 1;
         }
-        self.add_rule_threshold_samples(entry, lab_run_dir, expected_label, label_key);
+        self.add_rule_threshold_samples(
+            entry,
+            lab_run_dir,
+            expected_label,
+            label_key,
+            acceptance.passed && acceptance.actual_diagnosis_status == DiagnosisStatus::Known,
+        )?;
+        Ok(())
     }
 
     fn add_rule_threshold_samples(
@@ -359,29 +349,35 @@ impl LabCalibrationInputs {
         lab_run_dir: &Path,
         expected_label: FaultLabel,
         label_key: String,
-    ) {
-        let events_path = run_dir(lab_run_dir, &entry.run_id).join("diagnosis_events.json");
-        let Ok(events) = read_json(&events_path).and_then(|value| {
-            serde_json::from_value::<Vec<DiagnosisEvent>>(value).map_err(Into::into)
-        }) else {
-            return;
+        require_events: bool,
+    ) -> Result<()> {
+        let events_path = run_dir(lab_run_dir, &entry.run_id)?.join("diagnosis_events.json");
+        let Some(confidences) = read_rule_threshold_confidences(
+            &events_path,
+            require_events,
+            &entry.run_id,
+            expected_label,
+        )?
+        else {
+            return Ok(());
         };
         self.rule_threshold_samples
             .entry(label_key)
             .or_default()
-            .extend(
-                events
-                    .iter()
-                    .filter(|event| event.evidence.symptom == expected_label)
-                    .map(|event| event.evidence.confidence)
-                    .filter(|value| value.is_finite()),
-            );
+            .extend(confidences);
+        Ok(())
     }
 
     fn add_accepted_status(&mut self, acceptance: &LabAcceptanceReport, ml: &MlResult) {
         match acceptance.actual_diagnosis_status {
             DiagnosisStatus::Known => self.add_accepted_known(ml),
-            DiagnosisStatus::Uncertain => self.uncertain_runs += 1,
+            DiagnosisStatus::Uncertain => {
+                self.uncertain_runs += 1;
+                if acceptance.expected_label.is_none() {
+                    self.out_of_distribution_runs += 1;
+                    self.ood_distance.push(ml.uncertainty.feature_distance);
+                }
+            }
             DiagnosisStatus::OutOfDistribution => {
                 self.out_of_distribution_runs += 1;
                 self.ood_distance.push(ml.uncertainty.feature_distance);
@@ -551,49 +547,4 @@ impl LabCalibrationHotspotAccumulator {
             rate: round4(self.disagreements as f64 / denominator),
         }
     }
-}
-
-fn calibration_distribution(values: &[f64]) -> LabCalibrationDistribution {
-    let finite = values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    LabCalibrationDistribution {
-        count: finite.len(),
-        p50: round4(quantile(&finite, 0.50)),
-        p95: round4(quantile(&finite, 0.95)),
-        max: round4(finite.into_iter().fold(0.0, f64::max)),
-    }
-}
-
-fn calibrated_feature_bounds(
-    values: &BTreeMap<String, Vec<f64>>,
-    previous: &ModelUncertaintyThresholds,
-) -> BTreeMap<String, FeatureBounds> {
-    let mut bounds = previous.feature_bounds.clone();
-    for (name, samples) in values {
-        let finite = samples
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .collect::<Vec<_>>();
-        if finite.len() < 2 {
-            continue;
-        }
-        let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let span = (max - min)
-            .abs()
-            .max(max.abs().max(min.abs()) * 0.05)
-            .max(1e-6);
-        bounds.insert(
-            name.clone(),
-            FeatureBounds {
-                min: round4(min - span * 0.10),
-                max: round4(max + span * 0.10),
-            },
-        );
-    }
-    bounds
 }

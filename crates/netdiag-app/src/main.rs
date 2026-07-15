@@ -3,9 +3,14 @@ use eframe::egui::{
     Sense, Stroke, UiBuilder, Vec2,
 };
 use egui_remixicon::icons;
-use netdiag_app::data_source::{
-    FlowSummary, SimScenario, SourceDescriptor, SourceMode, SourceSnapshot, native_pcap_source,
+use netdiag_app::connector_auth::{bearer_scope_for_endpoint, profile_bearer_scope};
+use netdiag_app::credential_lifecycle::{
+    LegacyCredentialMigration, delete_bearer_credentials, delete_live_api_credentials,
+    has_stale_active_binding, legacy_live_api_binding, migrate_legacy_live_api_credential,
+    profile_binding, reconcile_inactive_profile_credentials,
+    resume_pending_live_api_credential_deletion, store_bearer_credential,
 };
+use netdiag_app::data_source::{SimScenario, SourceMode, SourceSnapshot, native_pcap_source};
 use netdiag_app::layout::{
     HEADER_ACTION_HEIGHT, HEADER_ACTION_WIDTH, OVERVIEW_MIN_CONTENT_HEIGHT, SUMMARY_CARD_HEIGHT,
     overview_content_height, summary_card_rects,
@@ -14,40 +19,39 @@ use netdiag_app::layout::{
 use netdiag_app::secrets::KeychainSecretStore;
 #[cfg(not(target_os = "macos"))]
 use netdiag_app::secrets::MemorySecretStore;
-use netdiag_app::secrets::SecretStore;
+use netdiag_app::secrets::{BearerSecretPresence, BearerSecretPresenceCache, SecretStore};
 use netdiag_app::settings::{
-    self, AppSettings, ConnectorKind, DefaultSource, LanguageSetting, SettingsStore, StartupTab,
+    self, AppSettings, BearerCredentialOwner, ConnectorAuthentication, ConnectorKind,
+    DefaultSource, LanguageSetting, SettingsStore, StartupTab,
 };
 use netdiag_app::trend::{LatencyMetric, TrendRange, latency_trend_points};
 use netdiag_app::updater::{UpdateCheckOutcome, sparkle_check_for_updates, sparkle_status};
 use netdiag_app::view_model::{DashboardViewModel, format_bytes};
+use netdiag_core::authentication::BearerSourceKind;
 use netdiag_core::connectors::{
-    CaptureControl, CaptureProgress, ConnectorLoadResult, NativePcapConfig, OtlpGrpcReceiverConfig,
-    OtlpReceiverSession, SystemCountersConfig, load_native_pcap_with_control,
+    CaptureControl, CaptureProgress, NativePcapConfig, OtlpGrpcReceiverConfig, OtlpReceiverSession,
+    OtlpShutdownOutcome, SystemCountersConfig, load_native_pcap_with_control,
     load_system_counters_with_control,
 };
+use netdiag_core::hil_review::review_recommendation;
 use netdiag_core::lab::{
-    LabAcceptanceReport, LabPreflightMode, LabPreflightOptions, LabPreflightReport, LabRunIndex,
-    LabRunIndexEntry, LabRunOptions, LabRunResult, LabSummaryReport, preflight_lab_scenario,
-    run_lab_scenario, summarize_lab_runs,
+    LabAcceptanceReport, LabPreflightReport, LabRunIndexEntry, LabRunResult, LabSummaryReport,
+    read_lab_run_index,
 };
-use netdiag_core::ml::{
-    FeedbackExportSummary, export_feedback_training_dataset, load_or_train_model,
-};
+use netdiag_core::ml::FeedbackExportSummary;
 use netdiag_core::models::{
     ConnectorHealthSnapshot, ConnectorHealthStatus, FaultLabel, HilReviewSummary, HilState,
     MetricProvenance, MetricQuality, RunEvidenceSummary, RunHistoryFilter, RunTimelineEvent,
     TopologyModel,
 };
 use netdiag_core::storage::{
-    compare_runs, connector_health_from_ingest, list_run_timeline, review_recommendation,
-    run_artifacts, run_evidence, write_connector_health,
+    clear_run_history as clear_stored_run_history, compare_runs, list_run_timeline, run_artifacts,
+    run_evidence,
 };
-use netdiag_core::twin::{
-    action_names, policy_action, topology_model, topology_names, validate_topology_model,
+use netdiag_core::twin::{action_names, load_topology_file, policy_action, topology_names};
+use netdiag_core::{
+    PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif_and_connector_health,
 };
-use netdiag_core::{PipelineResult, WhatIfRequest, diagnose_ingest_with_whatif};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -56,7 +60,8 @@ use std::sync::{
     mpsc,
 };
 use std::time::Duration;
-use std::{fs, process::Command, thread};
+use std::{fs, thread};
+use zeroize::{Zeroize, Zeroizing};
 
 const BLUE: Color32 = Color32::from_rgb(37, 88, 225);
 const PURPLE: Color32 = Color32::from_rgb(122, 56, 230);
@@ -66,14 +71,48 @@ const RED: Color32 = Color32::from_rgb(232, 58, 53);
 const INK: Color32 = Color32::from_rgb(18, 28, 48);
 const MUTED: Color32 = Color32::from_rgb(78, 88, 118);
 
+mod api_test;
 #[cfg(test)]
 mod app_tests;
+mod capture_session;
+mod confirmation;
+mod connector_flow;
+mod lab_runtime;
+mod model_cache;
 #[cfg(target_os = "macos")]
 mod native_menu;
 mod pilot_run_center;
+mod run_history;
+mod settings_runtime;
+mod source_selection;
+mod topology_state;
+mod translations;
+
+use api_test::{ApiTestJob, ApiTestPoll, ApiTestStatus};
+use capture_session::{CaptureSessionEvent, CaptureSessionPhase, CaptureSessionState};
+use confirmation::TargetConfirmation;
+use connector_flow::{
+    CaptureSessionCompletion, capture_session_completion, source_snapshot_from_connector_session,
+};
+use model_cache::{ModelCacheState, rebuild_model_bundle};
+use run_history::apply_run_history_clear_state;
+use source_selection::{connector_source_mode_from_profile, source_mode_from_settings};
+use topology_state::{selected_topology_model, write_topology_export};
+use translations::tr;
 
 #[cfg(target_os = "macos")]
 use native_menu::{NativeMenu, NativeMenuCommand};
+
+#[cfg(any(target_os = "macos", test))]
+fn optional_path_metadata(
+    result: std::io::Result<fs::Metadata>,
+) -> std::io::Result<Option<fs::Metadata>> {
+    match result {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 fn main() -> eframe::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
@@ -138,6 +177,7 @@ impl Language {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(usize)]
 enum Text {
     Subtitle,
     ImportTrace,
@@ -237,6 +277,7 @@ enum Text {
     TestConnection,
     TestingConnection,
     ConnectionOk,
+    ConnectionStale,
     KeychainError,
     DigitalTwinDefaults,
     DataArtifacts,
@@ -269,7 +310,6 @@ enum Text {
     OpenFailed,
     Saved,
     NotAvailable,
-    EnvFallback,
     Rows,
     DefaultSourceSimulation,
     DefaultSourceLastImport,
@@ -305,6 +345,7 @@ enum Text {
     DiagnoseBuffer,
     CaptureProgress,
     CaptureRunning,
+    CaptureCancelling,
     CaptureCompleted,
     CaptureCancelled,
     CaptureFailed,
@@ -327,6 +368,7 @@ enum Text {
     StartupLab,
     StartupReports,
     StartupSettings,
+    Count,
 }
 
 struct NetDiagApp {
@@ -336,7 +378,10 @@ struct NetDiagApp {
     language: Language,
     settings: AppSettings,
     settings_store: SettingsStore,
-    secrets: Box<dyn SecretStore>,
+    settings_persistence_authorized: bool,
+    secrets: Arc<dyn SecretStore>,
+    live_api_token_presence: BearerSecretPresenceCache,
+    profile_token_presence: BearerSecretPresenceCache,
     pending_startup_diagnosis: bool,
     startup_frames: u8,
     did_restore_window_size: bool,
@@ -353,13 +398,15 @@ struct NetDiagApp {
     topology: String,
     custom_topology: Option<TopologyModel>,
     action: String,
-    token_input: String,
+    token_input: Zeroizing<String>,
+    profile_token_input: Zeroizing<String>,
     probe_targets_text: String,
     hil_notes: BTreeMap<String, String>,
     settings_notice: Option<String>,
     update_notice: Option<String>,
-    api_test_status: Option<String>,
+    api_test_status: Option<ApiTestStatus>,
     api_test_job: Option<ApiTestJob>,
+    api_test_credential_revision: u64,
     capture_session: Option<CaptureSessionState>,
     evidence_timeline_loaded: bool,
     evidence_timeline: Vec<RunTimelineEvent>,
@@ -376,22 +423,16 @@ struct NetDiagApp {
     lab_status: Option<String>,
     pilot_center: pilot_run_center::PilotRunCenterState,
     pending_delete_token: bool,
-    pending_clear_runs: bool,
-    pending_rebuild_model: bool,
+    pending_delete_profile_token: TargetConfirmation<String>,
+    pending_clear_runs: TargetConfirmation<PathBuf>,
+    pending_rebuild_model: TargetConfirmation<PathBuf>,
+    model_cache_state: ModelCacheState,
     status: String,
     error: Option<String>,
 }
 
 type DiagnosisJob = mpsc::Receiver<anyhow::Result<(PipelineResult, SourceSnapshot)>>;
-type ApiTestJob = mpsc::Receiver<anyhow::Result<ApiTestOutcome>>;
-type CaptureSessionJob = mpsc::Receiver<CaptureSessionEvent>;
 type LabJob = mpsc::Receiver<anyhow::Result<LabJobOutcome>>;
-
-#[derive(Debug)]
-struct ApiTestOutcome {
-    rows: usize,
-    sample: String,
-}
 
 #[derive(Debug)]
 enum LabJobOutcome {
@@ -401,60 +442,64 @@ enum LabJobOutcome {
     DatasetExport(FeedbackExportSummary),
 }
 
-#[derive(Debug)]
-enum CaptureSessionEvent {
-    Progress(CaptureProgress),
-    Finished(Box<anyhow::Result<SourceSnapshot>>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureSessionPhase {
-    Running,
-    Cancelling,
-    Completed,
-    Cancelled,
-    Failed,
-}
-
-impl CaptureSessionPhase {
-    fn is_active(self) -> bool {
-        matches!(
-            self,
-            CaptureSessionPhase::Running | CaptureSessionPhase::Cancelling
-        )
-    }
-}
-
-struct CaptureSessionState {
-    kind: ConnectorKind,
-    phase: CaptureSessionPhase,
-    started_at: chrono::DateTime<chrono::Utc>,
-    timeout: Duration,
-    progress: Option<CaptureProgress>,
-    last_sample: Option<SourceSnapshot>,
-    status: String,
-    job: Option<CaptureSessionJob>,
-    cancel: Option<Arc<AtomicBool>>,
-    otlp: Option<OtlpReceiverSession>,
-}
-
 impl NetDiagApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         configure_fonts(&cc.egui_ctx);
         let settings_store = SettingsStore::new(SettingsStore::default_path());
-        let (mut settings, settings_warning) = settings_store.load_or_default();
-        settings.data_connectors.ensure_profiles();
-        let normalize_warning = if settings::normalize_bundle_settings(&mut settings) {
-            settings_store
-                .save(&settings)
-                .err()
-                .map(|err| err.to_string())
-        } else {
-            None
-        };
+        let settings_load = settings_store.load_for_startup();
+        let startup_authorized = settings_load.startup_authorized();
+        let settings_warning = settings_load.warning;
+        let mut settings = settings_load.settings;
+        let normalize_warning =
+            if startup_authorized && settings::normalize_bundle_settings(&mut settings) {
+                settings_store
+                    .save(&mut settings)
+                    .err()
+                    .map(|error| format!("{error:#}"))
+            } else {
+                None
+            };
         let secrets = default_secret_store();
-        let (source_mode, source_warning) = source_mode_from_settings(&settings, secrets.as_ref());
+        let (credential_notice, credential_warning) = if startup_authorized {
+            let recovery = resume_pending_live_api_credential_deletion(
+                &settings_store,
+                &mut settings,
+                secrets.as_ref(),
+            );
+            let migration = migrate_legacy_live_api_credential(
+                &settings_store,
+                &mut settings,
+                secrets.as_ref(),
+            );
+            let cleanup = reconcile_inactive_profile_credentials(
+                &settings_store,
+                &mut settings,
+                secrets.as_ref(),
+            );
+            let notice = matches!(&migration, Ok(LegacyCredentialMigration::Migrated)).then(|| {
+                "Legacy Live API credential migrated to its scoped Keychain entry".to_string()
+            });
+            let warning = [recovery.err(), migration.err(), cleanup.err()]
+                .into_iter()
+                .flatten()
+                .map(|error| format!("credential lifecycle: {error:#}"))
+                .collect::<Vec<_>>();
+            (notice, (!warning.is_empty()).then(|| warning.join("; ")))
+        } else {
+            (None, None)
+        };
+        let (source_mode, source_warning) = if startup_authorized {
+            source_mode_from_settings(&settings)
+        } else {
+            (
+                SourceMode::Unavailable {
+                    reason: "Settings were rejected; source execution is disabled until settings are repaired"
+                        .to_string(),
+                },
+                None,
+            )
+        };
         let initial_language = Language::from(settings.language);
         #[cfg(target_os = "macos")]
         let (native_menu, menu_warning) = match NativeMenu::install(&cc.egui_ctx, initial_language)
@@ -464,10 +509,24 @@ impl NetDiagApp {
         };
         #[cfg(not(target_os = "macos"))]
         let menu_warning: Option<String> = None;
-        let startup_warning = settings_warning
-            .or(normalize_warning)
-            .or(source_warning)
-            .or(menu_warning);
+        let (lab_runs, lab_runs_warning) = match load_lab_runs_from_index(&settings.artifacts_root)
+        {
+            Ok(runs) => (runs, None),
+            Err(err) => (Vec::new(), Some(format!("lab run index: {err}"))),
+        };
+        let startup_warnings = [
+            settings_warning,
+            normalize_warning,
+            source_warning,
+            credential_warning,
+            menu_warning,
+            lab_runs_warning,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let startup_warning = (!startup_warnings.is_empty()).then(|| startup_warnings.join("; "));
+        let model_cache_state = ModelCacheState::load(&settings.artifacts_root);
         Self {
             #[cfg(target_os = "macos")]
             native_menu,
@@ -475,8 +534,11 @@ impl NetDiagApp {
             language: initial_language,
             settings: settings.clone(),
             settings_store,
+            settings_persistence_authorized: startup_authorized,
             secrets,
-            pending_startup_diagnosis: settings.startup.auto_run_diagnosis,
+            live_api_token_presence: BearerSecretPresenceCache::default(),
+            profile_token_presence: BearerSecretPresenceCache::default(),
+            pending_startup_diagnosis: startup_authorized && settings.startup.auto_run_diagnosis,
             startup_frames: 0,
             did_restore_window_size: false,
             diagnosis_job: None,
@@ -492,17 +554,19 @@ impl NetDiagApp {
             topology: settings.what_if.topology.clone(),
             custom_topology: settings.what_if.custom_topology.clone(),
             action: settings.what_if.action.clone(),
-            token_input: String::new(),
+            token_input: Zeroizing::new(String::new()),
+            profile_token_input: Zeroizing::new(String::new()),
             probe_targets_text: settings
                 .data_connectors
                 .active_profile()
                 .map(|profile| profile.website_probe.targets.join("\n"))
                 .unwrap_or_else(|| settings.data_connectors.website_probe.targets.join("\n")),
             hil_notes: BTreeMap::new(),
-            settings_notice: startup_warning.clone(),
+            settings_notice: credential_notice.or_else(|| startup_warning.clone()),
             update_notice: None,
             api_test_status: None,
             api_test_job: None,
+            api_test_credential_revision: 0,
             capture_session: None,
             evidence_timeline_loaded: false,
             evidence_timeline: Vec::new(),
@@ -513,21 +577,19 @@ impl NetDiagApp {
             lab_scenario_path: "examples/scenarios/lab-congestion-001.yaml".to_string(),
             lab_preflight: None,
             lab_last_run: None,
-            lab_runs: load_lab_runs_from_index(&settings.artifacts_root).unwrap_or_default(),
+            lab_runs,
             lab_summary: None,
             lab_job: None,
             lab_status: None,
             pilot_center: pilot_run_center::PilotRunCenterState::default(),
             pending_delete_token: false,
-            pending_clear_runs: false,
-            pending_rebuild_model: false,
+            pending_delete_profile_token: TargetConfirmation::default(),
+            pending_clear_runs: TargetConfirmation::default(),
+            pending_rebuild_model: TargetConfirmation::default(),
+            model_cache_state,
             status: "Ready".to_string(),
             error: startup_warning,
         }
-    }
-
-    fn run_diagnosis(&mut self) {
-        self.start_diagnosis(false);
     }
 
     fn start_diagnosis(&mut self, restore_startup_warning: bool) {
@@ -536,17 +598,27 @@ impl NetDiagApp {
                 Some(tr(self.language, Text::AnalysisAlreadyRunning).to_string());
             return;
         }
+        if !self.ensure_current_settings_for_operation() {
+            return;
+        }
         let source_mode = self.source_mode.clone();
+        let secrets = Arc::clone(&self.secrets);
         let artifacts_root = self.artifacts_root.clone();
-        let what_if = self.current_what_if_request();
-        let action = self.action.clone();
+        let what_if = match self.current_what_if_request() {
+            Ok(request) => request,
+            Err(err) => {
+                self.status = "Needs attention".to_string();
+                self.error = Some(err.to_string());
+                return;
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         self.status = "Running".to_string();
         self.error = None;
         self.diagnosis_restore_startup_warning = restore_startup_warning;
         self.diagnosis_job = Some(receiver);
         thread::spawn(move || {
-            let result = Self::run_source(source_mode, artifacts_root, what_if, action);
+            let result = Self::run_source(source_mode, secrets, artifacts_root, what_if);
             let _ = sender.send(result);
         });
     }
@@ -556,14 +628,19 @@ impl NetDiagApp {
         result: anyhow::Result<(PipelineResult, SourceSnapshot)>,
         restore_startup_warning: bool,
     ) {
+        let result = result.and_then(|(result, source_snapshot)| {
+            let dashboard = DashboardViewModel::build(&result, &source_snapshot)?;
+            Ok((result, source_snapshot, dashboard))
+        });
         match result {
-            Ok((result, source_snapshot)) => {
+            Ok((result, source_snapshot, dashboard)) => {
                 self.status = status_for_result(&result).to_string();
                 self.error = None;
-                self.dashboard = Some(DashboardViewModel::build(&result, &source_snapshot));
+                self.dashboard = Some(dashboard);
                 self.source_snapshot = Some(source_snapshot);
                 self.result = Some(result);
                 self.hil_notes.clear();
+                self.model_cache_state = ModelCacheState::load(&self.artifacts_root);
                 self.refresh_evidence_timeline();
                 if restore_startup_warning && let Some(warning) = self.settings_notice.clone() {
                     self.error = Some(warning);
@@ -607,15 +684,17 @@ impl NetDiagApp {
 
     fn run_source(
         source_mode: SourceMode,
+        secrets: Arc<dyn SecretStore>,
         artifacts_root: PathBuf,
-        what_if: Option<WhatIfRequest>,
-        action: String,
+        what_if: WhatIfRequest,
     ) -> anyhow::Result<(PipelineResult, SourceSnapshot)> {
-        let source_snapshot = source_mode.load()?;
-        let request = what_if.or_else(|| WhatIfRequest::built_in("line", action.as_str()).ok());
-        let mut result =
-            diagnose_ingest_with_whatif(source_snapshot.ingest.clone(), &artifacts_root, request)?;
-        Self::persist_source_health(&mut result, &source_snapshot, &artifacts_root)?;
+        let source_snapshot = source_mode.load(secrets.as_ref())?;
+        let result = diagnose_ingest_with_whatif_and_connector_health(
+            source_snapshot.ingest.clone(),
+            &artifacts_root,
+            Some(what_if),
+            source_snapshot.connector_health(),
+        )?;
         Ok((result, source_snapshot))
     }
 
@@ -626,43 +705,30 @@ impl NetDiagApp {
             return;
         }
         let artifacts_root = self.artifacts_root.clone();
-        let what_if = self.current_what_if_request();
-        let action = self.action.clone();
+        let what_if = match self.current_what_if_request() {
+            Ok(request) => request,
+            Err(err) => {
+                self.status = "Needs attention".to_string();
+                self.error = Some(err.to_string());
+                return;
+            }
+        };
         let (sender, receiver) = mpsc::channel();
         self.status = "Running".to_string();
         self.error = None;
         self.diagnosis_restore_startup_warning = false;
         self.diagnosis_job = Some(receiver);
         thread::spawn(move || {
-            let request = what_if.or_else(|| WhatIfRequest::built_in("line", action.as_str()).ok());
-            let result = diagnose_ingest_with_whatif(
+            let result = diagnose_ingest_with_whatif_and_connector_health(
                 source_snapshot.ingest.clone(),
                 &artifacts_root,
-                request,
+                Some(what_if),
+                source_snapshot.connector_health(),
             )
             .map_err(anyhow::Error::from)
-            .and_then(|mut result| {
-                Self::persist_source_health(&mut result, &source_snapshot, &artifacts_root)?;
-                Ok((result, source_snapshot))
-            });
+            .map(|result| (result, source_snapshot));
             let _ = sender.send(result);
         });
-    }
-
-    fn persist_source_health(
-        result: &mut PipelineResult,
-        source_snapshot: &SourceSnapshot,
-        artifacts_root: &Path,
-    ) -> anyhow::Result<()> {
-        let health = connector_health_from_ingest(
-            &source_snapshot.descriptor.kind,
-            &source_snapshot.descriptor.name,
-            &source_snapshot.descriptor.captured_label,
-            &source_snapshot.ingest,
-        );
-        write_connector_health(artifacts_root, &result.run_id, &health)?;
-        result.connector_health = health;
-        Ok(())
     }
 
     fn current_otlp_receiver_config(&self) -> anyhow::Result<OtlpGrpcReceiverConfig> {
@@ -674,9 +740,10 @@ impl NetDiagApp {
         if profile.kind != ConnectorKind::OtlpGrpcReceiver {
             anyhow::bail!("active source profile is not OTLP gRPC");
         }
+        profile.otlp_grpc.validate()?;
         Ok(OtlpGrpcReceiverConfig {
             bind_addr: profile.otlp_grpc.bind_addr.clone(),
-            timeout: Duration::from_secs(profile.otlp_grpc.timeout_secs.max(1)),
+            timeout: Duration::from_secs(profile.otlp_grpc.timeout_secs),
             metrics: profile.otlp_grpc.mapping.clone(),
             sample: "otlp_grpc_session".to_string(),
         })
@@ -691,11 +758,12 @@ impl NetDiagApp {
         if profile.kind != ConnectorKind::NativePcap {
             anyhow::bail!("active source profile is not native pcap");
         }
+        profile.native_pcap.validate()?;
         Ok((
             NativePcapConfig {
                 source: native_pcap_source(&profile.native_pcap.source),
-                timeout: Duration::from_secs(profile.native_pcap.timeout_secs.max(1)),
-                packet_limit: profile.native_pcap.packet_limit.max(1),
+                timeout: Duration::from_secs(profile.native_pcap.timeout_secs),
+                packet_limit: profile.native_pcap.packet_limit,
                 sample: "native_pcap_session".to_string(),
             },
             profile.native_pcap.source.clone(),
@@ -711,12 +779,13 @@ impl NetDiagApp {
         if profile.kind != ConnectorKind::SystemCounters {
             anyhow::bail!("active source profile is not system counters");
         }
+        profile.system_counters.validate()?;
         let interface = profile.system_counters.interface.trim().to_string();
         Ok((
             SystemCountersConfig {
                 interface: (!interface.is_empty() && interface != "all")
                     .then_some(interface.clone()),
-                interval: Duration::from_secs(profile.system_counters.interval_secs.clamp(1, 10)),
+                interval: Duration::from_secs(profile.system_counters.interval_secs),
                 sample: "system_counters_session".to_string(),
             },
             if interface.is_empty() {
@@ -736,6 +805,9 @@ impl NetDiagApp {
             self.settings_notice = Some(tr(self.language, Text::CaptureRunning).to_string());
             return;
         }
+        if !self.ensure_current_settings_for_operation() {
+            return;
+        }
         match kind {
             ConnectorKind::OtlpGrpcReceiver => self.start_otlp_capture_session(),
             ConnectorKind::NativePcap => self.start_native_pcap_capture_session(),
@@ -751,9 +823,11 @@ impl NetDiagApp {
 
     fn start_otlp_capture_session(&mut self) {
         match self.current_otlp_receiver_config().and_then(|config| {
-            let bind_addr = config.bind_addr.clone();
             OtlpReceiverSession::start(&config)
-                .map(|session| (session, config.timeout, format!("Listening on {bind_addr}")))
+                .map(|session| {
+                    let status = format!("Listening on {}", session.local_addr());
+                    (session, config.timeout, status)
+                })
                 .map_err(anyhow::Error::from)
         }) {
             Ok((session, timeout, status)) => {
@@ -766,12 +840,13 @@ impl NetDiagApp {
                     last_sample: None,
                     status,
                     job: None,
+                    worker: None,
                     cancel: None,
                     otlp: Some(session),
                 });
             }
             Err(err) => {
-                self.capture_session = Some(failed_capture_session(
+                self.capture_session = Some(CaptureSessionState::failed(
                     ConnectorKind::OtlpGrpcReceiver,
                     err.to_string(),
                 ));
@@ -785,23 +860,25 @@ impl NetDiagApp {
                 let (sender, receiver) = mpsc::channel();
                 let cancel = Arc::new(AtomicBool::new(false));
                 let progress_sender = sender.clone();
+                let progress_cancel = Arc::clone(&cancel);
                 let control =
                     CaptureControl::new(Arc::clone(&cancel)).with_progress(move |progress| {
-                        let _ = progress_sender.send(CaptureSessionEvent::Progress(progress));
+                        if progress_sender
+                            .send(CaptureSessionEvent::Progress(progress))
+                            .is_err()
+                        {
+                            progress_cancel.store(true, Ordering::Relaxed);
+                        }
                     });
                 let timeout = config.timeout;
-                thread::spawn(move || {
-                    let result = load_native_pcap_with_control(&config, &control)
-                        .map(|loaded| {
-                            source_snapshot_from_connector_session(
-                                loaded,
-                                ConnectorKind::NativePcap,
-                                "Captured",
-                                source_label,
-                            )
-                        })
-                        .map_err(anyhow::Error::from);
-                    let _ = sender.send(CaptureSessionEvent::Finished(Box::new(result)));
+                let worker = thread::spawn(move || {
+                    let completion = capture_session_completion(
+                        load_native_pcap_with_control(&config, &control),
+                        ConnectorKind::NativePcap,
+                        "Captured",
+                        source_label,
+                    );
+                    drop(sender.send(CaptureSessionEvent::Finished(completion)));
                 });
                 self.capture_session = Some(CaptureSessionState {
                     kind: ConnectorKind::NativePcap,
@@ -812,12 +889,13 @@ impl NetDiagApp {
                     last_sample: None,
                     status: tr(self.language, Text::CaptureRunning).to_string(),
                     job: Some(receiver),
+                    worker: Some(worker),
                     cancel: Some(cancel),
                     otlp: None,
                 });
             }
             Err(err) => {
-                self.capture_session = Some(failed_capture_session(
+                self.capture_session = Some(CaptureSessionState::failed(
                     ConnectorKind::NativePcap,
                     err.to_string(),
                 ));
@@ -831,23 +909,25 @@ impl NetDiagApp {
                 let (sender, receiver) = mpsc::channel();
                 let cancel = Arc::new(AtomicBool::new(false));
                 let progress_sender = sender.clone();
+                let progress_cancel = Arc::clone(&cancel);
                 let control =
                     CaptureControl::new(Arc::clone(&cancel)).with_progress(move |progress| {
-                        let _ = progress_sender.send(CaptureSessionEvent::Progress(progress));
+                        if progress_sender
+                            .send(CaptureSessionEvent::Progress(progress))
+                            .is_err()
+                        {
+                            progress_cancel.store(true, Ordering::Relaxed);
+                        }
                     });
                 let timeout = config.interval;
-                thread::spawn(move || {
-                    let result = load_system_counters_with_control(&config, &control)
-                        .map(|loaded| {
-                            source_snapshot_from_connector_session(
-                                loaded,
-                                ConnectorKind::SystemCounters,
-                                "Sampled",
-                                source_label,
-                            )
-                        })
-                        .map_err(anyhow::Error::from);
-                    let _ = sender.send(CaptureSessionEvent::Finished(Box::new(result)));
+                let worker = thread::spawn(move || {
+                    let completion = capture_session_completion(
+                        load_system_counters_with_control(&config, &control),
+                        ConnectorKind::SystemCounters,
+                        "Sampled",
+                        source_label,
+                    );
+                    drop(sender.send(CaptureSessionEvent::Finished(completion)));
                 });
                 self.capture_session = Some(CaptureSessionState {
                     kind: ConnectorKind::SystemCounters,
@@ -858,12 +938,13 @@ impl NetDiagApp {
                     last_sample: None,
                     status: tr(self.language, Text::CaptureRunning).to_string(),
                     job: Some(receiver),
+                    worker: Some(worker),
                     cancel: Some(cancel),
                     otlp: None,
                 });
             }
             Err(err) => {
-                self.capture_session = Some(failed_capture_session(
+                self.capture_session = Some(CaptureSessionState::failed(
                     ConnectorKind::SystemCounters,
                     err.to_string(),
                 ));
@@ -876,25 +957,26 @@ impl NetDiagApp {
             return;
         };
         if let Some(otlp) = session.otlp.take() {
+            let (sender, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let result = otlp.stop().map_err(anyhow::Error::from);
+                drop(sender.send(CaptureSessionEvent::OtlpStopped(result)));
+            });
             session.phase = CaptureSessionPhase::Cancelling;
-            match otlp.stop() {
-                Ok(()) => {
-                    session.phase = CaptureSessionPhase::Cancelled;
-                    session.status = tr(self.language, Text::CaptureCancelled).to_string();
-                }
-                Err(err) => {
-                    session.phase = CaptureSessionPhase::Failed;
-                    session.status = err.to_string();
-                }
-            }
+            session.status = tr(self.language, Text::CaptureCancelling).to_string();
+            session.job = Some(receiver);
+            session.worker = Some(worker);
         } else if let Some(cancel) = &session.cancel {
             cancel.store(true, Ordering::Relaxed);
             session.phase = CaptureSessionPhase::Cancelling;
-            session.status = tr(self.language, Text::CaptureCancelled).to_string();
+            session.status = tr(self.language, Text::CaptureCancelling).to_string();
         }
     }
 
     fn diagnose_capture_last_sample(&mut self) {
+        if !self.ensure_current_settings_for_operation() {
+            return;
+        }
         let snapshot = self
             .capture_session
             .as_ref()
@@ -911,25 +993,40 @@ impl NetDiagApp {
             session.status = tr(self.language, Text::NoSource).to_string();
             return;
         };
-        match otlp.snapshot(session.timeout) {
-            Ok(loaded) => {
-                let source_snapshot = source_snapshot_from_connector_session(
-                    loaded,
-                    ConnectorKind::OtlpGrpcReceiver,
-                    "Buffered",
-                    "OTLP receiver".to_string(),
-                );
-                session.status = format!(
-                    "{}: {} {}",
-                    tr(self.language, Text::LastSample),
-                    source_snapshot.ingest.records.len(),
-                    tr(self.language, Text::Rows)
-                );
-                session.last_sample = Some(source_snapshot.clone());
-                diagnose_now = Some(source_snapshot);
-            }
+        let loaded = otlp.snapshot(session.timeout);
+        match loaded {
+            Ok(loaded) => match source_snapshot_from_connector_session(
+                loaded,
+                ConnectorKind::OtlpGrpcReceiver,
+                "Buffered",
+                "OTLP receiver".to_string(),
+            ) {
+                Ok(source_snapshot) => {
+                    session.status = format!(
+                        "{}: {} {}",
+                        tr(self.language, Text::LastSample),
+                        source_snapshot.ingest.records.len(),
+                        tr(self.language, Text::Rows)
+                    );
+                    session.last_sample = Some(source_snapshot.clone());
+                    diagnose_now = Some(source_snapshot);
+                }
+                Err(err) => {
+                    session.status = err.to_string();
+                }
+            },
             Err(err) => {
-                session.status = err.to_string();
+                let status = err.to_string();
+                if session.stop_otlp_after_failure(err) {
+                    session.phase = CaptureSessionPhase::Cancelling;
+                    session.status = format!(
+                        "{}: {status}; stopping receiver",
+                        tr(self.language, Text::CaptureFailed)
+                    );
+                } else {
+                    session.phase = CaptureSessionPhase::Failed;
+                    session.status = status;
+                }
             }
         }
         if let Some(source_snapshot) = diagnose_now {
@@ -937,14 +1034,14 @@ impl NetDiagApp {
         }
     }
 
-    fn current_what_if_request(&self) -> Option<WhatIfRequest> {
-        let topology = if self.topology == "custom" {
-            self.custom_topology.clone()?
-        } else {
-            topology_model(self.topology.as_str()).ok()?
-        };
-        let action = policy_action(&self.action).ok()?;
-        Some(WhatIfRequest { topology, action })
+    fn current_what_if_request(&self) -> netdiag_core::Result<WhatIfRequest> {
+        let topology = self.current_topology_model()?;
+        let action = policy_action(&self.action)?;
+        Ok(WhatIfRequest { topology, action })
+    }
+
+    fn current_topology_model(&self) -> netdiag_core::Result<TopologyModel> {
+        selected_topology_model(self.topology.as_str(), self.custom_topology.as_ref())
     }
 
     fn poll_diagnosis_job(&mut self, ctx: &egui::Context) {
@@ -1034,7 +1131,14 @@ impl NetDiagApp {
     }
 
     fn refresh_lab_runs(&mut self) {
-        self.lab_runs = load_lab_runs_from_index(&self.artifacts_root).unwrap_or_default();
+        match load_lab_runs_from_index(&self.artifacts_root) {
+            Ok(runs) => {
+                self.lab_runs = runs;
+            }
+            Err(err) => {
+                self.lab_status = Some(format!("Lab run index could not be loaded: {err}"));
+            }
+        }
     }
 
     fn choose_lab_scenario(&mut self) {
@@ -1048,126 +1152,48 @@ impl NetDiagApp {
         self.lab_scenario_path = path.display().to_string();
     }
 
-    fn start_lab_preflight(&mut self) {
-        if self.lab_job.is_some() {
-            self.lab_status = Some("Lab job is already running".to_string());
-            return;
-        }
-        let scenario = PathBuf::from(self.lab_scenario_path.trim());
-        let artifacts = self.artifacts_root.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.lab_status = Some("Preflight running".to_string());
-        self.lab_job = Some(receiver);
-        thread::spawn(move || {
-            let result = preflight_lab_scenario(
-                &scenario,
-                LabPreflightOptions {
-                    artifacts,
-                    mode: LabPreflightMode::Static,
-                },
-            )
-            .map(LabJobOutcome::Preflight)
-            .map_err(anyhow::Error::from);
-            let _ = sender.send(result);
-        });
-    }
-
-    fn start_lab_run(&mut self) {
-        if self.lab_job.is_some() {
-            self.lab_status = Some("Lab job is already running".to_string());
-            return;
-        }
-        let scenario = PathBuf::from(self.lab_scenario_path.trim());
-        let artifacts = self.artifacts_root.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.lab_status = Some("Lab run started".to_string());
-        self.lab_job = Some(receiver);
-        thread::spawn(move || {
-            let result = run_lab_scenario(&scenario, LabRunOptions { artifacts })
-                .map(|result| LabJobOutcome::Run(Box::new(result)))
-                .map_err(anyhow::Error::from);
-            let _ = sender.send(result);
-        });
-    }
-
-    fn start_lab_summary(&mut self) {
-        if self.lab_job.is_some() {
-            self.lab_status = Some("Lab job is already running".to_string());
-            return;
-        }
-        let artifacts = self.artifacts_root.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.lab_status = Some("Lab summary running".to_string());
-        self.lab_job = Some(receiver);
-        thread::spawn(move || {
-            let result = summarize_lab_runs(&artifacts)
-                .map(LabJobOutcome::Summary)
-                .map_err(anyhow::Error::from);
-            let _ = sender.send(result);
-        });
-    }
-
-    fn start_lab_dataset_export(&mut self) {
-        if self.lab_job.is_some() {
-            self.lab_status = Some("Lab job is already running".to_string());
-            return;
-        }
-        let artifacts = self.artifacts_root.clone();
-        let output = artifacts.join("datasets").join("lab-feedback.jsonl");
-        let (sender, receiver) = mpsc::channel();
-        self.lab_status = Some("Dataset export running".to_string());
-        self.lab_job = Some(receiver);
-        thread::spawn(move || {
-            let result = export_feedback_training_dataset(&artifacts, &output)
-                .map(LabJobOutcome::DatasetExport)
-                .map_err(anyhow::Error::from);
-            let _ = sender.send(result);
-        });
-    }
-
     fn start_api_test_connection(&mut self) {
         if self.api_test_job.is_some() {
+            return;
+        }
+        if !self.ensure_current_settings_for_operation() {
+            self.api_test_status = None;
             return;
         }
         let source_mode = match self.connector_source_mode() {
             Ok(source_mode) => source_mode,
             Err(err) => {
-                self.api_test_status = Some(err.to_string());
+                self.api_test_status = None;
+                self.settings_notice = Some(err.to_string());
                 return;
             }
         };
-        let (sender, receiver) = mpsc::channel();
-        self.api_test_status = Some(tr(self.language, Text::TestingConnection).to_string());
-        self.api_test_job = Some(receiver);
-        thread::spawn(move || {
-            let result = source_mode.load().map(|snapshot| ApiTestOutcome {
-                rows: snapshot.ingest.records.len(),
-                sample: snapshot.descriptor.name,
-            });
-            let _ = sender.send(result);
-        });
+        self.replace_api_test_status(tr(self.language, Text::TestingConnection).to_string());
+        self.api_test_job = Some(ApiTestJob::start(
+            source_mode,
+            self.api_test_credential_revision,
+            Arc::clone(&self.secrets),
+        ));
     }
 
     fn poll_api_test_job(&mut self, ctx: &egui::Context) {
-        let message = match self
-            .api_test_job
-            .as_ref()
-            .map(|receiver| receiver.try_recv())
-        {
-            Some(Ok(message)) => Some(message),
-            Some(Err(mpsc::TryRecvError::Disconnected)) => Some(Err(anyhow::anyhow!(
-                "API test worker stopped before returning a result"
-            ))),
-            Some(Err(mpsc::TryRecvError::Empty)) => {
-                ctx.request_repaint_after(Duration::from_millis(100));
-                None
-            }
-            None => None,
+        let Some(job) = self.api_test_job.as_ref() else {
+            return;
         };
-
-        if let Some(message) = message {
-            self.api_test_job = None;
-            self.api_test_status = Some(match message {
+        let message = match job.poll() {
+            ApiTestPoll::Pending => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
+            }
+            ApiTestPoll::Complete(message) => message,
+        };
+        let current_source = self.connector_source_mode().ok();
+        let is_current = current_source
+            .as_ref()
+            .is_some_and(|source| job.matches_current(source, self.api_test_credential_revision));
+        self.api_test_job = None;
+        let status = if is_current {
+            match message {
                 Ok(outcome) => format!(
                     "{}: {} {} · {}",
                     tr(self.language, Text::ConnectionOk),
@@ -1176,9 +1202,12 @@ impl NetDiagApp {
                     outcome.sample
                 ),
                 Err(err) => err.to_string(),
-            });
-            ctx.request_repaint();
-        }
+            }
+        } else {
+            tr(self.language, Text::ConnectionStale).to_string()
+        };
+        self.replace_api_test_status(status);
+        ctx.request_repaint();
     }
 
     fn poll_capture_session(&mut self, ctx: &egui::Context) {
@@ -1188,7 +1217,25 @@ impl NetDiagApp {
         if let Some(otlp) = &session.otlp
             && session.phase.is_active()
         {
-            let frames = otlp.buffered_frames();
+            let (frames, last_sample_at) = match otlp.progress_snapshot() {
+                Ok(progress) => progress,
+                Err(err) => {
+                    let status = err.to_string();
+                    if session.stop_otlp_after_failure(err) {
+                        session.phase = CaptureSessionPhase::Cancelling;
+                        session.status = format!(
+                            "{}: {status}; stopping receiver",
+                            tr(self.language, Text::CaptureFailed)
+                        );
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                    } else {
+                        session.phase = CaptureSessionPhase::Failed;
+                        session.status = status;
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
+            };
             let elapsed = (chrono::Utc::now() - session.started_at)
                 .num_milliseconds()
                 .max(0) as u64;
@@ -1201,12 +1248,13 @@ impl NetDiagApp {
                 elapsed_ms: elapsed,
                 timeout_ms: session.timeout.as_millis() as u64,
                 packet_limit: None,
-                last_sample_at: otlp.last_received_at(),
+                last_sample_at,
             });
             ctx.request_repaint_after(Duration::from_millis(500));
         }
 
         let mut finished = None;
+        let mut otlp_stopped = None;
         if let Some(receiver) = session.job.as_ref() {
             loop {
                 match receiver.try_recv() {
@@ -1214,12 +1262,16 @@ impl NetDiagApp {
                         session.progress = Some(progress);
                     }
                     Ok(CaptureSessionEvent::Finished(result)) => {
-                        finished = Some(*result);
+                        finished = Some(result);
+                        break;
+                    }
+                    Ok(CaptureSessionEvent::OtlpStopped(result)) => {
+                        otlp_stopped = Some(result);
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        finished = Some(Err(anyhow::anyhow!(
+                        finished = Some(CaptureSessionCompletion::Failed(anyhow::anyhow!(
                             "capture worker stopped before returning a result"
                         )));
                         break;
@@ -1228,11 +1280,47 @@ impl NetDiagApp {
             }
         }
 
-        if let Some(result) = finished {
+        if otlp_stopped.is_some() || finished.is_some() {
+            let worker_result = session.worker.take().map(thread::JoinHandle::join);
+            if worker_result.is_some_and(|result| result.is_err()) {
+                session.job = None;
+                session.cancel = None;
+                session.phase = CaptureSessionPhase::Failed;
+                session.status = format!(
+                    "{}: capture worker panicked",
+                    tr(self.language, Text::CaptureFailed)
+                );
+                ctx.request_repaint();
+                return;
+            }
+        }
+
+        if let Some(result) = otlp_stopped {
             session.job = None;
             session.cancel = None;
             match result {
-                Ok(snapshot) => {
+                Ok(OtlpShutdownOutcome::Graceful) => {
+                    session.phase = CaptureSessionPhase::Cancelled;
+                    session.status = tr(self.language, Text::CaptureCancelled).to_string();
+                }
+                Ok(OtlpShutdownOutcome::Forced) => {
+                    session.phase = CaptureSessionPhase::Cancelled;
+                    session.status = format!(
+                        "{} · active connections closed",
+                        tr(self.language, Text::CaptureCancelled)
+                    );
+                }
+                Err(err) => {
+                    session.phase = CaptureSessionPhase::Failed;
+                    session.status = format!("{}: {err}", tr(self.language, Text::CaptureFailed));
+                }
+            }
+            ctx.request_repaint();
+        } else if let Some(result) = finished {
+            session.job = None;
+            session.cancel = None;
+            match result {
+                CaptureSessionCompletion::Completed(snapshot) => {
                     let rows = snapshot.ingest.records.len();
                     session.phase = CaptureSessionPhase::Completed;
                     session.status = format!(
@@ -1241,13 +1329,13 @@ impl NetDiagApp {
                         rows,
                         tr(self.language, Text::Rows)
                     );
-                    session.last_sample = Some(snapshot);
+                    session.last_sample = Some(*snapshot);
                 }
-                Err(err) if err.to_string().contains("cancelled") => {
+                CaptureSessionCompletion::Cancelled => {
                     session.phase = CaptureSessionPhase::Cancelled;
                     session.status = tr(self.language, Text::CaptureCancelled).to_string();
                 }
-                Err(err) => {
+                CaptureSessionCompletion::Failed(err) => {
                     session.phase = CaptureSessionPhase::Failed;
                     session.status = format!("{}: {err}", tr(self.language, Text::CaptureFailed));
                 }
@@ -1280,21 +1368,21 @@ impl NetDiagApp {
             self.settings.last_imported_trace = Some(path.clone());
             self.persist_settings();
             self.source_mode = SourceMode::File(path);
-            self.run_diagnosis();
+            self.start_diagnosis(false);
         }
     }
 
     fn run_simulation(&mut self) {
         self.simulation_scenario = self.settings.simulation_scenario;
         self.source_mode = SourceMode::Simulated(self.simulation_scenario);
-        self.run_diagnosis();
+        self.start_diagnosis(false);
     }
 
     fn run_live_api(&mut self) {
         match self.connector_source_mode() {
             Ok(source_mode) => {
                 self.source_mode = source_mode;
-                self.run_diagnosis();
+                self.start_diagnosis(false);
             }
             Err(err) => {
                 self.tab = Tab::Settings;
@@ -1308,23 +1396,19 @@ impl NetDiagApp {
             }
         }
     }
+}
 
-    fn connector_source_mode(&self) -> anyhow::Result<SourceMode> {
-        connector_source_mode_from_profile(&self.settings, self.secrets.as_ref())
+fn save_settings_if_authorized(
+    store: &SettingsStore,
+    settings: &mut AppSettings,
+    authorized: bool,
+) -> anyhow::Result<()> {
+    if !authorized {
+        anyhow::bail!(
+            "settings were rejected at startup; repair or remove the settings file and restart before saving"
+        );
     }
-
-    fn persist_settings(&mut self) {
-        match self.settings_store.save(&self.settings) {
-            Ok(()) => self.settings_notice = Some(tr(self.language, Text::Saved).to_string()),
-            Err(err) => self.settings_notice = Some(err.to_string()),
-        }
-    }
-
-    fn set_language(&mut self, language: Language) {
-        self.language = language;
-        self.settings.language = LanguageSetting::from(language);
-        self.persist_settings();
-    }
+    store.save(settings)
 }
 
 impl eframe::App for NetDiagApp {
@@ -1431,7 +1515,7 @@ impl NetDiagApp {
     #[cfg(target_os = "macos")]
     fn handle_native_menu_command(&mut self, command: NativeMenuCommand) {
         match command {
-            NativeMenuCommand::NewAnalysis => self.run_diagnosis(),
+            NativeMenuCommand::NewAnalysis => self.start_diagnosis(false),
             NativeMenuCommand::ImportTrace => self.import_trace(),
             NativeMenuCommand::RunSimulation => self.run_simulation(),
             NativeMenuCommand::LiveApi => self.run_live_api(),
@@ -1806,7 +1890,7 @@ impl NetDiagApp {
             let fallback_model;
             let topology_model_ref = if let Some(model) = topology_model_ref {
                 Some(model)
-            } else if let Some(request) = self.current_what_if_request() {
+            } else if let Ok(request) = self.current_what_if_request() {
                 fallback_model = request.topology;
                 Some(&fallback_model)
             } else {
@@ -1906,12 +1990,8 @@ impl NetDiagApp {
 
         ui.add_space(16.0);
         glass_frame(ui, |ui| {
-            if let Some(action) = self.pilot_center.render(ui, &self.artifacts_root) {
-                match action {
-                    pilot_run_center::PilotRunCenterAction::OpenPath(path) => {
-                        self.open_path_with_notice(&path);
-                    }
-                }
+            if let Some(action) = self.pilot_center.render(ui) {
+                self.handle_pilot_run_center_action(action);
             }
         });
 
@@ -1964,9 +2044,6 @@ impl NetDiagApp {
         glass_frame(ui, |ui| {
             section_title(ui, "Previous lab runs");
             ui.add_space(10.0);
-            if self.lab_runs.is_empty() {
-                self.refresh_lab_runs();
-            }
             if self.lab_runs.is_empty() {
                 ui.label(
                     RichText::new("No indexed lab runs.")
@@ -2208,14 +2285,9 @@ impl NetDiagApp {
             .as_ref()
             .map(|result| result.connector_health.clone())
             .or_else(|| {
-                self.source_snapshot.as_ref().map(|snapshot| {
-                    connector_health_from_ingest(
-                        &snapshot.descriptor.kind,
-                        &snapshot.descriptor.name,
-                        &snapshot.descriptor.captured_label,
-                        &snapshot.ingest,
-                    )
-                })
+                self.source_snapshot
+                    .as_ref()
+                    .map(SourceSnapshot::connector_health)
             })
     }
 
@@ -2635,7 +2707,7 @@ impl NetDiagApp {
             if let Some(notice) = &self.settings_notice {
                 ui.label(RichText::new(notice).size(12.0).color(MUTED));
             }
-            if let Some(status) = &self.api_test_status {
+            if let Some(status) = self.current_api_test_status() {
                 ui.label(RichText::new(status).size(12.0).color(MUTED));
             }
             ui.add_space(12.0);
@@ -2761,13 +2833,12 @@ impl NetDiagApp {
         if source_changed || scenario_changed {
             self.simulation_scenario = self.settings.simulation_scenario;
             self.persist_settings();
-            let (source_mode, warning) =
-                source_mode_from_settings(&self.settings, self.secrets.as_ref());
+            let (source_mode, warning) = source_mode_from_settings(&self.settings);
             self.source_mode = source_mode;
             if warning.is_some() {
                 self.settings_notice = warning;
             }
-            self.run_diagnosis();
+            self.start_diagnosis(false);
         }
     }
 
@@ -2798,29 +2869,45 @@ impl NetDiagApp {
             self.persist_settings();
         }
 
-        let env_token = std::env::var(settings::NETDIAG_API_TOKEN_ENV)
+        let token_scope = bearer_scope_for_endpoint(
+            "legacy_live_api",
+            BearerSourceKind::HttpJson,
+            &self.settings.api.endpoint,
+        );
+        let token_presence = token_scope
+            .as_ref()
+            .map_err(ToString::to_string)
+            .map(|scope| {
+                self.live_api_token_presence
+                    .for_scope(self.secrets.as_ref(), scope)
+                    .clone()
+            });
+        let stale_binding = legacy_live_api_binding(&self.settings.api.endpoint)
             .ok()
-            .is_some_and(|token| !token.trim().is_empty());
-        let (token_status, token_color) = match self.secrets.has_live_api_token() {
-            Ok(keychain_token) => (
+            .is_some_and(|desired| has_stale_active_binding(&self.settings, &desired));
+        let (token_status, token_color) = match token_presence {
+            Ok(BearerSecretPresence::Present) => (
                 format!(
-                    "{}: {}{}",
+                    "{}: {}",
                     tr(self.language, Text::TokenStatus),
-                    if keychain_token {
-                        tr(self.language, Text::ApiSet)
-                    } else {
-                        tr(self.language, Text::ApiUnset)
-                    },
-                    if env_token {
-                        tr(self.language, Text::EnvFallback)
-                    } else {
-                        ""
-                    }
+                    tr(self.language, Text::ApiSet)
                 ),
                 MUTED,
             ),
-            Err(err) => (
-                format!("{}: {err}", tr(self.language, Text::KeychainError)),
+            Ok(BearerSecretPresence::Missing) if stale_binding => (
+                stale_bearer_credential_hint(self.language).to_string(),
+                ORANGE,
+            ),
+            Ok(BearerSecretPresence::Missing) => (
+                format!(
+                    "{}: {}",
+                    tr(self.language, Text::TokenStatus),
+                    tr(self.language, Text::ApiUnset)
+                ),
+                MUTED,
+            ),
+            Ok(BearerSecretPresence::ReadFailed(error)) | Err(error) => (
+                format!("{}: {error}", tr(self.language, Text::KeychainError)),
                 RED,
             ),
         };
@@ -2828,18 +2915,33 @@ impl NetDiagApp {
         ui.horizontal(|ui| {
             setting_caption(ui, tr(self.language, Text::KeychainProtection));
             ui.add(
-                egui::TextEdit::singleline(&mut self.token_input)
+                egui::TextEdit::singleline(&mut *self.token_input)
                     .password(true)
                     .desired_width(220.0),
             );
             if soft_button(ui, tr(self.language, Text::SaveToken)).clicked() {
-                match self.secrets.set_live_api_token(self.token_input.trim()) {
+                self.advance_api_test_credential_revision();
+                let result =
+                    legacy_live_api_binding(&self.settings.api.endpoint).and_then(|binding| {
+                        store_bearer_credential(
+                            &self.settings_store,
+                            &mut self.settings,
+                            self.secrets.as_ref(),
+                            binding,
+                            &self.token_input,
+                        )
+                    });
+                self.token_input.zeroize();
+                self.live_api_token_presence.invalidate();
+                match result {
                     Ok(()) => {
-                        self.token_input.clear();
                         self.pending_delete_token = false;
+                        if let Ok(scope) = token_scope.as_ref() {
+                            self.live_api_token_presence.mark_present(scope);
+                        }
                         self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
                     }
-                    Err(err) => self.settings_notice = Some(err.to_string()),
+                    Err(error) => self.settings_notice = Some(format!("{error:#}")),
                 }
             }
             let delete_label = if self.pending_delete_token {
@@ -2849,29 +2951,140 @@ impl NetDiagApp {
             };
             if soft_button(ui, delete_label).clicked() {
                 if self.pending_delete_token {
-                    match self.secrets.delete_live_api_token() {
+                    self.advance_api_test_credential_revision();
+                    let result = delete_live_api_credentials(
+                        &self.settings_store,
+                        &mut self.settings,
+                        self.secrets.as_ref(),
+                    );
+                    self.token_input.zeroize();
+                    self.live_api_token_presence.invalidate();
+                    match result {
                         Ok(()) => {
                             self.pending_delete_token = false;
+                            if let Ok(scope) = token_scope.as_ref() {
+                                self.live_api_token_presence.mark_missing(scope);
+                            }
                             self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
                         }
-                        Err(err) => self.settings_notice = Some(err.to_string()),
+                        Err(error) => self.settings_notice = Some(format!("{error:#}")),
                     }
                 } else {
                     self.pending_delete_token = true;
                 }
             }
-            let testing = self.api_test_job.is_some();
-            let test_label = if testing {
-                tr(self.language, Text::TestingConnection)
+        });
+    }
+
+    fn render_profile_bearer_token_settings(&mut self, ui: &mut egui::Ui, profile_index: usize) {
+        let profile = self.settings.data_connectors.profiles[profile_index].clone();
+        if profile.authentication == ConnectorAuthentication::None {
+            ui.label(
+                RichText::new(connector_authentication_disabled_hint(self.language))
+                    .size(12.0)
+                    .color(MUTED),
+            );
+            return;
+        }
+
+        let scope = profile_bearer_scope(&profile).and_then(|scope| {
+            scope.ok_or_else(|| anyhow::anyhow!("bearer authentication is not enabled"))
+        });
+        let presence = scope.as_ref().map_err(ToString::to_string).map(|scope| {
+            self.profile_token_presence
+                .for_scope(self.secrets.as_ref(), scope)
+                .clone()
+        });
+        let stale_binding = profile_binding(&profile)
+            .ok()
+            .flatten()
+            .is_some_and(|desired| has_stale_active_binding(&self.settings, &desired));
+        let (status, color) = match presence {
+            Ok(BearerSecretPresence::Present) => {
+                (tr(self.language, Text::ApiSet).to_string(), MUTED)
+            }
+            Ok(BearerSecretPresence::Missing) if stale_binding => (
+                stale_bearer_credential_hint(self.language).to_string(),
+                ORANGE,
+            ),
+            Ok(BearerSecretPresence::Missing) => {
+                (tr(self.language, Text::ApiUnset).to_string(), ORANGE)
+            }
+            Ok(BearerSecretPresence::ReadFailed(error)) | Err(error) => (error, RED),
+        };
+        ui.label(
+            RichText::new(format!(
+                "{}: {status}",
+                tr(self.language, Text::TokenStatus)
+            ))
+            .size(12.0)
+            .color(color),
+        );
+        ui.horizontal(|ui| {
+            setting_caption(ui, tr(self.language, Text::KeychainProtection));
+            ui.add(
+                egui::TextEdit::singleline(&mut *self.profile_token_input)
+                    .password(true)
+                    .desired_width(220.0),
+            );
+            if soft_button(ui, tr(self.language, Text::SaveToken)).clicked() {
+                self.advance_api_test_credential_revision();
+                self.pending_delete_profile_token.clear();
+                let desired = profile_binding(&profile).and_then(|binding| {
+                    binding.ok_or_else(|| anyhow::anyhow!("bearer authentication is not enabled"))
+                });
+                let result = desired.and_then(|binding| {
+                    store_bearer_credential(
+                        &self.settings_store,
+                        &mut self.settings,
+                        self.secrets.as_ref(),
+                        binding,
+                        &self.profile_token_input,
+                    )
+                });
+                self.profile_token_input.zeroize();
+                self.profile_token_presence.invalidate();
+                match result {
+                    Ok(()) => {
+                        if let Ok(scope) = scope.as_ref() {
+                            self.profile_token_presence.mark_present(scope);
+                        }
+                        self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
+                    }
+                    Err(error) => self.settings_notice = Some(format!("{error:#}")),
+                }
+            }
+            let delete_label = if self.pending_delete_profile_token.is_armed_for(&profile.id) {
+                tr(self.language, Text::ConfirmDeleteToken)
             } else {
-                tr(self.language, Text::TestConnection)
+                tr(self.language, Text::DeleteToken)
             };
-            let test_button = egui::Button::new(RichText::new(test_label).size(13.0).color(INK))
-                .fill(Color32::from_white_alpha(130))
-                .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
-                .corner_radius(8);
-            if ui.add_enabled(!testing, test_button).clicked() {
-                self.start_api_test_connection();
+            if soft_button(ui, delete_label).clicked()
+                && self
+                    .pending_delete_profile_token
+                    .request(profile.id.clone())
+            {
+                self.advance_api_test_credential_revision();
+                let owner = BearerCredentialOwner::profile(profile.id.clone());
+                let current = profile_binding(&profile).ok().flatten();
+                let result = delete_bearer_credentials(
+                    &self.settings_store,
+                    &mut self.settings,
+                    self.secrets.as_ref(),
+                    &owner,
+                    current,
+                );
+                self.profile_token_input.zeroize();
+                self.profile_token_presence.invalidate();
+                match result {
+                    Ok(()) => {
+                        if let Ok(scope) = scope.as_ref() {
+                            self.profile_token_presence.mark_missing(scope);
+                        }
+                        self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
+                    }
+                    Err(error) => self.settings_notice = Some(format!("{error:#}")),
+                }
             }
         });
     }
@@ -2880,7 +3093,6 @@ impl NetDiagApp {
         section_title(ui, tr(self.language, Text::DataConnectors));
         ui.add_space(8.0);
         let mut changed = false;
-        self.settings.data_connectors.ensure_profiles();
         ui.horizontal(|ui| {
             setting_caption(ui, tr(self.language, Text::SourceProfile));
             let selected_name = self
@@ -2927,16 +3139,47 @@ impl NetDiagApp {
                     .selected_text(connector_kind_label(profile.kind, self.language))
                     .show_ui(ui, |ui| {
                         for connector in ConnectorKind::ALL {
-                            changed |= ui
+                            let kind_changed = ui
                                 .selectable_value(
                                     &mut profile.kind,
                                     connector,
                                     connector_kind_label(connector, self.language),
                                 )
                                 .changed();
+                            changed |= kind_changed;
+                            if kind_changed && !profile.kind.supports_bearer_authentication() {
+                                profile.authentication = ConnectorAuthentication::None;
+                            }
                         }
                     });
             });
+            if profile.kind.supports_bearer_authentication() {
+                ui.horizontal(|ui| {
+                    setting_caption(ui, tr(self.language, Text::TokenStatus));
+                    egui::ComboBox::from_id_salt("profile_authentication")
+                        .selected_text(connector_authentication_label(
+                            profile.authentication,
+                            self.language,
+                        ))
+                        .show_ui(ui, |ui| {
+                            for authentication in [
+                                ConnectorAuthentication::None,
+                                ConnectorAuthentication::BearerToken,
+                            ] {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut profile.authentication,
+                                        authentication,
+                                        connector_authentication_label(
+                                            authentication,
+                                            self.language,
+                                        ),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+            }
             match profile.kind {
                 ConnectorKind::LocalProbe => {
                     ui.horizontal(|ui| {
@@ -3086,7 +3329,7 @@ impl NetDiagApp {
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut profile.native_pcap.packet_limit)
-                                    .range(1..=10_000),
+                                    .range(1..=netdiag_core::MAX_PCAP_PACKET_LIMIT),
                             )
                             .changed();
                         setting_caption(ui, tr(self.language, Text::CaptureTimeout));
@@ -3119,6 +3362,9 @@ impl NetDiagApp {
             }
             profile.kind
         };
+        if active_kind.supports_bearer_authentication() {
+            self.render_profile_bearer_token_settings(ui, profile_index);
+        }
         let testing = self.api_test_job.is_some();
         let test_label = if testing {
             tr(self.language, Text::TestingConnection)
@@ -3146,8 +3392,7 @@ impl NetDiagApp {
         if changed {
             self.settings.data_connectors.default_connector = active_kind;
             self.persist_settings();
-            let (source_mode, warning) =
-                source_mode_from_settings(&self.settings, self.secrets.as_ref());
+            let (source_mode, warning) = source_mode_from_settings(&self.settings);
             self.source_mode = source_mode;
             if warning.is_some() {
                 self.settings_notice = warning;
@@ -3159,10 +3404,9 @@ impl NetDiagApp {
         section_title(ui, tr(self.language, Text::CaptureSession));
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            let running = self
-                .capture_session
-                .as_ref()
-                .is_some_and(|session| session.phase.is_active());
+            let phase = self.capture_session.as_ref().map(|session| session.phase);
+            let active = phase.is_some_and(CaptureSessionPhase::is_active);
+            let running = phase == Some(CaptureSessionPhase::Running);
             let session_matches = self
                 .capture_session
                 .as_ref()
@@ -3179,7 +3423,7 @@ impl NetDiagApp {
                 .fill(Color32::from_white_alpha(130))
                 .stroke(Stroke::new(1.0, Color32::from_white_alpha(140)))
                 .corner_radius(8);
-            if ui.add_enabled(!running, start).clicked() {
+            if ui.add_enabled(!active, start).clicked() {
                 self.start_capture_session(active_kind);
             }
             let diagnose = egui::Button::new(
@@ -3422,7 +3666,7 @@ impl NetDiagApp {
             self.custom_topology = self.settings.what_if.custom_topology.clone();
             self.action.clone_from(&self.settings.what_if.action);
             self.persist_settings();
-            self.run_diagnosis();
+            self.start_diagnosis(false);
         }
     }
 
@@ -3444,48 +3688,49 @@ impl NetDiagApp {
                     .set_directory(&self.settings.artifacts_root)
                     .pick_folder()
             {
+                self.pending_clear_runs.clear();
+                self.pending_rebuild_model.clear();
+                self.model_cache_state = ModelCacheState::load(&path);
                 self.settings.artifacts_root = path.clone();
                 self.artifacts_root = path;
                 self.persist_settings();
-                self.run_diagnosis();
+                self.start_diagnosis(false);
             }
             if soft_button(ui, tr(self.language, Text::OpenFolder)).clicked() {
                 let path = self.settings.artifacts_root.clone();
                 self.open_path_with_notice(&path);
             }
-            let clear_label = if self.pending_clear_runs {
+            let clear_target = self.settings.artifacts_root.clone();
+            let clear_label = if self.pending_clear_runs.is_armed_for(&clear_target) {
                 tr(self.language, Text::ConfirmClearRunHistory)
             } else {
                 tr(self.language, Text::ClearRunHistory)
             };
-            if soft_button(ui, clear_label).clicked() {
-                if self.pending_clear_runs {
-                    self.clear_run_history();
-                } else {
-                    self.pending_clear_runs = true;
-                }
+            if soft_button(ui, clear_label).clicked()
+                && self.pending_clear_runs.request(clear_target)
+            {
+                self.clear_run_history();
             }
         });
         ui.label(
             RichText::new(format!(
                 "{}: {}",
                 tr(self.language, Text::ModelCache),
-                model_cache_status(&self.settings.artifacts_root, self.language)
+                self.model_cache_state.status(self.language.into())
             ))
             .size(12.0)
             .color(MUTED),
         );
-        let rebuild_label = if self.pending_rebuild_model {
+        let rebuild_target = self.settings.artifacts_root.clone();
+        let rebuild_label = if self.pending_rebuild_model.is_armed_for(&rebuild_target) {
             tr(self.language, Text::ConfirmRebuildModel)
         } else {
             tr(self.language, Text::RebuildModel)
         };
-        if soft_button(ui, rebuild_label).clicked() {
-            if self.pending_rebuild_model {
-                self.rebuild_model_cache();
-            } else {
-                self.pending_rebuild_model = true;
-            }
+        if soft_button(ui, rebuild_label).clicked()
+            && self.pending_rebuild_model.request(rebuild_target)
+        {
+            self.rebuild_model_cache();
         }
     }
 
@@ -3546,11 +3791,8 @@ impl NetDiagApp {
                 self.settings_notice = Some(message);
                 self.error = None;
             }
-            Ok(UpdateCheckOutcome::FeedReachable { feed_url }) => {
-                let message = format!(
-                    "{}: {feed_url}",
-                    tr(self.language, Text::UpdateFeedReachable)
-                );
+            Ok(UpdateCheckOutcome::FeedReachable) => {
+                let message = tr(self.language, Text::UpdateFeedReachable).to_string();
                 self.update_notice = Some(message.clone());
                 self.settings_notice = Some(message);
                 self.error = None;
@@ -3595,22 +3837,14 @@ impl NetDiagApp {
         else {
             return;
         };
-        match fs::read_to_string(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|raw| {
-                serde_json::from_str::<TopologyModel>(&raw).map_err(anyhow::Error::from)
-            })
-            .and_then(|model| {
-                validate_topology_model(&model).map_err(anyhow::Error::from)?;
-                Ok(model)
-            }) {
+        match load_topology_file(&path) {
             Ok(model) => {
                 self.settings.what_if.topology = "custom".to_string();
                 self.settings.what_if.custom_topology = Some(model.clone());
                 self.topology = "custom".to_string();
                 self.custom_topology = Some(model);
                 self.persist_settings();
-                self.run_diagnosis();
+                self.start_diagnosis(false);
             }
             Err(err) => {
                 self.settings_notice =
@@ -3620,14 +3854,12 @@ impl NetDiagApp {
     }
 
     fn export_topology(&mut self) {
-        let topology = if self.topology == "custom" {
-            self.custom_topology.clone()
-        } else {
-            topology_model(self.topology.as_str()).ok()
-        };
-        let Some(topology) = topology else {
-            self.settings_notice = Some(tr(self.language, Text::NotAvailable).to_string());
-            return;
+        let topology = match self.current_topology_model() {
+            Ok(topology) => topology,
+            Err(error) => {
+                self.settings_notice = Some(error.to_string());
+                return;
+            }
         };
         let Some(path) = rfd::FileDialog::new()
             .set_file_name(format!("{}_topology.json", topology.key))
@@ -3635,10 +3867,7 @@ impl NetDiagApp {
         else {
             return;
         };
-        match serde_json::to_vec_pretty(&topology)
-            .map_err(anyhow::Error::from)
-            .and_then(|raw| fs::write(&path, raw).map_err(anyhow::Error::from))
-        {
+        match write_topology_export(&path, &topology) {
             Ok(()) => self.settings_notice = Some(tr(self.language, Text::Saved).to_string()),
             Err(err) => {
                 self.settings_notice =
@@ -3650,11 +3879,20 @@ impl NetDiagApp {
     #[cfg(target_os = "macos")]
     fn open_help_document(&mut self) {
         let help_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
-        if help_path.exists() {
-            self.open_path_with_notice(&help_path);
-        } else {
-            self.tab = Tab::Settings;
-            self.settings_notice = Some(tr(self.language, Text::NotAvailable).to_string());
+        match optional_path_metadata(fs::metadata(&help_path)) {
+            Ok(Some(metadata)) if metadata.is_file() => self.open_path_with_notice(&help_path),
+            Ok(_) => {
+                self.tab = Tab::Settings;
+                self.settings_notice = Some(tr(self.language, Text::NotAvailable).to_string());
+            }
+            Err(error) => {
+                self.tab = Tab::Settings;
+                self.settings_notice = Some(format!(
+                    "{}: {}: {error}",
+                    tr(self.language, Text::OpenFailed),
+                    help_path.display()
+                ));
+            }
         }
     }
 
@@ -3663,8 +3901,13 @@ impl NetDiagApp {
             return;
         };
         let run_id = result.run_id.clone();
-        let artifact_root =
-            artifact_root_for_result(result).unwrap_or_else(|| self.artifacts_root.clone());
+        let Some(artifact_root) = artifact_root_for_result(result) else {
+            self.settings_notice = Some(format!(
+                "HIL review cannot resolve the artifact root from run directory {}",
+                result.run_dir.display()
+            ));
+            return;
+        };
         let notes = self
             .hil_notes
             .get(recommendation_id)
@@ -3708,46 +3951,34 @@ impl NetDiagApp {
     }
 
     fn clear_run_history(&mut self) {
-        let runs_dir = self.settings.artifacts_root.join("runs");
-        let index_path = self.settings.artifacts_root.join("run_index.json");
-        let result = (|| -> std::io::Result<()> {
-            if runs_dir.exists() {
-                fs::remove_dir_all(&runs_dir)?;
+        let result = clear_stored_run_history(&self.settings.artifacts_root);
+        apply_run_history_clear_state(
+            &result,
+            &mut self.evidence_timeline,
+            &mut self.evidence_timeline_loaded,
+            &mut self.selected_evidence,
+        );
+        match result {
+            Ok(()) => {
+                self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
             }
-            if index_path.exists() {
-                fs::remove_file(&index_path)?;
+            Err(error) => {
+                self.settings_notice = Some(error.to_string());
             }
-            Ok(())
-        })();
-        self.pending_clear_runs = false;
-        self.evidence_timeline.clear();
-        self.evidence_timeline_loaded = true;
-        self.selected_evidence = None;
-        self.settings_notice = Some(match result {
-            Ok(()) => tr(self.language, Text::Saved).to_string(),
-            Err(err) => err.to_string(),
-        });
+        }
     }
 
     fn rebuild_model_cache(&mut self) {
         let model_dir = self.settings.artifacts_root.join("model");
-        let model_file = model_dir.join("rust_logistic_model.json");
-        if model_file.exists()
-            && let Err(err) = fs::remove_file(&model_file)
-        {
-            self.settings_notice = Some(err.to_string());
-            self.pending_rebuild_model = false;
-            return;
-        }
-        match load_or_train_model(&model_dir) {
-            Ok(_) => {
+        let result = rebuild_model_bundle(&model_dir);
+        self.model_cache_state = ModelCacheState::load(&self.settings.artifacts_root);
+        match result {
+            Ok(()) => {
                 self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
-                self.pending_rebuild_model = false;
-                self.run_diagnosis();
+                self.start_diagnosis(false);
             }
             Err(err) => {
                 self.settings_notice = Some(err.to_string());
-                self.pending_rebuild_model = false;
             }
         }
     }
@@ -3785,7 +4016,7 @@ impl NetDiagApp {
                     tr(self.language, Text::NewAnalysis)
                 };
                 if action_button(ui, new_label, true, !is_running).clicked() {
-                    self.run_diagnosis();
+                    self.start_diagnosis(false);
                 }
                 ui.add_space(10.0);
                 if action_button(ui, self.live_api_action_label(), false, !is_running).clicked() {
@@ -3818,8 +4049,7 @@ impl NetDiagApp {
         .corner_radius(12)
         .min_size(Vec2::new(HEADER_ACTION_WIDTH, HEADER_ACTION_HEIGHT));
         ui.add_enabled_ui(enabled, |ui| {
-            #[allow(deprecated)]
-            egui::menu::menu_custom_button(ui, button, |ui| {
+            egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
                 for scenario in SimScenario::ALL {
                     if ui
                         .selectable_label(
@@ -4422,220 +4652,13 @@ impl From<Tab> for StartupTab {
 }
 
 #[cfg(target_os = "macos")]
-fn default_secret_store() -> Box<dyn SecretStore> {
-    Box::new(KeychainSecretStore)
+fn default_secret_store() -> Arc<dyn SecretStore> {
+    Arc::new(KeychainSecretStore)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn default_secret_store() -> Box<dyn SecretStore> {
-    Box::new(MemorySecretStore::default())
-}
-
-fn source_mode_from_settings(
-    settings: &AppSettings,
-    secrets: &dyn SecretStore,
-) -> (SourceMode, Option<String>) {
-    match settings.default_source {
-        DefaultSource::Simulation => (SourceMode::Simulated(settings.simulation_scenario), None),
-        DefaultSource::LastImportedFile => {
-            if let Some(path) = &settings.last_imported_trace {
-                if path.is_file() {
-                    return (SourceMode::File(path.clone()), None);
-                }
-                return (
-                    SourceMode::Simulated(settings.simulation_scenario),
-                    Some(format!(
-                        "Last imported trace is unavailable: {}",
-                        path.display()
-                    )),
-                );
-            }
-            (
-                SourceMode::Simulated(settings.simulation_scenario),
-                Some("No last imported trace is saved; using simulation.".to_string()),
-            )
-        }
-        DefaultSource::LiveApi => connector_source_mode_from_settings(settings, secrets),
-    }
-}
-
-fn connector_source_mode_from_settings(
-    settings: &AppSettings,
-    secrets: &dyn SecretStore,
-) -> (SourceMode, Option<String>) {
-    match connector_source_mode_from_profile(settings, secrets) {
-        Ok(source_mode) => (source_mode, None),
-        Err(err) => (
-            SourceMode::Simulated(settings.simulation_scenario),
-            Some(format!(
-                "Live collection is not ready; using simulation. {err}"
-            )),
-        ),
-    }
-}
-
-fn connector_source_mode_from_profile(
-    settings: &AppSettings,
-    secrets: &dyn SecretStore,
-) -> anyhow::Result<SourceMode> {
-    let profile = settings.data_connectors.active_profile();
-    let kind = profile
-        .map(|profile| profile.kind)
-        .unwrap_or(settings.data_connectors.default_connector);
-    match kind {
-        ConnectorKind::LocalProbe => Ok(SourceMode::LocalProbe(
-            profile
-                .map(|profile| profile.local_probe.clone())
-                .unwrap_or_else(|| settings.data_connectors.local_probe.clone()),
-        )),
-        ConnectorKind::WebsiteProbe => Ok(SourceMode::WebsiteProbe(
-            profile
-                .map(|profile| profile.website_probe.clone())
-                .unwrap_or_else(|| settings.data_connectors.website_probe.clone()),
-        )),
-        ConnectorKind::HttpJson => {
-            let config = if let Some(profile) = profile {
-                AppSettings {
-                    api: profile.http_json.clone(),
-                    ..settings.clone()
-                }
-                .api_config(secrets)?
-            } else {
-                settings.api_config(secrets)?
-            };
-            Ok(SourceMode::Api(config))
-        }
-        ConnectorKind::PrometheusQueryRange => Ok(SourceMode::PrometheusQueryRange(
-            profile
-                .map(|profile| profile.prometheus_query.clone())
-                .unwrap_or_else(|| settings.data_connectors.prometheus_query.clone()),
-            secrets.get_live_api_token()?,
-        )),
-        ConnectorKind::PrometheusExposition => Ok(SourceMode::PrometheusExposition(
-            profile
-                .map(|profile| profile.prometheus_exposition.clone())
-                .unwrap_or_else(|| settings.data_connectors.prometheus_exposition.clone()),
-            secrets.get_live_api_token()?,
-        )),
-        ConnectorKind::OtlpGrpcReceiver => Ok(SourceMode::OtlpGrpcReceiver(
-            profile
-                .map(|profile| profile.otlp_grpc.clone())
-                .unwrap_or_else(|| settings.data_connectors.otlp_grpc.clone()),
-        )),
-        ConnectorKind::NativePcap => Ok(SourceMode::NativePcap(
-            profile
-                .map(|profile| profile.native_pcap.clone())
-                .unwrap_or_else(|| settings.data_connectors.native_pcap.clone()),
-        )),
-        ConnectorKind::SystemCounters => Ok(SourceMode::SystemCounters(
-            profile
-                .map(|profile| profile.system_counters.clone())
-                .unwrap_or_else(|| settings.data_connectors.system_counters.clone()),
-        )),
-    }
-}
-
-fn failed_capture_session(kind: ConnectorKind, status: String) -> CaptureSessionState {
-    CaptureSessionState {
-        kind,
-        phase: CaptureSessionPhase::Failed,
-        started_at: chrono::Utc::now(),
-        timeout: Duration::from_secs(0),
-        progress: None,
-        last_sample: None,
-        status,
-        job: None,
-        cancel: None,
-        otlp: None,
-    }
-}
-
-fn source_snapshot_from_connector_session(
-    loaded: ConnectorLoadResult,
-    kind: ConnectorKind,
-    captured_verb: &str,
-    data_source_label: String,
-) -> SourceSnapshot {
-    let rows = loaded.ingest.records.len();
-    let payload = loaded.payload.unwrap_or(Value::Null);
-    let (kind_label, protocol) = match kind {
-        ConnectorKind::OtlpGrpcReceiver => ("OTLP gRPC Session", "OTLP"),
-        ConnectorKind::NativePcap => ("Native pcap Session", "PCAP"),
-        ConnectorKind::SystemCounters => ("System counters Session", "Interface"),
-        _ => ("Capture Session", "Capture"),
-    };
-    let mut flow_summary = connector_payload_flow_summary(&payload, protocol, rows);
-    if flow_summary.total_bytes.is_none() {
-        flow_summary.total_bytes = estimate_session_bytes(&loaded.ingest.records);
-    }
-    SourceSnapshot {
-        descriptor: SourceDescriptor {
-            name: loaded.sample,
-            kind: kind_label.to_string(),
-            captured_label: format!("{captured_verb}  •  {}", chrono::Utc::now().format("%H:%M")),
-            data_source_label,
-        },
-        flow_summary,
-        ingest: loaded.ingest,
-    }
-}
-
-fn connector_payload_flow_summary(payload: &Value, protocol: &str, rows: usize) -> FlowSummary {
-    let top_talkers = payload
-        .get("top_talkers")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let label = item.get("label").and_then(Value::as_str)?;
-                    let bytes = item.get("bytes").and_then(Value::as_u64)?;
-                    Some(netdiag_app::data_source::TopTalker {
-                        label: label.to_string(),
-                        bytes,
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let total_bytes = payload
-        .get("total_bytes")
-        .or_else(|| payload.get("bytes"))
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            let sum = top_talkers.iter().map(|talker| talker.bytes).sum::<u64>();
-            (sum > 0).then_some(sum)
-        });
-    let flows = if top_talkers.is_empty() {
-        payload
-            .get("flow_count")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .or(Some(rows))
-    } else {
-        Some(top_talkers.len())
-    };
-    FlowSummary {
-        protocol: Some(protocol.to_string()),
-        flows,
-        total_bytes,
-        top_talkers,
-    }
-}
-
-fn estimate_session_bytes(records: &[netdiag_core::models::TraceRecord]) -> Option<u64> {
-    if records.len() < 2 {
-        return None;
-    }
-    let mut bytes = 0.0;
-    for pair in records.windows(2) {
-        let seconds = (pair[1].timestamp - pair[0].timestamp)
-            .num_milliseconds()
-            .max(0) as f64
-            / 1000.0;
-        bytes += pair[0].throughput_mbps.max(0.0) * 1_000_000.0 * seconds / 8.0;
-    }
-    bytes.is_finite().then_some(bytes.round() as u64)
+fn default_secret_store() -> Arc<dyn SecretStore> {
+    Arc::new(MemorySecretStore::default())
 }
 
 fn format_capture_progress(progress: &CaptureProgress) -> String {
@@ -4662,13 +4685,7 @@ fn format_capture_progress(progress: &CaptureProgress) -> String {
 }
 
 fn load_lab_runs_from_index(artifact_root: &Path) -> anyhow::Result<Vec<LabRunIndexEntry>> {
-    let index_path = artifact_root.join("lab_run_index.json");
-    if !index_path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(&index_path)?;
-    let index: LabRunIndex = serde_json::from_str(&raw)?;
-    Ok(index.runs)
+    Ok(read_lab_run_index(artifact_root)?.map_or_else(Vec::new, |index| index.runs))
 }
 
 fn render_lab_acceptance(ui: &mut egui::Ui, acceptance: &LabAcceptanceReport) {
@@ -4706,401 +4723,6 @@ fn render_lab_acceptance(ui: &mut egui::Ui, acceptance: &LabAcceptanceReport) {
     }
 }
 
-fn tr(lang: Language, text: Text) -> &'static str {
-    match (lang, text) {
-        (Language::Zh, Text::Subtitle) => "实时网络诊断与分析",
-        (Language::Zh, Text::ImportTrace) => "导入 Trace",
-        (Language::Zh, Text::Simulate) => "仿真",
-        (Language::Zh, Text::LiveApi) => "真实 API",
-        (Language::Zh, Text::NewAnalysis) => "+ 新分析",
-        (Language::Zh, Text::CurrentTrace) => "当前 Trace",
-        (Language::Zh, Text::Duration) => "持续时间",
-        (Language::Zh, Text::Protocol) => "协议",
-        (Language::Zh, Text::Flows) => "流",
-        (Language::Zh, Text::Packets) => "数据包",
-        (Language::Zh, Text::KeyMetrics) => "关键指标",
-        (Language::Zh, Text::LatencyChart) => "延迟趋势",
-        (Language::Zh, Text::DiagnosisSummary) => "诊断摘要",
-        (Language::Zh, Text::RuleMlComparison) => "规则 vs ML 对比",
-        (Language::Zh, Text::TopTalkers) => "主要流量",
-        (Language::Zh, Text::SystemStatus) => "系统状态",
-        (Language::Zh, Text::DataSource) => "数据源",
-        (Language::Zh, Text::LastUpdate) => "最后更新",
-        (Language::Zh, Text::AnalysisId) => "分析 ID",
-        (Language::Zh, Text::NoMetrics) => "暂无指标。",
-        (Language::Zh, Text::NoDiagnosis) => "暂无诊断。",
-        (Language::Zh, Text::NoComparison) => "暂无对比。",
-        (Language::Zh, Text::NoFlowMetadata) => "当前数据源没有逐流元数据。",
-        (Language::Zh, Text::NoSource) => "暂无数据源",
-        (Language::Zh, Text::ImportTraceToBegin) => "导入 Trace 后开始分析。",
-        (Language::Zh, Text::AnalysisLoading) => "分析正在载入。",
-        (Language::Zh, Text::AnalysisAlreadyRunning) => "分析正在运行，请等待当前任务完成",
-        (Language::Zh, Text::Running) => "运行中",
-        (Language::Zh, Text::ViewDetails) => "查看详情",
-        (Language::Zh, Text::ViewComparison) => "查看对比",
-        (Language::Zh, Text::Confidence) => "置信度",
-        (Language::Zh, Text::Agreement) => "一致",
-        (Language::Zh, Text::ReviewNeeded) => "需要复核",
-        (Language::Zh, Text::SettingsLanguage) => "界面语言",
-        (Language::Zh, Text::Artifacts) => "运行产物",
-        (Language::Zh, Text::CurrentRun) => "当前运行",
-        (Language::Zh, Text::ReviewState) => "复核状态",
-        (Language::Zh, Text::RootCauses) => "根因",
-        (Language::Zh, Text::Recommendations) => "推荐动作",
-        (Language::Zh, Text::Evidence) => "证据",
-        (Language::Zh, Text::EvidenceConsole) => "证据控制台",
-        (Language::Zh, Text::Timeline) => "时间线",
-        (Language::Zh, Text::SelectedRun) => "选中运行",
-        (Language::Zh, Text::CompareLeft) => "设为 A",
-        (Language::Zh, Text::CompareRight) => "设为 B",
-        (Language::Zh, Text::CompareRuns) => "运行对比",
-        (Language::Zh, Text::QualityStatus) => "质量状态",
-        (Language::Zh, Text::WarningCount) => "告警数",
-        (Language::Zh, Text::QualityDelta) => "质量变化",
-        (Language::Zh, Text::NoRunSelected) => "请选择一个历史运行查看证据。",
-        (Language::Zh, Text::WhatIfResult) => "What-if 结果",
-        (Language::Zh, Text::MlTopPredictions) => "ML Top 预测",
-        (Language::Zh, Text::FeatureContribution) => "特征贡献",
-        (Language::Zh, Text::ModelStatus) => "模型状态",
-        (Language::Zh, Text::SyntheticFallback) => "synthetic fallback，仅适合原型和回归验证",
-        (Language::Zh, Text::RuleBased) => "规则诊断",
-        (Language::Zh, Text::MlAssisted) => "ML 辅助",
-        (Language::Zh, Text::AddApi) => "添加 API",
-        (Language::Zh, Text::ConfigureLiveApiFirst) => {
-            "请先在 Settings 填写 API URL，或设置 NETDIAG_API_URL"
-        }
-        (Language::Zh, Text::Metric) => "指标",
-        (Language::Zh, Text::Baseline) => "基线",
-        (Language::Zh, Text::Proposed) => "方案",
-        (Language::Zh, Text::NoWhatIf) => "暂无 What-if 结果。",
-        (Language::Zh, Text::NoArtifacts) => "暂无运行产物。",
-        (Language::Zh, Text::Topology) => "拓扑",
-        (Language::Zh, Text::Action) => "动作",
-        (Language::Zh, Text::Risk) => "风险",
-        (Language::Zh, Text::Approval) => "审批",
-        (Language::Zh, Text::HilReview) => "HIL 复核",
-        (Language::Zh, Text::HilStatus) => "HIL 状态",
-        (Language::Zh, Text::Accept) => "通过",
-        (Language::Zh, Text::Reject) => "驳回",
-        (Language::Zh, Text::MarkUncertain) => "标记不确定",
-        (Language::Zh, Text::RequireRerun) => "要求重跑",
-        (Language::Zh, Text::ReviewNotes) => "复核备注",
-        (Language::Zh, Text::ReviewedBy) => "复核人",
-        (Language::Zh, Text::ApiUnset) => "未配置",
-        (Language::Zh, Text::ApiSet) => "已配置",
-        (Language::Zh, Text::EngineerRole) => "网络工程师",
-        (Language::Zh, Text::Online) => "在线",
-        (Language::Zh, Text::Total) => "总计",
-        (Language::Zh, Text::General) => "通用",
-        (Language::Zh, Text::StartupDefaultPage) => "启动默认页",
-        (Language::Zh, Text::AutoRunDiagnosis) => "启动时自动运行诊断",
-        (Language::Zh, Text::DataSources) => "数据源",
-        (Language::Zh, Text::DefaultDataSource) => "默认数据源",
-        (Language::Zh, Text::SimulationScenario) => "仿真场景",
-        (Language::Zh, Text::LastImportedTrace) => "上次导入",
-        (Language::Zh, Text::LiveApiConnection) => "真实 API 连接",
-        (Language::Zh, Text::ApiUrl) => "API URL",
-        (Language::Zh, Text::RequestTimeout) => "请求超时",
-        (Language::Zh, Text::TokenStatus) => "Token 状态",
-        (Language::Zh, Text::SaveToken) => "保存 Token",
-        (Language::Zh, Text::DeleteToken) => "删除 Token",
-        (Language::Zh, Text::ConfirmDeleteToken) => "确认删除",
-        (Language::Zh, Text::TestConnection) => "测试连接",
-        (Language::Zh, Text::TestingConnection) => "正在测试...",
-        (Language::Zh, Text::ConnectionOk) => "连接成功",
-        (Language::Zh, Text::KeychainError) => "Keychain 错误",
-        (Language::Zh, Text::DigitalTwinDefaults) => "数字孪生默认值",
-        (Language::Zh, Text::DataArtifacts) => "数据与产物",
-        (Language::Zh, Text::ArtifactRoot) => "产物目录",
-        (Language::Zh, Text::ChooseFolder) => "选择目录",
-        (Language::Zh, Text::OpenFolder) => "打开目录",
-        (Language::Zh, Text::SettingsFile) => "设置文件",
-        (Language::Zh, Text::ClearRunHistory) => "清理运行历史",
-        (Language::Zh, Text::ConfirmClearRunHistory) => "确认清理历史",
-        (Language::Zh, Text::ModelCache) => "模型缓存",
-        (Language::Zh, Text::RebuildModel) => "重建模型",
-        (Language::Zh, Text::ConfirmRebuildModel) => "确认重建模型",
-        (Language::Zh, Text::DiagnosisReview) => "诊断与复核",
-        (Language::Zh, Text::RulePolicy) => "规则引擎：证据优先、确定性诊断",
-        (Language::Zh, Text::MlPolicy) => "ML：Rust linfa logistic，提供概率和特征贡献",
-        (Language::Zh, Text::HilPolicy) => "HIL：推荐动作默认需要人工复核",
-        (Language::Zh, Text::PrivacyAbout) => "隐私与关于",
-        (Language::Zh, Text::LocalProcessing) => "Trace、报告和模型缓存都保存在本机",
-        (Language::Zh, Text::KeychainProtection) => "Token 使用 macOS Keychain 保存",
-        (Language::Zh, Text::BundleId) => "Bundle ID",
-        (Language::Zh, Text::Version) => "版本",
-        (Language::Zh, Text::OpenReport) => "打开报告",
-        (Language::Zh, Text::CheckForUpdates) => "检查更新",
-        (Language::Zh, Text::UpdateStatus) => "更新状态",
-        (Language::Zh, Text::UpdateDialogOpened) => "更新窗口已打开",
-        (Language::Zh, Text::UpdateFeedReachable) => "更新源可访问",
-        (Language::Zh, Text::OpenRunFolder) => "打开运行目录",
-        (Language::Zh, Text::ArtifactFiles) => "产物文件",
-        (Language::Zh, Text::ValidationWarnings) => "校验警告",
-        (Language::Zh, Text::OpenFailed) => "打开失败",
-        (Language::Zh, Text::Saved) => "已保存",
-        (Language::Zh, Text::NotAvailable) => "不可用",
-        (Language::Zh, Text::EnvFallback) => " / 环境变量",
-        (Language::Zh, Text::Rows) => "行",
-        (Language::Zh, Text::DefaultSourceSimulation) => "仿真",
-        (Language::Zh, Text::DefaultSourceLastImport) => "上次导入文件",
-        (Language::Zh, Text::DefaultSourceLiveApi) => "真实采集",
-        (Language::Zh, Text::DataConnectors) => "数据连接器",
-        (Language::Zh, Text::ConnectorKind) => "连接器类型",
-        (Language::Zh, Text::ConnectorLocalProbe) => "本机网络探针",
-        (Language::Zh, Text::ConnectorWebsiteProbe) => "网站探针",
-        (Language::Zh, Text::ConnectorHttpJson) => "HTTP/JSON 实验平台",
-        (Language::Zh, Text::ConnectorPrometheusQuery) => "Prometheus query_range",
-        (Language::Zh, Text::ConnectorPrometheusMetrics) => "Prometheus /metrics",
-        (Language::Zh, Text::ConnectorOtlpGrpc) => "OTLP gRPC 接收器",
-        (Language::Zh, Text::ConnectorNativePcap) => "Rust 原生抓包",
-        (Language::Zh, Text::ConnectorSystemCounters) => "系统接口计数器",
-        (Language::Zh, Text::SourceProfile) => "采集 Profile",
-        (Language::Zh, Text::ProfileName) => "Profile 名称",
-        (Language::Zh, Text::PrometheusBaseUrl) => "Prometheus URL",
-        (Language::Zh, Text::PrometheusMetricsEndpoint) => "Metrics 端点",
-        (Language::Zh, Text::PrometheusLookback) => "回看秒数",
-        (Language::Zh, Text::PrometheusStep) => "步长秒数",
-        (Language::Zh, Text::ProbeSamples) => "探测次数",
-        (Language::Zh, Text::ProbeTargets) => "探测目标",
-        (Language::Zh, Text::OtlpBindAddr) => "OTLP 监听地址",
-        (Language::Zh, Text::CaptureSource) => "抓包来源",
-        (Language::Zh, Text::PacketLimit) => "包数上限",
-        (Language::Zh, Text::CaptureTimeout) => "抓包超时",
-        (Language::Zh, Text::CaptureSession) => "采集会话",
-        (Language::Zh, Text::StartReceiver) => "启动接收器",
-        (Language::Zh, Text::StartCapture) => "开始采集",
-        (Language::Zh, Text::CancelCapture) => "取消采集",
-        (Language::Zh, Text::DiagnoseLastSample) => "诊断最近采样",
-        (Language::Zh, Text::StopReceiver) => "停止接收器",
-        (Language::Zh, Text::DiagnoseBuffer) => "诊断缓冲区",
-        (Language::Zh, Text::CaptureProgress) => "采集进度",
-        (Language::Zh, Text::CaptureRunning) => "采集中",
-        (Language::Zh, Text::CaptureCompleted) => "采集完成",
-        (Language::Zh, Text::CaptureCancelled) => "采集已取消",
-        (Language::Zh, Text::CaptureFailed) => "采集失败",
-        (Language::Zh, Text::SystemInterface) => "接口",
-        (Language::Zh, Text::SamplingInterval) => "采样间隔",
-        (Language::Zh, Text::HttpJsonConnectorHint) => {
-            "HTTP/JSON 使用下方真实 API URL 和 Keychain Token"
-        }
-        (Language::Zh, Text::ConnectorHealth) => "连接器健康",
-        (Language::Zh, Text::MeasurementQuality) => "测量质量",
-        (Language::Zh, Text::MissingMetrics) => "缺失指标",
-        (Language::Zh, Text::LastSample) => "最近采样",
-        (Language::Zh, Text::ImportTopology) => "导入拓扑",
-        (Language::Zh, Text::ExportTopology) => "导出拓扑",
-        (Language::Zh, Text::CustomTopology) => "自定义拓扑",
-        (Language::Zh, Text::StartupOverview) => "概览",
-        (Language::Zh, Text::StartupTelemetry) => "遥测",
-        (Language::Zh, Text::StartupDiagnosis) => "诊断",
-        (Language::Zh, Text::StartupRuleMl) => "规则 vs ML",
-        (Language::Zh, Text::StartupDigitalTwin) => "数字孪生",
-        (Language::Zh, Text::StartupWhatIf) => "What-if",
-        (Language::Zh, Text::StartupLab) => "实验室",
-        (Language::Zh, Text::StartupReports) => "报告",
-        (Language::Zh, Text::StartupSettings) => "设置",
-        (Language::En, Text::Subtitle) => "Real-time network diagnosis and analysis",
-        (Language::En, Text::ImportTrace) => "Import Trace",
-        (Language::En, Text::Simulate) => "Simulate",
-        (Language::En, Text::LiveApi) => "Live API",
-        (Language::En, Text::NewAnalysis) => "+ New Analysis",
-        (Language::En, Text::CurrentTrace) => "Current Trace",
-        (Language::En, Text::Duration) => "Duration",
-        (Language::En, Text::Protocol) => "Protocol",
-        (Language::En, Text::Flows) => "Flows",
-        (Language::En, Text::Packets) => "Packets",
-        (Language::En, Text::KeyMetrics) => "Key Metrics",
-        (Language::En, Text::LatencyChart) => "Latency Trend",
-        (Language::En, Text::DiagnosisSummary) => "Diagnosis Summary",
-        (Language::En, Text::RuleMlComparison) => "Rule vs ML Comparison",
-        (Language::En, Text::TopTalkers) => "Top Talkers",
-        (Language::En, Text::SystemStatus) => "System Status",
-        (Language::En, Text::DataSource) => "Data Source",
-        (Language::En, Text::LastUpdate) => "Last Update",
-        (Language::En, Text::AnalysisId) => "Analysis ID",
-        (Language::En, Text::NoMetrics) => "No metrics yet.",
-        (Language::En, Text::NoDiagnosis) => "No diagnosis yet.",
-        (Language::En, Text::NoComparison) => "No comparison yet.",
-        (Language::En, Text::NoFlowMetadata) => "No per-flow metadata in this source.",
-        (Language::En, Text::NoSource) => "No source",
-        (Language::En, Text::ImportTraceToBegin) => "Import a trace to begin.",
-        (Language::En, Text::AnalysisLoading) => "Analysis is loading.",
-        (Language::En, Text::AnalysisAlreadyRunning) => {
-            "Analysis is already running; wait for the current job to finish"
-        }
-        (Language::En, Text::Running) => "Running",
-        (Language::En, Text::ViewDetails) => "View Details",
-        (Language::En, Text::ViewComparison) => "View Comparison",
-        (Language::En, Text::Confidence) => "Confidence",
-        (Language::En, Text::Agreement) => "Agreement",
-        (Language::En, Text::ReviewNeeded) => "Review Needed",
-        (Language::En, Text::SettingsLanguage) => "Interface Language",
-        (Language::En, Text::Artifacts) => "Run Artifacts",
-        (Language::En, Text::CurrentRun) => "Current Run",
-        (Language::En, Text::ReviewState) => "Review State",
-        (Language::En, Text::RootCauses) => "Root Causes",
-        (Language::En, Text::Recommendations) => "Recommendations",
-        (Language::En, Text::Evidence) => "Evidence",
-        (Language::En, Text::EvidenceConsole) => "Evidence Console",
-        (Language::En, Text::Timeline) => "Timeline",
-        (Language::En, Text::SelectedRun) => "Selected Run",
-        (Language::En, Text::CompareLeft) => "Set A",
-        (Language::En, Text::CompareRight) => "Set B",
-        (Language::En, Text::CompareRuns) => "Run Compare",
-        (Language::En, Text::QualityStatus) => "Quality Status",
-        (Language::En, Text::WarningCount) => "Warnings",
-        (Language::En, Text::QualityDelta) => "Quality Delta",
-        (Language::En, Text::NoRunSelected) => "Select a historical run to inspect evidence.",
-        (Language::En, Text::WhatIfResult) => "What-if Result",
-        (Language::En, Text::MlTopPredictions) => "ML Top Predictions",
-        (Language::En, Text::FeatureContribution) => "Feature Contribution",
-        (Language::En, Text::ModelStatus) => "Model Status",
-        (Language::En, Text::SyntheticFallback) => {
-            "synthetic fallback; suitable for prototype and regression validation"
-        }
-        (Language::En, Text::RuleBased) => "Rule-based",
-        (Language::En, Text::MlAssisted) => "ML-assisted",
-        (Language::En, Text::AddApi) => "Add API",
-        (Language::En, Text::ConfigureLiveApiFirst) => {
-            "Configure an API URL in Settings or set NETDIAG_API_URL first"
-        }
-        (Language::En, Text::Metric) => "Metric",
-        (Language::En, Text::Baseline) => "Baseline",
-        (Language::En, Text::Proposed) => "Proposed",
-        (Language::En, Text::NoWhatIf) => "No what-if result.",
-        (Language::En, Text::NoArtifacts) => "No run artifacts yet.",
-        (Language::En, Text::Topology) => "Topology",
-        (Language::En, Text::Action) => "Action",
-        (Language::En, Text::Risk) => "Risk",
-        (Language::En, Text::Approval) => "Approval",
-        (Language::En, Text::HilReview) => "HIL Review",
-        (Language::En, Text::HilStatus) => "HIL Status",
-        (Language::En, Text::Accept) => "Accept",
-        (Language::En, Text::Reject) => "Reject",
-        (Language::En, Text::MarkUncertain) => "Mark Uncertain",
-        (Language::En, Text::RequireRerun) => "Require Rerun",
-        (Language::En, Text::ReviewNotes) => "Review Notes",
-        (Language::En, Text::ReviewedBy) => "Reviewed By",
-        (Language::En, Text::ApiUnset) => "not set",
-        (Language::En, Text::ApiSet) => "set",
-        (Language::En, Text::EngineerRole) => "Network Engineer",
-        (Language::En, Text::Online) => "Online",
-        (Language::En, Text::Total) => "Total",
-        (Language::En, Text::General) => "General",
-        (Language::En, Text::StartupDefaultPage) => "Startup Page",
-        (Language::En, Text::AutoRunDiagnosis) => "Run diagnosis on launch",
-        (Language::En, Text::DataSources) => "Data Sources",
-        (Language::En, Text::DefaultDataSource) => "Default Source",
-        (Language::En, Text::SimulationScenario) => "Simulation Scenario",
-        (Language::En, Text::LastImportedTrace) => "Last Import",
-        (Language::En, Text::LiveApiConnection) => "Live API Connection",
-        (Language::En, Text::ApiUrl) => "API URL",
-        (Language::En, Text::RequestTimeout) => "Request Timeout",
-        (Language::En, Text::TokenStatus) => "Token Status",
-        (Language::En, Text::SaveToken) => "Save Token",
-        (Language::En, Text::DeleteToken) => "Delete Token",
-        (Language::En, Text::ConfirmDeleteToken) => "Confirm Delete",
-        (Language::En, Text::TestConnection) => "Test Connection",
-        (Language::En, Text::TestingConnection) => "Testing...",
-        (Language::En, Text::ConnectionOk) => "Connection OK",
-        (Language::En, Text::KeychainError) => "Keychain error",
-        (Language::En, Text::DigitalTwinDefaults) => "Digital Twin Defaults",
-        (Language::En, Text::DataArtifacts) => "Data & Artifacts",
-        (Language::En, Text::ArtifactRoot) => "Artifact Root",
-        (Language::En, Text::ChooseFolder) => "Choose Folder",
-        (Language::En, Text::OpenFolder) => "Open Folder",
-        (Language::En, Text::SettingsFile) => "Settings File",
-        (Language::En, Text::ClearRunHistory) => "Clear Run History",
-        (Language::En, Text::ConfirmClearRunHistory) => "Confirm Clear History",
-        (Language::En, Text::ModelCache) => "Model Cache",
-        (Language::En, Text::RebuildModel) => "Rebuild Model",
-        (Language::En, Text::ConfirmRebuildModel) => "Confirm Rebuild Model",
-        (Language::En, Text::DiagnosisReview) => "Diagnosis & Review",
-        (Language::En, Text::RulePolicy) => "Rules: evidence-first deterministic diagnosis",
-        (Language::En, Text::MlPolicy) => {
-            "ML: Rust linfa logistic probabilities and feature contribution"
-        }
-        (Language::En, Text::HilPolicy) => "HIL: recommendations require human review by default",
-        (Language::En, Text::PrivacyAbout) => "Privacy & About",
-        (Language::En, Text::LocalProcessing) => "Traces, reports, and model cache remain local",
-        (Language::En, Text::KeychainProtection) => "Token is stored in macOS Keychain",
-        (Language::En, Text::BundleId) => "Bundle ID",
-        (Language::En, Text::Version) => "Version",
-        (Language::En, Text::OpenReport) => "Open Report",
-        (Language::En, Text::CheckForUpdates) => "Check for Updates",
-        (Language::En, Text::UpdateStatus) => "Update Status",
-        (Language::En, Text::UpdateDialogOpened) => "Update window opened",
-        (Language::En, Text::UpdateFeedReachable) => "Update feed reachable",
-        (Language::En, Text::OpenRunFolder) => "Open Run Folder",
-        (Language::En, Text::ArtifactFiles) => "Artifact Files",
-        (Language::En, Text::ValidationWarnings) => "Validation Warnings",
-        (Language::En, Text::OpenFailed) => "Open failed",
-        (Language::En, Text::Saved) => "Saved",
-        (Language::En, Text::NotAvailable) => "Unavailable",
-        (Language::En, Text::EnvFallback) => " / env",
-        (Language::En, Text::Rows) => "rows",
-        (Language::En, Text::DefaultSourceSimulation) => "Simulation",
-        (Language::En, Text::DefaultSourceLastImport) => "Last Imported File",
-        (Language::En, Text::DefaultSourceLiveApi) => "Live Collection",
-        (Language::En, Text::DataConnectors) => "Data Connectors",
-        (Language::En, Text::ConnectorKind) => "Connector Type",
-        (Language::En, Text::ConnectorLocalProbe) => "Local Network Probe",
-        (Language::En, Text::ConnectorWebsiteProbe) => "Website Probe",
-        (Language::En, Text::ConnectorHttpJson) => "HTTP/JSON Lab Adapter",
-        (Language::En, Text::ConnectorPrometheusQuery) => "Prometheus query_range",
-        (Language::En, Text::ConnectorPrometheusMetrics) => "Prometheus /metrics",
-        (Language::En, Text::ConnectorOtlpGrpc) => "OTLP gRPC Receiver",
-        (Language::En, Text::ConnectorNativePcap) => "Rust Native Capture",
-        (Language::En, Text::ConnectorSystemCounters) => "System Counters",
-        (Language::En, Text::SourceProfile) => "Source Profile",
-        (Language::En, Text::ProfileName) => "Profile Name",
-        (Language::En, Text::PrometheusBaseUrl) => "Prometheus URL",
-        (Language::En, Text::PrometheusMetricsEndpoint) => "Metrics Endpoint",
-        (Language::En, Text::PrometheusLookback) => "Lookback Seconds",
-        (Language::En, Text::PrometheusStep) => "Step Seconds",
-        (Language::En, Text::ProbeSamples) => "Probe Samples",
-        (Language::En, Text::ProbeTargets) => "Probe Targets",
-        (Language::En, Text::OtlpBindAddr) => "OTLP Bind Address",
-        (Language::En, Text::CaptureSource) => "Capture Source",
-        (Language::En, Text::PacketLimit) => "Packet Limit",
-        (Language::En, Text::CaptureTimeout) => "Capture Timeout",
-        (Language::En, Text::CaptureSession) => "Capture Session",
-        (Language::En, Text::StartReceiver) => "Start Receiver",
-        (Language::En, Text::StartCapture) => "Start Capture",
-        (Language::En, Text::CancelCapture) => "Cancel Capture",
-        (Language::En, Text::DiagnoseLastSample) => "Diagnose Last Sample",
-        (Language::En, Text::StopReceiver) => "Stop Receiver",
-        (Language::En, Text::DiagnoseBuffer) => "Diagnose Buffer",
-        (Language::En, Text::CaptureProgress) => "Capture Progress",
-        (Language::En, Text::CaptureRunning) => "Capturing",
-        (Language::En, Text::CaptureCompleted) => "Capture Completed",
-        (Language::En, Text::CaptureCancelled) => "Capture Cancelled",
-        (Language::En, Text::CaptureFailed) => "Capture Failed",
-        (Language::En, Text::SystemInterface) => "Interface",
-        (Language::En, Text::SamplingInterval) => "Sampling Interval",
-        (Language::En, Text::HttpJsonConnectorHint) => {
-            "HTTP/JSON uses the Live API URL and Keychain token below"
-        }
-        (Language::En, Text::ConnectorHealth) => "Connector Health",
-        (Language::En, Text::MeasurementQuality) => "Measurement Quality",
-        (Language::En, Text::MissingMetrics) => "Missing Metrics",
-        (Language::En, Text::LastSample) => "Last Sample",
-        (Language::En, Text::ImportTopology) => "Import Topology",
-        (Language::En, Text::ExportTopology) => "Export Topology",
-        (Language::En, Text::CustomTopology) => "Custom Topology",
-        (Language::En, Text::StartupOverview) => "Overview",
-        (Language::En, Text::StartupTelemetry) => "Telemetry",
-        (Language::En, Text::StartupDiagnosis) => "Diagnosis",
-        (Language::En, Text::StartupRuleMl) => "Rule vs ML",
-        (Language::En, Text::StartupDigitalTwin) => "Digital Twin",
-        (Language::En, Text::StartupWhatIf) => "What-if",
-        (Language::En, Text::StartupLab) => "Lab",
-        (Language::En, Text::StartupReports) => "Reports",
-        (Language::En, Text::StartupSettings) => "Settings",
-    }
-}
-
 fn settings_separator(ui: &mut egui::Ui) {
     ui.add_space(12.0);
     ui.separator();
@@ -5130,6 +4752,33 @@ fn connector_kind_label(connector: ConnectorKind, lang: Language) -> &'static st
         ConnectorKind::OtlpGrpcReceiver => tr(lang, Text::ConnectorOtlpGrpc),
         ConnectorKind::NativePcap => tr(lang, Text::ConnectorNativePcap),
         ConnectorKind::SystemCounters => tr(lang, Text::ConnectorSystemCounters),
+    }
+}
+
+fn connector_authentication_label(
+    authentication: ConnectorAuthentication,
+    lang: Language,
+) -> &'static str {
+    match (authentication, lang) {
+        (ConnectorAuthentication::None, Language::Zh) => "不使用认证",
+        (ConnectorAuthentication::None, Language::En) => "No authentication",
+        (ConnectorAuthentication::BearerToken, _) => "Bearer token",
+    }
+}
+
+fn connector_authentication_disabled_hint(lang: Language) -> &'static str {
+    match lang {
+        Language::Zh => "此配置默认不读取或发送任何令牌。",
+        Language::En => "This profile does not read or send any token by default.",
+    }
+}
+
+fn stale_bearer_credential_hint(lang: Language) -> &'static str {
+    match lang {
+        Language::Zh => "令牌仍绑定到先前的端点；请保存新令牌完成轮换，或显式删除旧令牌。",
+        Language::En => {
+            "The token remains bound to the previous endpoint; save a new token to rotate it or explicitly delete it."
+        }
     }
 }
 
@@ -5169,16 +4818,36 @@ fn action_display(key: &str) -> String {
     key.replace('_', " ")
 }
 
+#[cfg(target_os = "macos")]
 fn open_path(path: &Path) -> std::io::Result<()> {
-    Command::new("open").arg(path).spawn().map(|_| ())
+    use objc2_app_kit::NSWorkspace;
+    use objc2_foundation::{NSString, NSURL};
+
+    let path = path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must be valid Unicode before opening it with macOS Workspace",
+        )
+    })?;
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+    if NSWorkspace::sharedWorkspace().openURL(&url) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "macOS Workspace declined to open the path",
+        ))
+    }
 }
 
-fn model_cache_status(root: &Path, lang: Language) -> String {
-    let model = root.join("model").join("rust_logistic_model.json");
-    match fs::metadata(&model) {
-        Ok(metadata) => format_bytes(metadata.len()),
-        Err(_) => tr(lang, Text::NotAvailable).to_string(),
-    }
+#[cfg(not(target_os = "macos"))]
+fn open_path(path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "opening paths is supported only by the macOS desktop build: {}",
+            path.display()
+        ),
+    ))
 }
 
 fn configure_fonts(ctx: &egui::Context) {

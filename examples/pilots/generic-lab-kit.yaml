@@ -4,6 +4,8 @@ name: Generic lab kit pilot
 operator: lab-operator
 safety:
   allow_active: false
+  # Adapters are trusted executable code; endpoints must stay within this root.
+  adapter_execution_root: ../adapters
   retention_days: 14
 sources:
   - name: openconfig-gnmi
@@ -11,6 +13,8 @@ sources:
     endpoint: ../adapters/openconfig-gnmi/adapter.py
     role: corroborating
     active: false
+    adapter:
+      mode: sample
     metadata:
       adapter_contract: netdiag-adapter/v1
       stack: OpenConfig/gNMI
@@ -20,6 +24,8 @@ sources:
     endpoint: ../adapters/snmp-if-mib/adapter.py
     role: corroborating
     active: false
+    adapter:
+      mode: sample
     metadata:
       adapter_contract: netdiag-adapter/v1
       stack: SNMP IF-MIB
@@ -29,6 +35,8 @@ sources:
     endpoint: ../adapters/frr-routing-state/adapter.py
     role: corroborating
     active: false
+    adapter:
+      mode: sample
     metadata:
       adapter_contract: netdiag-adapter/v1
       stack: FRR
@@ -38,6 +46,8 @@ sources:
     endpoint: ../adapters/iperf3-http-json/adapter.py
     role: primary
     active: false
+    adapter:
+      mode: sample
     metadata:
       adapter_contract: netdiag-adapter/v1
       stack: iperf3
@@ -47,6 +57,8 @@ sources:
     endpoint: ../adapters/tc-netem-lab/adapter.py
     role: corroborating
     active: false
+    adapter:
+      mode: sample
     metadata:
       adapter_contract: netdiag-adapter/v1
       stack: tc/netem

@@ -4,11 +4,36 @@ These adapters convert lab tools into the canonical NetDiag JSON payload:
 
 ```json
 {
-  "schema": "netdiag-adapter-payload/v1",
+  "schema": "netdiag-adapter-payload/v2",
+  "collection_mode": "sample",
   "sample": "lab-congestion-001",
   "protocol": "TCP",
   "flow_count": 1,
-  "records": [],
+  "measurement_quality": {
+    "latency_ms": "measured",
+    "jitter_ms": "missing",
+    "packet_loss_rate": "missing",
+    "retransmission_rate": "missing",
+    "timeout_events": "missing",
+    "retry_events": "missing",
+    "throughput_mbps": "measured",
+    "dns_failure_events": "missing",
+    "tls_failure_events": "missing",
+    "quic_blocked_ratio": "missing"
+  },
+  "records": [{
+    "timestamp": "2026-05-07T09:00:00Z",
+    "latency_ms": 42.0,
+    "jitter_ms": 0.0,
+    "packet_loss_rate": 0.0,
+    "retransmission_rate": 0.0,
+    "timeout_events": 0.0,
+    "retry_events": 0.0,
+    "throughput_mbps": 88.0,
+    "dns_failure_events": 0.0,
+    "tls_failure_events": 0.0,
+    "quic_blocked_ratio": 0.0
+  }],
   "experiment": {
     "scenario_id": "lab-congestion-001",
     "fault_start": "2026-05-07T09:00:00Z",
@@ -39,7 +64,7 @@ contract:
 - `--preflight`: validate local binaries, credentials, input files, and endpoint
   syntax without changing the device or lab.
 - `--collect`: collect one bounded read-only sample and emit the same
-  `netdiag-adapter-payload/v1` JSON schema as stdout.
+  `netdiag-adapter-payload/v2` JSON schema as stdout.
 - `--emit-sample`: emit a deterministic offline sample for CI and schema drift
   checks.
 
@@ -73,10 +98,38 @@ For a complete local lab, use `iperf3-http-json` for traffic, `tc-netem-lab`
 for impairment control, Prometheus/OTLP for time-series evidence, and pcap or
 native capture for packet-level corroboration.
 
-Adapters that cannot directly observe a canonical field must say so in
-`experiment.measurement_quality`. For example, IF-MIB counters can derive
-throughput and discard/error ratios but cannot prove RTT; routing-state snapshots
-can indicate churn and forwarding stalls but should not pretend to measure
-packet loss. Use those adapters as corroborating sources unless the missing
-metrics are supplied by Prometheus, pcap, active probes, or another primary
-source.
+Bundled adapters emit `netdiag-adapter-payload/v2` and declare all ten canonical
+numeric fields in the required top-level `measurement_quality` object. It is a
+closed object: every canonical field is required, unknown fields are rejected,
+and values are limited to `measured`, `estimated`, `fallback`, or `missing`.
+There is no free-text source or reason field in this contract. The reader keeps
+v1 input compatibility, but because v1 has no quality declaration, every v1
+metric is treated as `missing`; bundled adapters no longer emit v1.
+
+- `measured` means the source directly supplied the canonical quantity.
+- `estimated` means the same canonical quantity was calculated from direct raw
+  observations, such as an interval counter rate.
+- `fallback` marks a proxy, heuristic, or unapplied plan that must not be treated
+  as a direct observation.
+- `missing` marks a required numeric placeholder that carries no evidence.
+
+The bundled mappings are intentionally conservative:
+
+| Adapter | Measured | Estimated | Fallback | Missing |
+| --- | --- | --- | --- | --- |
+| HTTP JSON / Prometheus CSV | all ten fields | — | — | — |
+| iperf3 TCP | `throughput_mbps` | `retry_events` | — | all other fields |
+| iperf3 UDP | `jitter_ms`, `packet_loss_rate`, `throughput_mbps` | — | — | all other fields |
+| OpenConfig/gNMI | `latency_ms`, `jitter_ms`, `throughput_mbps` | — | discard/error proxies | unobserved fields |
+| SNMP IF-MIB | — | `throughput_mbps` | discard/error proxies | unobserved fields |
+| FRR routing state | — | — | stall, flap, churn, and throughput proxies | unobserved fields, including both canonical rates |
+| DNS probe | latency, jitter, timeout, and DNS failure counts | — | application-failure packet-loss proxy | unobserved fields |
+| TLS probe | latency, jitter, timeout, DNS failure, and TLS failure counts | — | application-failure packet-loss proxy | unobserved fields |
+| QUIC probe | latency, jitter, timeout, and DNS failure counts | — | UDP reachability loss/blocking proxies | unobserved fields |
+| tc/netem plan | — | — | planned latency, jitter, loss, and throughput | all unobserved fields |
+
+For example, IF-MIB counters can calculate throughput and expose discard/error
+proxies but cannot prove RTT or transport retransmission. Routing-state
+snapshots can indicate churn and forwarding stalls but do not emit a fabricated
+canonical retransmission rate. Use fallback fields only as corroborating
+evidence unless a primary source supplies the missing canonical measurement.

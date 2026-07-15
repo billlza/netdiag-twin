@@ -1,8 +1,15 @@
-use super::super::PilotDiagnosisSummary;
-use super::*;
+use super::super::{
+    PilotDiagnosisSummary, PilotReport, PilotWorkflowOptions, PilotWorkflowPhaseStatus,
+    PilotWorkflowVerificationOptions,
+};
+use super::{
+    passed_or_failed, phase, run_pilot_workflow, verification_phase_status, workflow_passed,
+    workflow_verification,
+};
 use crate::diagnose_file;
 use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
 use crate::models::ActionVerificationVerdict;
+use chrono::Utc;
 use tempfile::tempdir;
 
 fn sample(name: &str) -> std::path::PathBuf {
@@ -20,6 +27,7 @@ fn repo_root() -> std::path::PathBuf {
 }
 
 fn provision_test_model(artifacts: &std::path::Path) {
+    crate::storage::ensure_artifact_root_owned(artifacts).expect("owned artifacts dir");
     train_model_from_jsonl_with_options(
         repo_root().join("examples/datasets/pilot-smoke-training.jsonl"),
         artifacts.join("model"),
@@ -74,6 +82,7 @@ sources: []
         PilotWorkflowOptions {
             artifacts: temp.path().join("artifacts"),
             allow_active: false,
+            allow_adapter_execution: false,
             verification: None,
         },
     )
@@ -106,6 +115,7 @@ sources:
         PilotWorkflowOptions {
             artifacts: temp.path().join("artifacts"),
             allow_active: false,
+            allow_adapter_execution: false,
             verification: None,
         },
     )
@@ -144,6 +154,7 @@ sources:
         PilotWorkflowOptions {
             artifacts,
             allow_active: false,
+            allow_adapter_execution: false,
             verification: None,
         },
     )
@@ -163,6 +174,7 @@ fn workflow_propagates_verification_errors_after_successful_run() {
         PilotWorkflowOptions {
             artifacts,
             allow_active: false,
+            allow_adapter_execution: true,
             verification: Some(PilotWorkflowVerificationOptions {
                 after_run_id: "missing-after-run".to_string(),
                 recommendation_id: None,
@@ -193,6 +205,7 @@ fn workflow_verifies_after_run_from_global_artifacts_root() {
         PilotWorkflowOptions {
             artifacts,
             allow_active: false,
+            allow_adapter_execution: true,
             verification: Some(PilotWorkflowVerificationOptions {
                 after_run_id: after.run_id.clone(),
                 recommendation_id: None,
@@ -243,6 +256,7 @@ objective:
         PilotWorkflowOptions {
             artifacts,
             allow_active: false,
+            allow_adapter_execution: true,
             verification: Some(PilotWorkflowVerificationOptions {
                 after_run_id: after.run_id,
                 recommendation_id: None,
@@ -289,6 +303,7 @@ objective:
         PilotWorkflowOptions {
             artifacts,
             allow_active: false,
+            allow_adapter_execution: true,
             verification: Some(PilotWorkflowVerificationOptions {
                 after_run_id: after.run_id,
                 recommendation_id: None,
@@ -499,6 +514,7 @@ fn workflow_options_round_trip_verification_paths() {
     let options = PilotWorkflowOptions {
         artifacts: "artifacts".into(),
         allow_active: true,
+        allow_adapter_execution: true,
         verification: Some(PilotWorkflowVerificationOptions {
             after_run_id: "after".to_string(),
             recommendation_id: Some("rec-1".to_string()),
@@ -512,6 +528,7 @@ fn workflow_options_round_trip_verification_paths() {
 
     let verification = round_trip.verification.expect("verification options");
     assert!(round_trip.allow_active);
+    assert!(round_trip.allow_adapter_execution);
     assert_eq!(verification.after_run_id, "after");
     assert_eq!(verification.recommendation_id.as_deref(), Some("rec-1"));
     assert_eq!(
@@ -525,7 +542,9 @@ fn workflow_options_round_trip_verification_paths() {
 }
 
 fn mark_connector_health_degraded(artifact_root: &std::path::Path, run_id: &str) {
-    let path = crate::storage::run_dir(artifact_root, run_id).join("connector_health.json");
+    let path = crate::storage::run_dir(artifact_root, run_id)
+        .expect("valid run id")
+        .join("connector_health.json");
     let raw = std::fs::read_to_string(&path).expect("connector health");
     let mut value: serde_json::Value = serde_json::from_str(&raw).expect("connector health json");
     value["status"] = serde_json::Value::String("degraded".to_string());

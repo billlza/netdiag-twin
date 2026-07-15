@@ -1,22 +1,36 @@
-use crate::error::{IoContext, Result};
+#[cfg(test)]
+use crate::error::NetdiagError;
+use crate::error::Result;
 use crate::ingest::ingest_trace;
-use crate::ml::{ModelLoadPolicy, infer_with_quality_from_model_dir_with_policy};
+use crate::ml::{
+    ModelBundleSnapshot, ModelLoadPolicy, infer_with_quality_from_model_bundle_snapshot,
+    load_model_bundle_snapshot_with_policy,
+};
 use crate::models::{
-    ConnectorHealthSnapshot, DiagnosisEvent, HilReviewSummary, IngestResult, MlResult,
-    Recommendation, RunIndexEntry, RunManifest, TelemetrySummary, TopologyModel, TwinPolicyAction,
-    WhatIfResult,
+    ConnectorHealthSnapshot, DiagnosisEvent, IngestResult, MlResult, Recommendation,
+    TelemetrySummary, TopologyModel, TwinPolicyAction, WhatIfResult,
 };
 use crate::recommendation::recommend_actions;
 use crate::report::{Report, RuleMlComparison, compare_rule_ml, decide_diagnosis, render_report};
 use crate::rules::diagnose_rules;
-use crate::storage::{connector_health_from_ingest, read_json, run_dir, save_json_atomic};
+use crate::storage::{
+    ArtifactRootCapability, StagedAtomicDirectory, prepare_artifact_root,
+    with_artifact_root_capability,
+};
 use crate::telemetry::summarize_ingest;
 use crate::twin::{policy_action, run_simulated_whatif_with_policy, topology_model};
-use chrono::Utc;
-use serde::Serialize;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
+
+mod artifact;
+mod connector_health;
+use connector_health::validated_connector_health;
+mod execution;
+use execution::ComputedPipelineRun;
+mod publication;
+use publication::{PendingRunPublication, RunPublicationRoot};
+mod persist;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Clone)]
 pub struct PipelineResult {
@@ -53,8 +67,15 @@ pub fn diagnose_file(
     artifact_root: impl AsRef<Path>,
     default_what_if: Option<(&str, &str)>,
 ) -> Result<PipelineResult> {
+    ensure_run_directory_publication_supported(artifact_root.as_ref())?;
     let ingest = ingest_trace(path)?;
     diagnose_ingest(ingest, artifact_root, default_what_if)
+}
+
+pub(crate) fn ensure_run_directory_publication_supported(
+    artifact_root: impl AsRef<Path>,
+) -> Result<()> {
+    publication::preflight(artifact_root.as_ref())
 }
 
 pub fn diagnose_ingest(
@@ -82,6 +103,23 @@ pub fn diagnose_ingest_with_whatif(
     )
 }
 
+pub fn diagnose_ingest_with_whatif_and_connector_health(
+    ingest: IngestResult,
+    artifact_root: impl AsRef<Path>,
+    default_what_if: Option<WhatIfRequest>,
+    connector_health: ConnectorHealthSnapshot,
+) -> Result<PipelineResult> {
+    let artifact_root = artifact_root.as_ref();
+    diagnose_ingest_with_whatif_and_model_dir_with_policy(
+        ingest,
+        artifact_root,
+        artifact_root.join("model"),
+        default_what_if,
+        ModelLoadPolicy::AllowSyntheticFallback,
+        Some(connector_health),
+    )
+}
+
 pub fn diagnose_ingest_with_whatif_and_model_dir(
     ingest: IngestResult,
     artifact_root: impl AsRef<Path>,
@@ -94,6 +132,7 @@ pub fn diagnose_ingest_with_whatif_and_model_dir(
         model_dir,
         default_what_if,
         ModelLoadPolicy::AllowSyntheticFallback,
+        None,
     )
 }
 
@@ -109,6 +148,7 @@ pub fn diagnose_ingest_with_whatif_and_existing_model_dir(
         model_dir,
         default_what_if,
         ModelLoadPolicy::ExistingOnly,
+        None,
     )
 }
 
@@ -118,20 +158,111 @@ fn diagnose_ingest_with_whatif_and_model_dir_with_policy(
     model_dir: impl AsRef<Path>,
     default_what_if: Option<WhatIfRequest>,
     model_load_policy: ModelLoadPolicy,
+    connector_health: Option<ConnectorHealthSnapshot>,
 ) -> Result<PipelineResult> {
+    publication::preflight(artifact_root.as_ref())?;
+    let connector_health = validated_connector_health(&ingest, connector_health)?;
     let artifact_root = artifact_root.as_ref();
-    std::fs::create_dir_all(artifact_root).with_path(artifact_root)?;
-    let runs_root = artifact_root.join("runs");
-    std::fs::create_dir_all(&runs_root).with_path(&runs_root)?;
-    let run_id = Uuid::new_v4().to_string();
+    let capability = prepare_artifact_root(artifact_root)?;
+    let load_snapshot =
+        || load_model_bundle_snapshot_with_policy(model_dir.as_ref(), model_load_policy);
+    let snapshot = with_artifact_root_capability(&capability, |_| load_snapshot())?;
+    diagnose_ingest_with_authorized_model_snapshot(
+        ingest,
+        &snapshot,
+        default_what_if,
+        connector_health,
+        &capability,
+    )
+}
+
+pub(crate) fn diagnose_ingest_with_whatif_and_model_snapshot_and_capability(
+    ingest: IngestResult,
+    model_snapshot: &ModelBundleSnapshot,
+    default_what_if: Option<WhatIfRequest>,
+    capability: &ArtifactRootCapability,
+) -> Result<PipelineResult> {
+    publication::preflight(capability.path())?;
+    let connector_health = validated_connector_health(&ingest, None)?;
+    diagnose_ingest_with_authorized_model_snapshot(
+        ingest,
+        model_snapshot,
+        default_what_if,
+        connector_health,
+        capability,
+    )
+}
+
+pub(crate) fn diagnose_ingest_with_nested_artifact_root_and_model_snapshot_and_connector_health(
+    ingest: IngestResult,
+    nested_root: &StagedAtomicDirectory,
+    model_snapshot: &ModelBundleSnapshot,
+    default_what_if: Option<WhatIfRequest>,
+    connector_health: ConnectorHealthSnapshot,
+) -> Result<PipelineResult> {
+    let connector_health = validated_connector_health(&ingest, Some(connector_health))?;
+    let pending = PendingRunPublication::prepare();
+    let computed = compute_pipeline_run(
+        ingest,
+        &pending,
+        model_snapshot,
+        default_what_if,
+        connector_health,
+    )?;
+    computed.publish(pending, RunPublicationRoot::Nested(nested_root))
+}
+
+pub(crate) fn diagnose_ingest_with_nested_artifact_root_and_model_snapshot(
+    ingest: IngestResult,
+    nested_root: &StagedAtomicDirectory,
+    model_snapshot: &ModelBundleSnapshot,
+    default_what_if: Option<WhatIfRequest>,
+) -> Result<PipelineResult> {
+    let connector_health = validated_connector_health(&ingest, None)?;
+    diagnose_ingest_with_nested_artifact_root_and_model_snapshot_and_connector_health(
+        ingest,
+        nested_root,
+        model_snapshot,
+        default_what_if,
+        connector_health,
+    )
+}
+
+fn diagnose_ingest_with_authorized_model_snapshot(
+    ingest: IngestResult,
+    model_snapshot: &ModelBundleSnapshot,
+    default_what_if: Option<WhatIfRequest>,
+    connector_health: ConnectorHealthSnapshot,
+    capability: &ArtifactRootCapability,
+) -> Result<PipelineResult> {
+    let pending = PendingRunPublication::prepare();
+    let computed = compute_pipeline_run(
+        ingest,
+        &pending,
+        model_snapshot,
+        default_what_if,
+        connector_health,
+    )?;
+    with_artifact_root_capability(capability, |owned| {
+        computed.publish(pending, RunPublicationRoot::Owned(owned))
+    })
+}
+
+fn compute_pipeline_run(
+    ingest: IngestResult,
+    pending: &PendingRunPublication,
+    model_snapshot: &ModelBundleSnapshot,
+    default_what_if: Option<WhatIfRequest>,
+    connector_health: ConnectorHealthSnapshot,
+) -> Result<ComputedPipelineRun> {
+    let run_id = pending.run_id().to_string();
     let telemetry = summarize_ingest(&ingest, 5)?;
     let diagnosis_events = diagnose_rules(&telemetry, &run_id);
-    let ml_result = infer_with_quality_from_model_dir_with_policy(
+    let ml_result = infer_with_quality_from_model_bundle_snapshot(
         &telemetry.windows,
         &run_id,
-        model_dir,
+        model_snapshot,
         &telemetry.metric_provenance,
-        model_load_policy,
     )?;
     let comparison = compare_rule_ml(&diagnosis_events, &ml_result);
     let what_if = default_what_if
@@ -151,53 +282,7 @@ fn diagnose_ingest_with_whatif_and_model_dir_with_policy(
         what_if.clone(),
         &recommendations,
     );
-    let connector_health = connector_health_from_ingest(
-        "ingest",
-        &ingest.schema.sample,
-        &ingest.schema.sample,
-        &ingest,
-    );
-    let run_dir_path = run_dir(artifact_root, &run_id);
-    let temp_run_dir = runs_root.join(format!(".{run_id}.tmp"));
-    if temp_run_dir.exists() {
-        std::fs::remove_dir_all(&temp_run_dir).with_path(&temp_run_dir)?;
-    }
-    std::fs::create_dir_all(&temp_run_dir).with_path(&temp_run_dir)?;
-    let artifact_paths = PersistRun {
-        write_dir_path: &temp_run_dir,
-        run_id: &run_id,
-        ingest: &ingest,
-        telemetry: &telemetry,
-        diagnosis_events: &diagnosis_events,
-        ml_result: &ml_result,
-        what_if: what_if.as_ref(),
-        recommendations: &recommendations,
-        report: &report,
-        connector_health: &connector_health,
-    }
-    .persist()?;
-    let manifest = RunManifest {
-        run_id: run_id.clone(),
-        sample: ingest.schema.sample.clone(),
-        created_at: Utc::now(),
-        trace_rows: ingest.schema.rows,
-        artifact_paths,
-    };
-    save_json_atomic(temp_run_dir.join("manifest.json"), &manifest)?;
-    if run_dir_path.exists() {
-        std::fs::remove_dir_all(&run_dir_path).with_path(&run_dir_path)?;
-    }
-    std::fs::rename(&temp_run_dir, &run_dir_path).with_path(&run_dir_path)?;
-    update_run_index(
-        artifact_root,
-        &manifest,
-        &run_dir_path,
-        HilReviewSummary::from_recommendations(&recommendations)
-            .run_status()
-            .to_string(),
-    )?;
-
-    Ok(PipelineResult {
+    Ok(ComputedPipelineRun {
         run_id,
         ingest,
         telemetry,
@@ -208,120 +293,46 @@ fn diagnose_ingest_with_whatif_and_model_dir_with_policy(
         recommendations,
         report,
         connector_health,
-        run_dir: run_dir_path,
     })
 }
 
-fn update_run_index(
-    artifact_root: &Path,
-    manifest: &RunManifest,
-    run_dir_path: &Path,
-    status: String,
-) -> Result<()> {
-    let index_path = artifact_root.join("run_index.json");
-    let mut entries = if index_path.exists() {
-        serde_json::from_value::<Vec<RunIndexEntry>>(read_json(&index_path)?)?
-    } else {
-        Vec::new()
-    };
-    entries.retain(|entry| entry.run_id != manifest.run_id);
-    entries.insert(
-        0,
-        RunIndexEntry {
-            run_id: manifest.run_id.clone(),
-            sample: manifest.sample.clone(),
-            created_at: manifest.created_at,
-            status,
-            run_dir: stored_path(artifact_root, run_dir_path),
-        },
-    );
-    entries.truncate(50);
-    save_json_atomic(index_path, &entries)?;
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_RUN_INDEX_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_AFTER_RUN_PUBLICATION_JOURNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn fail_next_run_index_update() {
+    FAIL_NEXT_RUN_INDEX_UPDATE.with(|fail| fail.set(true));
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn fail_after_run_publication_journal() {
+    FAIL_AFTER_RUN_PUBLICATION_JOURNAL.with(|fail| fail.set(true));
+}
+
+fn maybe_fail_run_index_update() -> Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_RUN_INDEX_UPDATE.with(|fail| fail.replace(false)) {
+        return Err(NetdiagError::InvalidTrace(
+            "injected run index update failure".to_string(),
+        ));
+    }
     Ok(())
 }
 
-fn stored_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+#[cfg(test)]
+fn maybe_fail_after_run_publication_journal() -> Result<()> {
+    if FAIL_AFTER_RUN_PUBLICATION_JOURNAL.with(std::cell::Cell::take) {
+        return Err(NetdiagError::InvalidTrace(
+            "injected crash after run publication journal".to_string(),
+        ));
+    }
+    Ok(())
 }
 
-struct PersistRun<'a> {
-    write_dir_path: &'a Path,
-    run_id: &'a str,
-    ingest: &'a IngestResult,
-    telemetry: &'a TelemetrySummary,
-    diagnosis_events: &'a [DiagnosisEvent],
-    ml_result: &'a MlResult,
-    what_if: Option<&'a WhatIfResult>,
-    recommendations: &'a [Recommendation],
-    report: &'a Report,
-    connector_health: &'a ConnectorHealthSnapshot,
-}
-
-impl PersistRun<'_> {
-    fn persist(&self) -> Result<BTreeMap<String, String>> {
-        let mut paths = BTreeMap::new();
-        self.persist_artifact(
-            &mut paths,
-            "trace_schema",
-            "trace_schema.json",
-            &self.ingest.schema,
-        )?;
-        self.persist_artifact(
-            &mut paths,
-            "telemetry_summary",
-            "telemetry_summary.json",
-            self.telemetry,
-        )?;
-        self.persist_artifact(
-            &mut paths,
-            "telemetry_windows",
-            "telemetry_windows.json",
-            &self.telemetry.windows,
-        )?;
-        self.persist_artifact(
-            &mut paths,
-            "diagnosis_events",
-            "diagnosis_events.json",
-            self.diagnosis_events,
-        )?;
-        self.persist_artifact(&mut paths, "ml_result", "ml_result.json", self.ml_result)?;
-        if let Some(what_if) = self.what_if {
-            self.persist_artifact(
-                &mut paths,
-                "whatif_default",
-                &format!("whatif_{}.json", what_if.action_id),
-                what_if,
-            )?;
-        }
-        self.persist_artifact(
-            &mut paths,
-            "recommendations",
-            "recommendations.json",
-            self.recommendations,
-        )?;
-        self.persist_artifact(
-            &mut paths,
-            "connector_health",
-            "connector_health.json",
-            self.connector_health,
-        )?;
-        self.persist_artifact(&mut paths, "report", "report.json", self.report)?;
-        paths.insert("run_id".to_string(), self.run_id.to_string());
-        Ok(paths)
-    }
-
-    fn persist_artifact<T: Serialize + ?Sized>(
-        &self,
-        paths: &mut BTreeMap<String, String>,
-        key: &str,
-        file_name: &str,
-        value: &T,
-    ) -> Result<()> {
-        save_json_atomic(self.write_dir_path.join(file_name), value)?;
-        paths.insert(key.to_string(), file_name.to_string());
-        Ok(())
-    }
+#[cfg(not(test))]
+fn maybe_fail_after_run_publication_journal() -> Result<()> {
+    Ok(())
 }

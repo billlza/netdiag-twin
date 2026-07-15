@@ -1,9 +1,10 @@
-use super::{ModelPromotionGate, gate};
+use super::{MAX_CALIBRATION_AGE_DAYS, ModelPromotionGate, gate};
 use crate::lab::LabCalibrationReport;
 use crate::models::{FaultLabel, ModelManifest};
 use chrono::{Duration, Utc};
 
-const CALIBRATION_SCHEMA: &str = "netdiag-lab-calibration/v1";
+mod schema;
+use schema::calibration_schema_gate;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CalibrationGateOptions {
@@ -46,21 +47,6 @@ pub(super) fn calibration_gates(
     ]
 }
 
-fn calibration_schema_gate(report: &LabCalibrationReport) -> ModelPromotionGate {
-    gate(
-        "calibration_schema",
-        report.schema == CALIBRATION_SCHEMA,
-        if report.schema == CALIBRATION_SCHEMA {
-            "calibration schema is supported".to_string()
-        } else {
-            format!(
-                "unsupported calibration schema {}; expected {CALIBRATION_SCHEMA}",
-                report.schema
-            )
-        },
-    )
-}
-
 fn calibration_applied_gate(report: &LabCalibrationReport) -> ModelPromotionGate {
     gate(
         "calibration_applied",
@@ -85,7 +71,14 @@ fn calibration_freshness_gate(
             "calibration report timestamp is in the future",
         );
     }
-    let max_age = Duration::days(i64::try_from(max_age_days).unwrap_or(i64::MAX));
+    if !(1..=MAX_CALIBRATION_AGE_DAYS).contains(&max_age_days) {
+        return gate(
+            "calibration_freshness",
+            false,
+            "maximum calibration age exceeds the supported range",
+        );
+    }
+    let max_age = Duration::days(max_age_days as i64);
     gate(
         "calibration_freshness",
         age <= max_age,

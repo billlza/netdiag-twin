@@ -1,9 +1,12 @@
 target/
+.venv-jsonschema/
 __pycache__/
 *.pyc
 .DS_Store
 *.log
 *.tmp
+*.profraw
+*.profdata
 .env
 .env.*
 !.env.example
@@ -12,6 +15,10 @@ artifacts/cache/
 artifacts/model/
 target/netdiag-cli-*.json
 *.p12
+*.p8
+*.pfx
+*.pem
+*.key
 *.cer
 *.mobileprovision
 *.provisionprofile

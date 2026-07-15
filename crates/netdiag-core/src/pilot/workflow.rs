@@ -1,100 +1,14 @@
 use super::{
-    PilotOptions, PilotReport, PilotWorkflowOptions, PilotWorkflowPhase, PilotWorkflowPhaseStatus,
-    PilotWorkflowReport, PilotWorkflowVerificationOptions, preflight_pilot, run_pilot,
+    PilotReport, PilotWorkflowPhase, PilotWorkflowPhaseStatus, PilotWorkflowVerificationOptions,
 };
 use crate::error::Result;
 use crate::lab::{ActionVerificationOptions, verify_action_with_options};
 use crate::models::{ActionVerification, ActionVerificationVerdict};
-use chrono::Utc;
-use persistence::save_workflow_report;
 use std::path::Path;
 
-const PILOT_WORKFLOW_SCHEMA: &str = "netdiag-pilot-workflow/v1";
-
+mod entry;
 mod persistence;
-
-pub fn run_pilot_workflow(
-    path: impl AsRef<Path>,
-    options: PilotWorkflowOptions,
-) -> Result<PilotWorkflowReport> {
-    run_pilot_workflow_path(path.as_ref(), options)
-}
-
-fn run_pilot_workflow_path(
-    path: &Path,
-    options: PilotWorkflowOptions,
-) -> Result<PilotWorkflowReport> {
-    let pilot_options = PilotOptions {
-        artifacts: options.artifacts.clone(),
-        allow_active: options.allow_active,
-    };
-    let preflight = preflight_pilot(path, pilot_options.clone())?;
-    let mut phases = Vec::new();
-    phases.push(phase(
-        "preflight",
-        passed_or_failed(preflight.passed),
-        if preflight.passed {
-            "preflight passed"
-        } else {
-            "preflight failed"
-        },
-    ));
-
-    if !preflight.passed {
-        return Ok(PilotWorkflowReport {
-            schema: PILOT_WORKFLOW_SCHEMA.to_string(),
-            generated_at: Utc::now(),
-            pilot_id: preflight.pilot_id.clone(),
-            passed: false,
-            phases,
-            preflight: Some(preflight),
-            pilot_run: None,
-            verification: None,
-        });
-    }
-
-    phases.push(phase(
-        "collect",
-        PilotWorkflowPhaseStatus::Passed,
-        "sources collected through pilot connector contract",
-    ));
-    let pilot_run = run_pilot(path, pilot_options)?;
-    phases.push(phase(
-        "diagnose",
-        passed_or_failed(pilot_run.passed),
-        "primary source diagnosed and gated",
-    ));
-    phases.push(phase(
-        "evidence_bundle",
-        passed_or_failed(pilot_run.evidence_bundle.is_some()),
-        "portable evidence bundle exported",
-    ));
-    phases.push(phase(
-        "review",
-        PilotWorkflowPhaseStatus::Pending,
-        "human review is required before active remediation",
-    ));
-
-    let verification = workflow_verification(
-        &mut phases,
-        &pilot_run,
-        &options.artifacts,
-        options.verification,
-    )?;
-
-    let passed = workflow_passed(&pilot_run, &phases);
-    let report = PilotWorkflowReport {
-        schema: PILOT_WORKFLOW_SCHEMA.to_string(),
-        generated_at: Utc::now(),
-        pilot_id: pilot_run.pilot_id.clone(),
-        passed,
-        phases,
-        preflight: Some(preflight),
-        pilot_run: Some(pilot_run.clone()),
-        verification,
-    };
-    save_workflow_report(&pilot_run, &report).map(|()| report)
-}
+pub use entry::{run_pilot_workflow, run_pilot_workflow_with_bearer_bindings};
 
 fn workflow_verification(
     phases: &mut Vec<PilotWorkflowPhase>,

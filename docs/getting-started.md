@@ -1,10 +1,21 @@
 # Getting Started
 
-This guide describes the stable v0.5.2 platform contract for SRE and platform
+This guide describes the stable v0.5.3 platform contract for SRE and platform
 teams: how telemetry becomes canonical `TraceRecord` rows, how live adapters
 map into the same pipeline, how ML abstention is reported, and where diagnosis,
 what-if, post-action verification, recommendation, and human-review artifacts
 are written.
+
+### Platform mutation contract
+
+The v0.5.3 desktop release targets macOS, and crash-consistent artifact mutation
+currently requires the audited Unix directory durability boundary. Windows can
+inspect and validate datasets and read a complete existing model bundle, but it
+does not publish dataset splits/registrations, train or rebuild model bundles,
+apply HIL reviews, create new run directories, or clear run history containing
+run directories. Those operations fail with a typed `NotPublished` error before
+mutating their output hierarchy. This is an intentional fail-closed boundary,
+not an empty-result fallback.
 
 ## Quick Path
 
@@ -29,15 +40,60 @@ cargo run -p netdiag-cli -- evidence <run_id> --artifacts /tmp/netdiag-artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts /tmp/netdiag-artifacts
 ```
 
+Every v0.5.3 artifact root has a durable product-ownership marker. Commands that
+operate on an artifact root claim a new empty root automatically. Before a
+standalone command such as `train` writes a model subdirectory into a new root,
+initialize that empty root explicitly. Existing non-empty roots are never
+claimed implicitly:
+
+```bash
+cargo run -p netdiag-cli -- artifact-root initialize --artifacts /path/to/new-artifacts
+```
+
+To adopt a root created by an earlier release, stop every older writer and run
+the explicit migration once:
+
+```bash
+cargo run -p netdiag-cli -- artifact-root migrate --artifacts /path/to/artifacts
+```
+
+Migration accepts only a known artifact layout with a verifiable model, run,
+Lab, calibration, dataset registry, or legacy Lab feedback export. Unknown
+top-level entries, top-level links or reparse points, corrupt metadata, and
+roots without a verifiable product artifact are rejected before the ownership
+marker is published. Migration does not move, rewrite, or delete existing
+artifacts.
+
+Artifact-root migration deliberately does not make a flat v0.5.2
+`netdiag-model-manifest/v1` model readable. Runtime readers continue to reject
+v1. After claiming the root, replace that model through an explicit serialized
+writer, for example with a reviewed training dataset:
+
+```bash
+cargo run -p netdiag-cli -- train \
+  --dataset /path/to/training.jsonl \
+  --model-dir /path/to/artifacts/model
+```
+
+The desktop **Rebuild Model** action is another explicit writer, but it creates
+the deterministic synthetic smoke model rather than a production-trained
+model. A writer accepts only an exact, complete v0.5.2 pair, validates it under
+the model lock, preserves its exact model bytes in a hash-bound v2 generation,
+publishes the replacement through `current.json`, and only then removes the
+flat files. Do not delete or hand-edit the old pair; corrupt, extra, or
+ambiguous entries fail before staging.
+
 Run the core golden contract tests:
 
 ```bash
 cargo test -p netdiag-core --test golden
 ```
 
-Run the v0.5.2 reliability and benchmark gates:
+Run the v0.5.3 reliability and benchmark gates:
 
 ```bash
+python3 -m venv --clear --copies .venv-jsonschema
+.venv-jsonschema/bin/python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
 cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
   --output target/benchmark-report
@@ -46,7 +102,9 @@ cargo run -p netdiag-cli -- reliability check \
 ```
 
 `benchmark_report.json` is the CI-facing contract; `benchmark_report.md` is the
-human review artifact for release notes, mentor review, and lab handoff.
+human review artifact for release notes, mentor review, and lab handoff. This
+Quick Path provisions the deterministic smoke model; model-promotion workflows
+must instead calibrate first and pass the candidate model with `--model-dir`.
 
 ## Canonical Trace Schema
 
@@ -124,14 +182,27 @@ NETDIAG_API_TOKEN="optional bearer token" \
 cargo run -p netdiag-cli -- collect \
   --kind http-json \
   --endpoint https://example.internal/netdiag/trace \
+  --bearer-token-env NETDIAG_API_TOKEN \
   --diagnose
 ```
 
 The response should include `sample`, `protocol`, `flow_count`, canonical
 `records`, and an `experiment` object with `scenario_id`, `fault_start`,
 `fault_end`, and `ground_truth`. Diagnosis uses only the canonical records;
-lab evidence keeps the metadata for reproducibility. Tokens are read from
-`NETDIAG_API_TOKEN` in CLI mode and from Settings/Keychain in the app.
+lab evidence keeps the metadata for reproducibility. The CLI reads the named
+variable only because this invocation supplies `--bearer-token-env`; omitting
+the flag authorizes no environment lookup. The app uses Keychain credentials
+scoped to the exact source profile, connector kind, and canonical origin, with
+no process-wide token fallback.
+
+Authenticated HTTP/JSON and Prometheus endpoints must use HTTPS, except for
+plain HTTP addressed by a literal loopback IP (`127.0.0.1` or `[::1]`). A
+`localhost` hostname is not accepted for this exception. These clients do not
+follow redirects; a `3xx` response fails explicitly. Do not put tokens, API
+keys, passwords, secrets, or authorization values in endpoint query strings:
+credential-like query keys are rejected case-insensitively before requests or
+settings persistence. Use the dedicated bearer-token environment/Keychain
+boundary instead.
 
 ## Prometheus Mapping
 
@@ -178,7 +249,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.5.2 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.5.3 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -197,10 +268,25 @@ Prometheus mapping. Keep units explicit before they reach NetDiag:
 latency and jitter in milliseconds, throughput in Mbps, loss/retransmission in
 percent, and QUIC blocked state as a `0.0..1.0` ratio.
 
+The receiver is intentionally local-only: both IPv4 and IPv6 loopback addresses
+are accepted, while wildcard and non-loopback binds are rejected before server
+startup because this endpoint has no remote authentication mode. Each decoded
+gRPC message is limited to 1 MiB and then validated for bounded resource,
+scope, metric, datapoint, attribute, nesting, and string shapes. Accepted
+exports are immediately reduced to compact mapped numeric frames; raw OTLP
+requests are never retained. The session buffer is fail-closed at 256 frames
+and 64 KiB of retained queue memory, so capacity exhaustion returns a gRPC
+resource-exhausted error without evicting earlier evidence.
+
 ## pcap And Native Capture
 
-NetDiag v0.5.2 includes Rust-native packet capture support through `pcap` and
-`etherparse`. It can read a `.pcap` file or capture from a live interface.
+NetDiag v0.5.3 includes Rust-native packet capture support through `pcap` and
+`etherparse`. It can read a classic `.pcap` file or capture from a live
+interface. File imports reject pcapng, symbolic links/reparse points, unstable
+files, unsupported link types, malformed timestamps, truncated packet bodies,
+and snapshots larger than 16 MiB. Convert pcapng inputs to classic pcap before
+import. The same whole-operation deadline covers the stable file snapshot and
+every parsed packet, so timeout or cancellation never returns partial success.
 Live capture on macOS may require packet-capture permission or elevated
 privileges; when that is unavailable, file import is the stable path.
 
@@ -223,15 +309,26 @@ packet capture alone, such as end-to-end packet loss or QUIC policy blocking,
 are recorded as warnings with fallback values rather than presented as measured
 facts.
 
-Local and website probes in the desktop app are active probes, not packet
-capture. They record warnings for metrics they cannot observe directly instead
-of silently inventing data.
+All native pcap entry points use the same packet bound: `packet_limit` must be
+between 1 and 10000. Values outside that range fail before source access.
+
+Local and website probes are Core active-probe connectors, not packet capture.
+Website targets are validated before network access: HTTP schemes must be
+lowercase, redirects and environment proxies are disabled, URL credentials,
+fragments, sensitive queries, and hostname-only TCP targets are rejected. Raw
+TCP targets must be explicit IP socket addresses. Work is bounded by a fixed
+16-request concurrency ceiling, per-request timeouts, a whole-run deadline, and
+a bounded result queue. Samples for one target remain sequential; jitter is the
+absolute latency change from that target's previous sample, with an explicit
+zero fallback for the first sample. Metrics the probe cannot observe are marked
+with fallback provenance instead of being silently invented.
 
 ## System Counters
 
 On macOS, the system counters connector samples `netstat -ibn` before and after
 a short interval and converts interface byte/error deltas into throughput and
-drop evidence.
+drop evidence. `interval_secs` must be between 1 and 10; invalid values fail
+before platform access and are never clamped.
 
 ```bash
 cargo run -p netdiag-cli -- collect \
@@ -304,19 +401,27 @@ Lab scenarios are YAML files with a stable `netdiag-lab-scenario/v1` schema.
 They bind a primary data source, optional corroborating sources, topology,
 policy, collection windows, and acceptance gates.
 
+Collection inputs are validated before any I/O: `timeout_secs` is 1–300,
+`lookback_secs` is 1–86400, `step_secs` is 1–3600 and cannot exceed the
+lookback, `packet_limit` is 1–10000, and `interval_secs` is 1–10. Values
+outside those bounds fail explicitly instead of being clamped at runtime.
+
 ```bash
 cargo run -p netdiag-cli -- train \
   --dataset examples/datasets/pilot-smoke-training.jsonl \
   --model-dir artifacts/model \
   --validation-split 0 \
   --min-rows-per-label 1
-shasum -a 256 artifacts/model/model_manifest.json artifacts/model/rust_logistic_model.json
-cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
+generation="$(jq -r '.generation' artifacts/model/current.json)"
+shasum -a 256 \
+  "artifacts/model/generations/$generation/model_manifest.json" \
+  "artifacts/model/generations/$generation/rust_logistic_model.json"
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab preflight examples/scenarios/lab-congestion-001.yaml --mode live
 cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
 cargo run -p netdiag-cli -- lab validate <run_id> \
   --artifacts artifacts
+cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 ```
 
 Preflight defaults to `--mode static`, which validates scenario schema,
@@ -347,8 +452,8 @@ so the scenario does not pretend an unknown failure is one of the six known
 labels.
 
 Run `lab calibrate` after collecting accepted lab runs from representative
-equipment. It derives thresholds from accepted known/OOD runs and writes
-`artifacts/model/model_manifest.json` only when the corpus covers every known
+equipment. It derives thresholds from accepted known/OOD runs and publishes a
+new immutable model generation only when the corpus covers every known
 label plus at least one explicit OOD run. Low-coverage calibration still returns
 a report, but `applied` stays `false` so provisional thresholds do not masquerade
 as lab-grade. The report includes per-label accuracy, known/uncertain/OOD status
@@ -381,11 +486,15 @@ Pilot manifests use `netdiag-pilot/v1` and are intentionally separate from Lab
 scenario acceptance. A pilot inventories real or mock device sources, enforces a
 read-only default, runs the primary source through the normal diagnosis
 pipeline, stores connector health, and writes `pilot_report.json` with redacted
-source metadata.
+source metadata and the published evidence manifest. The bundle hashes the
+separate immutable `pilot_evidence_report.json` payload under the archive name
+`pilot_report.json`, avoiding a recursive self-hash.
 
 Start with the CI-safe mock pilot:
 
 ```bash
+cargo run -p netdiag-cli -- artifact-root initialize \
+  --artifacts target/pilot-artifacts
 cargo run -p netdiag-cli -- train \
   --dataset examples/datasets/pilot-smoke-training.jsonl \
   --model-dir target/pilot-artifacts/model \
@@ -394,7 +503,8 @@ cargo run -p netdiag-cli -- train \
 cargo run -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
   --artifacts target/pilot-artifacts
 cargo run -p netdiag-cli -- pilot run examples/pilots/loopback-mock.yaml \
-  --artifacts target/pilot-artifacts
+  --artifacts target/pilot-artifacts \
+  --allow-adapter-execution
 ```
 
 The generic lab-kit example shows the intended real-device shape with
@@ -436,7 +546,15 @@ Each lab run writes:
 
 The zip bundle includes the nested pipeline artifacts plus top-level lab
 `acceptance.json`, `comparison.json`, `multi_source_evidence.json`, aggregate
-`connector_health.json`, and `scenario.yaml`.
+`connector_health.json`, and `scenario.yaml`. Lab export fails atomically if any
+of those required files is missing or changes while its bounded immutable
+snapshot is being captured. All archived files and topology derived from
+`report.json` are read from that one snapshot generation.
+
+The generic `evidence-bundle` command uses the explicit plain context: contextual
+Lab or Pilot files are not guessed from nearby marker files. Plain bundles contain
+manifest-declared run artifacts and only caller-requested extras; requested extras
+remain required and never degrade into optional files.
 
 Validate topology and policy files before adding them to a scenario:
 
@@ -525,6 +643,25 @@ cargo run -p netdiag-cli -- dataset split artifacts/datasets/feedback.jsonl \
   --stratified \
   --seed 2026
 ```
+
+A split directory belongs to exactly one immutable split transaction. NetDiag
+publishes `.dataset-split-transaction.json` before any partition and retains it
+as provenance after completion. A matching retry can verify and reuse owned
+partitions after a crash; a different input, algorithm, seed, ratio, or mode is
+rejected without replacing files. When `dataset_manifest.json` already exists,
+the retry is successful only if that complete manifest and every partition
+exactly match the receipt; the returned report retains the originally committed
+`created_at`, and the retry re-syncs the commit directory before succeeding.
+Missing or changed committed files are reported and never recreated. Do not
+delete the receipt by itself. Use a new empty output directory for another
+split, or remove the entire incomplete directory when you
+deliberately abandon that transaction.
+
+`dataset split` and `dataset register` require Unix directory `fsync` semantics
+in v0.5.3. Windows supports the read-only `inspect`, `validate`, and `compare`
+commands; mutation commands fail before creating the requested output path. The
+bundled benchmark's trusted Python schema-validation subprocess is Unix-only and
+fails explicitly on Windows before spawning a validator.
 
 ## Human-In-The-Loop Review
 

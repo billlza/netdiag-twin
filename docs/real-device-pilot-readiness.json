@@ -1,0 +1,16 @@
+{
+  "schema": "netdiag-real-device-pilot-readiness/v1",
+  "status": "pending_lab_access",
+  "real_device_validation": "not_validated",
+  "real_device_release_claim_eligible": false,
+  "blocking_reason": "lab_device_access_unavailable",
+  "last_reviewed": "2026-06-18",
+  "validated_evidence_manifest": null,
+  "required_evidence_before_claim": [
+    "pilot preflight report from a real lab manifest",
+    "pilot workflow report with a real after-run verification",
+    "connector_health.json from real device sources",
+    "evidence bundle manifest with SHA-256 file hashes",
+    "model promotion gate report matching the promoted model and calibration artifacts"
+  ]
+}

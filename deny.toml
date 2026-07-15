@@ -1,12 +1,6 @@
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-    # Transitive through linfa-logistic -> argmin. Keep this explicit so the
-    # release gate still surfaces the ML-stack replacement work. Owner, expiry,
-    # and removal plan are enforced by scripts/check_deny_waivers.py.
-    "RUSTSEC-2024-0436",
-]
 
 [licenses]
 version = 2

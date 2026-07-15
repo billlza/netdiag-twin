@@ -4,9 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-fast}"
 COVERAGE_MIN="${NETDIAG_COVERAGE_MIN:-90}"
-WORKSPACE_COVERAGE_MIN="${NETDIAG_WORKSPACE_COVERAGE_MIN:-55}"
+WORKSPACE_COVERAGE_MIN="${NETDIAG_WORKSPACE_COVERAGE_MIN:-79.5}"
+APP_SECURITY_COVERAGE_MIN="${NETDIAG_APP_SECURITY_COVERAGE_MIN:-80}"
+APP_SECURITY_FILE_COVERAGE_MIN="${NETDIAG_APP_SECURITY_FILE_COVERAGE_MIN:-50}"
 STRICT_COVERAGE_FLOOR="90"
-STRICT_WORKSPACE_COVERAGE_FLOOR="55"
+STRICT_WORKSPACE_COVERAGE_FLOOR="79.5"
+STRICT_APP_SECURITY_COVERAGE_FLOOR="80"
+STRICT_APP_SECURITY_FILE_COVERAGE_FLOOR="50"
 
 cd "$ROOT"
 
@@ -27,11 +31,12 @@ require_cargo_subcommand() {
 }
 
 schema_python() {
-  if [[ -x .venv-jsonschema/bin/python ]]; then
-    echo ".venv-jsonschema/bin/python"
-  else
-    echo "python3"
+  local interpreter=".venv-jsonschema/bin/python"
+  if [[ ! -f "$interpreter" || -L "$interpreter" || ! -x "$interpreter" ]]; then
+    echo "missing trusted schema Python: recreate it with 'python3 -m venv --clear --copies .venv-jsonschema' and install requirements-jsonschema.lock with --require-hashes and --only-binary=:all:" >&2
+    return 2
   fi
+  printf '%s\n' "$interpreter"
 }
 
 run_adapter_contracts() {
@@ -39,6 +44,35 @@ run_adapter_contracts() {
   python="$(schema_python)"
   "$python" scripts/validate_adapter_samples.py
   "$python" scripts/validate_adapter_contract.py
+}
+
+run_python_quality_guards() {
+  local python
+  python="$(schema_python)"
+  "$python" -W error::ResourceWarning scripts/test_quality_guards.py
+}
+
+run_patch_contracts() {
+  cargo metadata --locked --offline --no-deps --format-version 1 \
+    --manifest-path third_party/argmin-0.11.0/Cargo.toml >/dev/null
+  cargo metadata --locked --offline --no-deps --format-version 1 \
+    --manifest-path third_party/wayland-scanner-0.31.10/Cargo.toml >/dev/null
+  cargo test --locked --offline \
+    --target-dir target/patch-contracts/wayland-scanner-upstream \
+    --manifest-path third_party/wayland-scanner-0.31.10/Cargo.toml \
+    --all-targets --all-features
+  cargo clippy --locked --offline \
+    --target-dir target/patch-contracts/wayland-scanner-upstream \
+    --manifest-path third_party/wayland-scanner-0.31.10/Cargo.toml \
+    --all-targets --all-features -- -D warnings
+  cargo test --locked -p netdiag-argmin-patch-contract \
+    --all-targets --all-features
+  cargo clippy --locked -p netdiag-argmin-patch-contract \
+    --all-targets --all-features -- -D warnings
+  cargo test --locked -p netdiag-wayland-scanner-patch-contract \
+    --all-targets --all-features
+  cargo clippy --locked -p netdiag-wayland-scanner-patch-contract \
+    --all-targets --all-features -- -D warnings
 }
 
 run_cargo_deny_clean() {
@@ -96,113 +130,183 @@ PY
 }
 
 run_pilot_smoke() {
-  cargo run --quiet -p netdiag-cli -- train \
-    --dataset examples/datasets/pilot-smoke-training.jsonl \
-    --model-dir target/pilot-artifacts/model \
-    --validation-split 0 \
-    --min-rows-per-label 1
-  cargo run --quiet -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
-    --artifacts target/pilot-artifacts
-  local after_run_id
-  after_run_id="$(
-    cargo run --quiet -p netdiag-cli -- diagnose data/samples/normal.csv \
-      --artifacts target/pilot-artifacts \
-      | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])'
-  )"
-  cargo run --quiet -p netdiag-cli -- pilot workflow examples/pilots/loopback-mock.yaml \
-    --artifacts target/pilot-artifacts \
-    --after-run-id "$after_run_id"
-  python3 - <<'PY'
+  (
+  umask 077
+  mkdir -p "$ROOT/target"
+
+  local workspace
+  local artifacts
+  local scenarios
+  local training_dataset
+  local benchmark_artifacts
+  local benchmark_report
+  workspace="$(mktemp -d "$ROOT/target/pilot-smoke.XXXXXX")"
+  artifacts="$workspace/artifacts"
+  scenarios="$workspace/scenarios"
+  training_dataset="$workspace/input/pilot-smoke-training-expanded.jsonl"
+  benchmark_artifacts="$workspace/benchmark-artifacts"
+  benchmark_report="$workspace/benchmark-report"
+
+  cleanup_pilot_smoke() {
+    local status=$?
+    trap - EXIT HUP INT TERM
+    if (( status != 0 )); then
+      echo "failed pilot smoke workspace preserved for diagnosis: $workspace" >&2
+      exit "$status"
+    fi
+    if [[ "$workspace" != "$ROOT"/target/pilot-smoke.?????? \
+      || ! -d "$workspace" \
+      || -L "$workspace" \
+      || ! -f "$artifacts/.netdiag-artifact-root.json" \
+      || -L "$artifacts/.netdiag-artifact-root.json" ]]; then
+      echo "refusing to clean an unverified pilot smoke workspace: $workspace" >&2
+      exit 1
+    fi
+    if ! rm -rf -- "$workspace"; then
+      echo "failed to remove successful pilot smoke workspace: $workspace" >&2
+      exit 1
+    fi
+    exit 0
+  }
+  trap cleanup_pilot_smoke EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  mkdir -p "$artifacts" "$scenarios" "$(dirname "$training_dataset")"
+  cargo run --locked --quiet -p netdiag-cli -- artifact-root initialize \
+    --artifacts "$artifacts"
+  PILOT_SMOKE_WORKSPACE="$workspace" python3 - <<'PY'
 from __future__ import annotations
 
-import hashlib
 import json
-from datetime import datetime, timezone
+import os
 from pathlib import Path
 
-artifacts = Path("target/pilot-artifacts")
-model_dir = artifacts / "model"
-manifest_path = model_dir / "model_manifest.json"
-model_path = model_dir / "rust_logistic_model.json"
-manifest = json.loads(manifest_path.read_text())
-thresholds = manifest.get("uncertainty_thresholds")
-if not thresholds:
-    raise SystemExit("pilot smoke model manifest is missing uncertainty_thresholds")
-
-labels = [
-    "normal",
-    "congestion",
-    "random_loss",
-    "dns_failure",
-    "tls_failure",
-    "udp_quic_blocked",
-]
-per_label = {
-    label: {
-        "runs": 1,
-        "accepted_known_runs": 1,
-        "rule_correct": 1,
-        "ml_correct": 1,
-        "rule_accuracy": 1.0,
-        "ml_accuracy": 1.0,
-        "known_rate": 1.0,
-        "uncertain_rate": 0.0,
-        "out_of_distribution_rate": 0.0,
-    }
-    for label in labels
-}
-report = {
-    "schema": "netdiag-lab-calibration/v1",
-    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "artifact_root": str(artifacts),
-    "model_manifest_path": str(manifest_path),
-    "model_manifest_hash_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-    "model_file_hash_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
-    "dataset_hash_sha256": manifest.get("dataset_hash_sha256"),
-    "evaluated_runs": len(labels) + 1,
-    "known_runs": len(labels),
-    "uncertain_runs": 0,
-    "out_of_distribution_runs": 1,
-    "skipped_runs": 0,
-    "per_label": per_label,
-    "ood": {
-        "expected_ood_runs": 1,
-        "expected_known_runs": len(labels),
-        "false_positive_runs": 0,
-        "false_negative_runs": 0,
-        "false_positive_rate": 0.0,
-        "false_negative_rate": 0.0,
-    },
-    "rule_ml_disagreement_hotspots": [],
-    "feature_distance_distribution": {
-        "count": len(labels) + 1,
-        "p50": 1.0,
-        "p95": 2.0,
-        "max": 3.0,
-    },
-    "suggested_rule_thresholds": {},
-    "applied": True,
-    "calibrated_thresholds": thresholds,
-    "warnings": [],
-}
-(artifacts / "lab_calibration_report.json").write_text(json.dumps(report, indent=2) + "\n")
+source = Path("examples/datasets/pilot-smoke-training.jsonl")
+output = Path(os.environ["PILOT_SMOKE_WORKSPACE"]) / "input/pilot-smoke-training-expanded.jsonl"
+with source.open() as handle, output.open("w") as out:
+    for line in handle:
+        row = json.loads(line)
+        for idx in range(6):
+            cloned = json.loads(json.dumps(row))
+            features = cloned.get("features", {})
+            for name in ("latency_mean", "latency_p95", "jitter_std"):
+                if name in features:
+                    features[name] = round(float(features[name]) + (idx * 0.01), 4)
+            out.write(json.dumps(cloned, separators=(",", ":")) + "\n")
 PY
-  cargo run --quiet -p netdiag-cli -- pilot model-gate \
-    --model-dir target/pilot-artifacts/model \
-    --benchmark-report target/benchmark-report/benchmark_report.json \
-    --calibration-report target/pilot-artifacts/lab_calibration_report.json \
-    --min-rows-per-label 1 \
-    --allow-missing-evaluation
+  cargo run --locked --quiet -p netdiag-cli -- train \
+    --dataset "$training_dataset" \
+    --model-dir "$artifacts/model" \
+    --validation-split 0.34 \
+    --stratified \
+    --min-rows-per-label 1
+  cargo run --locked --quiet -p netdiag-cli -- pilot preflight examples/pilots/loopback-mock.yaml \
+    --artifacts "$artifacts"
+  local after_run_id
+  after_run_id="$(
+    cargo run --locked --quiet -p netdiag-cli -- diagnose data/samples/normal.csv \
+      --artifacts "$artifacts" \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["run_id"])'
+  )"
+  cargo run --locked --quiet -p netdiag-cli -- pilot workflow examples/pilots/loopback-mock.yaml \
+    --artifacts "$artifacts" \
+    --allow-adapter-execution \
+    --after-run-id "$after_run_id"
+  PILOT_SMOKE_WORKSPACE="$workspace" python3 - <<'PY'
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+workspace = Path(os.environ["PILOT_SMOKE_WORKSPACE"])
+scenarios = workspace / "scenarios"
+sample_root = Path.cwd() / "data/samples"
+known = [
+    ("normal", "normal.csv"),
+    ("congestion", "congestion.csv"),
+    ("random_loss", "random_loss.csv"),
+    ("dns_failure", "dns_failure.csv"),
+    ("tls_failure", "tls_failure.csv"),
+    ("udp_quic_blocked", "udp_quic_blocked.csv"),
+]
+for label, sample in known:
+    endpoint = Path(os.path.relpath(sample_root / sample, scenarios)).as_posix()
+    (scenarios / f"{label}.yaml").write_text(
+        f"""schema: netdiag-lab-scenario/v1
+id: smoke-{label}
+name: Smoke {label}
+expected_label: {label}
+data_sources:
+  - name: {label}
+    role: primary
+    kind: trace-file
+    endpoint: {endpoint}
+acceptance:
+  expected_root_cause: {label}
+  min_rule_confidence: 0.0
+  min_ml_probability: 0.0
+  require_rule_ml_agreement: false
+  require_what_if_improvement: false
+""",
+    )
+ood_endpoint = Path(
+    os.path.relpath(sample_root / "ood_mtu_blackhole.csv", scenarios)
+).as_posix()
+(scenarios / "ood.yaml").write_text(
+    f"""schema: netdiag-lab-scenario/v1
+id: smoke-ood
+name: Smoke OOD
+data_sources:
+  - name: ood
+    role: primary
+    kind: trace-file
+    endpoint: {ood_endpoint}
+acceptance:
+  min_ml_probability: 0.0
+  allowed_diagnosis_statuses:
+    - uncertain
+    - out_of_distribution
+  require_rule_ml_agreement: false
+  require_what_if_improvement: false
+""",
+)
+PY
+  for scenario in "$scenarios"/*.yaml; do
+    cargo run --locked --quiet -p netdiag-cli -- lab run "$scenario" \
+      --artifacts "$artifacts"
+  done
+  cargo run --locked --quiet -p netdiag-cli -- lab calibrate \
+    --artifacts "$artifacts"
+  cargo run --locked --quiet --release -p netdiag-cli -- benchmark run \
+    --artifacts "$benchmark_artifacts" \
+    --output "$benchmark_report" \
+    --model-dir "$artifacts/model"
+  cargo run --locked --quiet -p netdiag-cli -- pilot model-gate \
+    --model-dir "$artifacts/model" \
+    --benchmark-report "$benchmark_report/benchmark_report.json" \
+    --calibration-report "$artifacts/lab_calibration_report.json" \
+    --min-rows-per-label 1
+  cleanup_pilot_smoke
+  )
 }
 
 run_fast() {
   cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets -- -D warnings
-  cargo test --workspace
-  RUSTFLAGS="-D warnings" cargo test --workspace
+  cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+  RUSTFLAGS="-D warnings" cargo test --locked --workspace --all-features
+  run_python_quality_guards
+  python3 scripts/check_workspace_publish_policy.py
+  python3 scripts/check_patch_contract_hygiene.py
+  run_patch_contracts
   run_adapter_contracts
+  python3 scripts/check_release_gate_hygiene.py
+  python3 scripts/check_docs_workflow_hygiene.py
+  python3 scripts/check_real_device_readiness.py
   python3 scripts/check_complexity.py
   scripts/check_architecture_guard.sh
+  python3 scripts/check_architecture_guard_sanity.py
   scripts/check_perf_budget.sh
 }
 
@@ -215,37 +319,103 @@ run_strict() {
 
   local coverage_min
   local workspace_coverage_min
+  local app_security_coverage_min
+  local app_security_file_coverage_min
   coverage_min="$(strict_floor "$COVERAGE_MIN" "$STRICT_COVERAGE_FLOOR" NETDIAG_COVERAGE_MIN)"
   workspace_coverage_min="$(strict_floor "$WORKSPACE_COVERAGE_MIN" "$STRICT_WORKSPACE_COVERAGE_FLOOR" NETDIAG_WORKSPACE_COVERAGE_MIN)"
+  app_security_coverage_min="$(strict_floor "$APP_SECURITY_COVERAGE_MIN" "$STRICT_APP_SECURITY_COVERAGE_FLOOR" NETDIAG_APP_SECURITY_COVERAGE_MIN)"
+  app_security_file_coverage_min="$(strict_floor "$APP_SECURITY_FILE_COVERAGE_MIN" "$STRICT_APP_SECURITY_FILE_COVERAGE_FLOOR" NETDIAG_APP_SECURITY_FILE_COVERAGE_MIN)"
 
   cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets -- -D warnings
-  cargo nextest run --workspace --lib --bins --tests
-  RUSTFLAGS="-D warnings" cargo nextest run --workspace --lib --bins --tests
-  cargo llvm-cov clean --workspace
-  cargo llvm-cov nextest --workspace --exclude netdiag-app --lib --bins --tests \
+  cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+  RUSTFLAGS="-D warnings" cargo nextest run --locked --workspace --all-features --lib --bins --tests
+  cargo test --locked -p netdiag-core --bench perf_budget --all-features
+  run_python_quality_guards
+  python3 scripts/check_workspace_publish_policy.py
+  python3 scripts/check_patch_contract_hygiene.py
+  run_patch_contracts
+  python3 scripts/check_complexity.py
+  scripts/check_architecture_guard.sh
+  python3 scripts/check_architecture_guard_sanity.py
+  python3 scripts/check_release_gate_hygiene.py
+  local coverage_dir
+  local coverage_target_dir
+  local coverage_summary
+  local app_security_coverage_summary
+  mkdir -p "$ROOT/target"
+  coverage_dir="$(mktemp -d "$ROOT/target/netdiag-llvm-cov.XXXXXX")"
+  coverage_target_dir="$coverage_dir/cargo-target"
+  coverage_summary="$coverage_dir/summary.json"
+  app_security_coverage_summary="$coverage_dir/app-security-summary.json"
+  CARGO_TARGET_DIR="$coverage_target_dir" cargo llvm-cov clean --workspace || {
+    echo "strict coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+    return 1
+  }
+  LLVM_PROFILE_FILE_NAME="netdiag-%m-%p.profraw" CARGO_TARGET_DIR="$coverage_target_dir" cargo llvm-cov nextest --locked \
+    -p netdiag-core -p netdiag-cli -p netdiag-platform --all-features --lib --bins --tests \
     --test-threads 1 \
     --summary-only \
     --json \
-    --output-path target/llvm-cov-workspace-summary.json
+    --output-path "$coverage_summary" || {
+      echo "strict coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+      return 1
+    }
   python3 scripts/check_coverage_summary.py \
-    --summary target/llvm-cov-workspace-summary.json \
+    --summary "$coverage_summary" \
+    --dep-info-dir "$coverage_target_dir/llvm-cov-target/debug/deps" \
     --critical-min "$coverage_min" \
-    --workspace-min "$workspace_coverage_min"
+    --workspace-min "$workspace_coverage_min" || {
+      echo "strict coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+      return 1
+    }
+  LLVM_PROFILE_FILE_NAME="netdiag-%m-%p.profraw" CARGO_TARGET_DIR="$coverage_target_dir" cargo llvm-cov nextest --locked \
+    -p netdiag-app --all-features --lib --bins --tests \
+    --test-threads 1 \
+    --summary-only \
+    --json \
+    --output-path "$app_security_coverage_summary" || {
+      echo "strict app security coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+      return 1
+    }
+  python3 scripts/check_app_security_coverage.py \
+    --summary "$app_security_coverage_summary" \
+    --dep-info-dir "$coverage_target_dir/llvm-cov-target/debug/deps" \
+    --aggregate-min "$app_security_coverage_min" \
+    --file-min "$app_security_file_coverage_min" || {
+      echo "strict app security coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+      return 1
+    }
+  cp "$coverage_summary" "$coverage_dir/validated-summary.json" || {
+    echo "strict coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+    return 1
+  }
+  cp "$app_security_coverage_summary" "$coverage_dir/validated-app-security-summary.json" || {
+    echo "strict app security coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+    return 1
+  }
+  mv "$coverage_dir/validated-app-security-summary.json" target/llvm-cov-app-security-summary.json || {
+    echo "strict app security coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+    return 1
+  }
+  mv "$coverage_dir/validated-summary.json" target/llvm-cov-workspace-summary.json || {
+    echo "strict coverage artifacts preserved for diagnosis: $coverage_dir" >&2
+    return 1
+  }
+  if ! rm -rf "$coverage_dir"; then
+    echo "failed to remove successful strict coverage work directory: $coverage_dir" >&2
+    return 1
+  fi
   run_cargo_deny_clean
   python3 scripts/check_deny_waivers.py
   cargo machete
   python3 scripts/check_pilot_cli_wiring.py
+  python3 scripts/check_docs_workflow_hygiene.py
+  python3 scripts/check_real_device_readiness.py
   run_adapter_contracts
-  python3 scripts/check_complexity.py
-  scripts/check_architecture_guard.sh
   scripts/check_perf_budget.sh
-  cargo run --quiet --release -p netdiag-cli -- benchmark run \
-    --artifacts target/benchmark-artifacts \
-    --output target/benchmark-report
   run_pilot_smoke
   if [[ "${NETDIAG_RUN_MIRI:-0}" == "1" ]]; then
-    cargo miri test --workspace
+    cargo miri test --locked --workspace
   fi
 }
 

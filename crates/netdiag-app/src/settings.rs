@@ -1,27 +1,48 @@
 use crate::data_source::SimScenario;
-use crate::secrets::SecretStore;
 use anyhow::{Context, Result, bail};
-use netdiag_core::connectors::default_prometheus_mapping;
+use netdiag_core::connectors::{
+    LocalProbeConfig, WebsiteProbeConfig, default_prometheus_mapping,
+    validate_http_connector_bearer_endpoint, validate_prometheus_query_window,
+};
 use netdiag_core::models::TopologyModel;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::fmt;
+#[cfg(test)]
 use std::fs;
-use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+mod bearer_credentials;
+mod credential_cleanup;
+mod debug;
+mod environment;
+mod otlp;
+mod store;
+mod validation;
+pub(crate) use bearer_credentials::LEGACY_LIVE_API_SCOPE_ID;
+pub use bearer_credentials::{
+    BearerCredentialBinding, BearerCredentialOwner, BearerCredentialState,
+};
+pub use credential_cleanup::CredentialCleanupJournal;
+use environment::{first_non_empty, read_api_environment};
+pub use otlp::OtlpGrpcSettings;
+pub use store::{SettingsLoadOutcome, SettingsLoadState, SettingsStore, SettingsVerificationError};
+use validation::validate_settings;
 
 pub const APP_SUPPORT_DIR: &str = "NetDiag Twin";
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const NETDIAG_API_URL_ENV: &str = "NETDIAG_API_URL";
-pub const NETDIAG_API_TOKEN_ENV: &str = "NETDIAG_API_TOKEN";
 pub const NETDIAG_API_TIMEOUT_SECONDS_ENV: &str = "NETDIAG_API_TIMEOUT_SECONDS";
 pub const DEFAULT_API_TIMEOUT_SECS: u64 = 8;
+const MAX_SETTINGS_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppSettings {
+    #[serde(default)]
+    #[doc(hidden)]
+    pub settings_generation: u64,
     #[serde(default)]
     pub language: LanguageSetting,
     #[serde(default)]
@@ -34,6 +55,10 @@ pub struct AppSettings {
     pub api: ApiSettings,
     #[serde(default)]
     pub data_connectors: DataConnectorsSettings,
+    #[serde(default)]
+    pub bearer_credentials: Vec<BearerCredentialBinding>,
+    #[serde(default)]
+    pub credential_cleanup: CredentialCleanupJournal,
     #[serde(default = "default_artifacts_root")]
     pub artifacts_root: PathBuf,
     #[serde(default)]
@@ -45,12 +70,15 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            settings_generation: 0,
             language: LanguageSetting::default(),
             default_source: DefaultSource::default(),
             last_imported_trace: None,
             simulation_scenario: SimScenario::Congestion,
             api: ApiSettings::default(),
             data_connectors: DataConnectorsSettings::default(),
+            bearer_credentials: Vec::new(),
+            credential_cleanup: CredentialCleanupJournal::default(),
             artifacts_root: default_artifacts_root(),
             what_if: WhatIfSettings::default(),
             startup: StartupSettings::default(),
@@ -61,23 +89,14 @@ impl Default for AppSettings {
 impl AppSettings {
     #[cfg(test)]
     pub fn load_from_path(path: impl Into<PathBuf>) -> Result<Self> {
-        let store = SettingsStore::new(path.into());
-        match store.load() {
-            Ok(settings) => Ok(settings),
-            Err(err) if err.to_string().contains("not valid JSON") => Ok(Self::default()),
-            Err(err) => Err(err),
-        }
+        SettingsStore::new(path.into()).load()
     }
 
-    pub fn api_config(&self, secrets: &dyn SecretStore) -> Result<ApiConfig> {
-        self.api_config_with_env(secrets, env::vars())
+    pub fn api_config(&self) -> Result<ApiConfig> {
+        self.api_config_with_env(read_api_environment()?)
     }
 
-    pub fn api_config_with_env<I, K, V>(
-        &self,
-        secrets: &dyn SecretStore,
-        env_vars: I,
-    ) -> Result<ApiConfig>
+    pub fn api_config_with_env<I, K, V>(&self, env_vars: I) -> Result<ApiConfig>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<str>,
@@ -98,30 +117,32 @@ impl AppSettings {
             bail!("configure an API endpoint in settings or {NETDIAG_API_URL_ENV}");
         }
 
-        let bearer_token = secrets
-            .get_live_api_token()?
-            .and_then(non_empty_owned)
-            .or_else(|| {
-                env_vars
-                    .get(NETDIAG_API_TOKEN_ENV)
-                    .and_then(|token| non_empty(token).map(str::to_owned))
-            });
+        validate_http_connector_bearer_endpoint(&endpoint)
+            .map_err(|error| anyhow::anyhow!("API endpoint {error}"))?;
 
         let timeout_secs = if self.api.timeout_secs > 0 {
-            self.api.timeout_secs
+            validate_api_timeout(self.api.timeout_secs)?
+        } else if let Some(value) = env_vars.get(NETDIAG_API_TIMEOUT_SECONDS_ENV) {
+            let seconds = value.trim().parse::<u64>().with_context(|| {
+                format!("{NETDIAG_API_TIMEOUT_SECONDS_ENV} must be an integer between 1 and 120")
+            })?;
+            validate_api_timeout(seconds)?
         } else {
-            env_vars
-                .get(NETDIAG_API_TIMEOUT_SECONDS_ENV)
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|seconds| *seconds > 0)
-                .unwrap_or(DEFAULT_API_TIMEOUT_SECS)
+            DEFAULT_API_TIMEOUT_SECS
         };
 
         Ok(ApiConfig {
             endpoint,
-            bearer_token,
             timeout: Duration::from_secs(timeout_secs),
         })
+    }
+}
+
+fn validate_api_timeout(seconds: u64) -> Result<u64> {
+    if (1..=120).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        bail!("API timeout must be between 1 and 120 seconds")
     }
 }
 
@@ -150,8 +171,8 @@ impl DefaultSource {
     ];
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct ApiSettings {
     #[serde(default)]
     pub endpoint: String,
@@ -165,6 +186,12 @@ impl Default for ApiSettings {
             endpoint: String::new(),
             timeout_secs: DEFAULT_API_TIMEOUT_SECS,
         }
+    }
+}
+
+impl ApiSettings {
+    pub fn validated_timeout_secs(&self) -> Result<u64> {
+        validate_api_timeout(self.timeout_secs)
     }
 }
 
@@ -193,10 +220,38 @@ impl ConnectorKind {
         ConnectorKind::NativePcap,
         ConnectorKind::SystemCounters,
     ];
+
+    pub fn supports_bearer_authentication(self) -> bool {
+        matches!(
+            self,
+            Self::HttpJson | Self::PrometheusQueryRange | Self::PrometheusExposition
+        )
+    }
+
+    pub fn stable_name(self) -> &'static str {
+        match self {
+            Self::LocalProbe => "local-probe",
+            Self::WebsiteProbe => "website-probe",
+            Self::HttpJson => "http-json",
+            Self::PrometheusQueryRange => "prometheus-query",
+            Self::PrometheusExposition => "prometheus-metrics",
+            Self::OtlpGrpcReceiver => "otlp-grpc",
+            Self::NativePcap => "native-pcap",
+            Self::SystemCounters => "system-counters",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorAuthentication {
+    #[default]
+    None,
+    BearerToken,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LocalProbeSettings {
     #[serde(default = "default_probe_samples")]
     pub samples: usize,
@@ -210,8 +265,18 @@ impl Default for LocalProbeSettings {
     }
 }
 
+impl LocalProbeSettings {
+    pub fn validate(&self) -> Result<()> {
+        LocalProbeConfig {
+            samples: self.samples,
+        }
+        .validate()
+        .map_err(anyhow::Error::from)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WebsiteProbeSettings {
     #[serde(default = "default_website_probe_targets")]
     pub targets: Vec<String>,
@@ -228,8 +293,19 @@ impl Default for WebsiteProbeSettings {
     }
 }
 
+impl WebsiteProbeSettings {
+    pub fn validate(&self) -> Result<()> {
+        WebsiteProbeConfig {
+            targets: self.targets.clone(),
+            samples_per_target: self.samples_per_target,
+        }
+        .validate()
+        .map_err(anyhow::Error::from)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DataConnectorsSettings {
     #[serde(default)]
     pub default_connector: ConnectorKind,
@@ -275,42 +351,22 @@ impl DataConnectorsSettings {
         self.profiles
             .iter()
             .find(|profile| profile.id == self.active_profile_id)
-            .or_else(|| self.profiles.first())
     }
 
     pub fn active_profile_mut(&mut self) -> Option<&mut SourceProfile> {
-        let index = self
-            .profiles
-            .iter()
-            .position(|profile| profile.id == self.active_profile_id)
-            .unwrap_or(0);
-        self.profiles.get_mut(index)
-    }
-
-    pub fn ensure_profiles(&mut self) {
-        if self.profiles.is_empty() {
-            self.profiles = default_source_profiles();
-        }
-        if !self
-            .profiles
-            .iter()
-            .any(|profile| profile.id == self.active_profile_id)
-        {
-            self.active_profile_id = self
-                .profiles
-                .first()
-                .map(|profile| profile.id.clone())
-                .unwrap_or_else(default_active_profile_id);
-        }
+        self.profiles
+            .iter_mut()
+            .find(|profile| profile.id == self.active_profile_id)
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SourceProfile {
     pub id: String,
     pub name: String,
     pub kind: ConnectorKind,
+    pub authentication: ConnectorAuthentication,
     pub local_probe: LocalProbeSettings,
     pub website_probe: WebsiteProbeSettings,
     pub http_json: ApiSettings,
@@ -327,6 +383,7 @@ impl Default for SourceProfile {
             id: "website_probe".to_string(),
             name: "Website probe".to_string(),
             kind: ConnectorKind::WebsiteProbe,
+            authentication: ConnectorAuthentication::None,
             local_probe: LocalProbeSettings::default(),
             website_probe: WebsiteProbeSettings::default(),
             http_json: ApiSettings::default(),
@@ -339,8 +396,23 @@ impl Default for SourceProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+impl SourceProfile {
+    pub fn http_endpoint(&self) -> Option<&str> {
+        match self.kind {
+            ConnectorKind::HttpJson => Some(&self.http_json.endpoint),
+            ConnectorKind::PrometheusQueryRange => Some(&self.prometheus_query.base_url),
+            ConnectorKind::PrometheusExposition => Some(&self.prometheus_exposition.endpoint),
+            ConnectorKind::LocalProbe
+            | ConnectorKind::WebsiteProbe
+            | ConnectorKind::OtlpGrpcReceiver
+            | ConnectorKind::NativePcap
+            | ConnectorKind::SystemCounters => None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct PrometheusQuerySettings {
     pub base_url: String,
     pub lookback_seconds: i64,
@@ -359,8 +431,18 @@ impl Default for PrometheusQuerySettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+impl PrometheusQuerySettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.lookback_seconds < 10 {
+            bail!("Prometheus lookback_seconds must be between 10 and 86400");
+        }
+        validate_prometheus_query_window(self.lookback_seconds, self.step_seconds)
+            .map_err(anyhow::Error::from)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct PrometheusExpositionSettings {
     pub endpoint: String,
     pub mapping: BTreeMapString,
@@ -376,25 +458,7 @@ impl Default for PrometheusExpositionSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct OtlpGrpcSettings {
-    pub bind_addr: String,
-    pub timeout_secs: u64,
-    pub mapping: BTreeMapString,
-}
-
-impl Default for OtlpGrpcSettings {
-    fn default() -> Self {
-        Self {
-            bind_addr: "127.0.0.1:4317".to_string(),
-            timeout_secs: 20,
-            mapping: default_prometheus_mapping(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NativePcapSettings {
     pub source: String,
     pub packet_limit: usize,
@@ -411,8 +475,24 @@ impl Default for NativePcapSettings {
     }
 }
 
+impl NativePcapSettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_api_timeout(self.timeout_secs)?;
+        if !(1..=netdiag_core::MAX_PCAP_PACKET_LIMIT).contains(&self.packet_limit) {
+            bail!(
+                "native pcap packet_limit must be between 1 and {}",
+                netdiag_core::MAX_PCAP_PACKET_LIMIT
+            );
+        }
+        if self.source.trim().is_empty() {
+            bail!("native pcap source is empty");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SystemCountersSettings {
     pub interface: String,
     pub interval_secs: u64,
@@ -427,10 +507,20 @@ impl Default for SystemCountersSettings {
     }
 }
 
+impl SystemCountersSettings {
+    pub fn validate(&self) -> Result<()> {
+        if (1..=10).contains(&self.interval_secs) {
+            Ok(())
+        } else {
+            bail!("system counters interval_secs must be between 1 and 10")
+        }
+    }
+}
+
 pub type BTreeMapString = std::collections::BTreeMap<String, String>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WhatIfSettings {
     #[serde(default = "default_what_if_topology")]
     pub topology: String,
@@ -451,7 +541,7 @@ impl Default for WhatIfSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct StartupSettings {
     #[serde(default)]
     pub default_tab: StartupTab,
@@ -501,87 +591,16 @@ impl StartupTab {
 pub struct ApiConfig {
     pub endpoint: String,
     pub timeout: Duration,
-    bearer_token: Option<String>,
 }
 
 impl ApiConfig {
-    pub fn bearer_token(&self) -> Option<&str> {
-        self.bearer_token.as_deref()
+    pub fn new(endpoint: String, timeout: Duration) -> Self {
+        Self { endpoint, timeout }
     }
 
     #[cfg(test)]
     pub fn timeout_secs(&self) -> u64 {
         self.timeout.as_secs()
-    }
-}
-
-impl fmt::Debug for ApiConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ApiConfig")
-            .field("endpoint", &self.endpoint)
-            .field("timeout", &self.timeout)
-            .field(
-                "bearer_token",
-                &self.bearer_token.as_ref().map(|_| "<redacted>"),
-            )
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SettingsStore {
-    path: PathBuf,
-}
-
-impl SettingsStore {
-    pub fn default_path() -> PathBuf {
-        app_support_dir().join(SETTINGS_FILE)
-    }
-
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn load_or_default(&self) -> (AppSettings, Option<String>) {
-        match self.load() {
-            Ok(settings) => (settings, None),
-            Err(err) => (AppSettings::default(), Some(err.to_string())),
-        }
-    }
-
-    pub fn load(&self) -> Result<AppSettings> {
-        match fs::read_to_string(&self.path) {
-            Ok(raw) => {
-                let mut settings: AppSettings = serde_json::from_str(&raw).with_context(|| {
-                    format!("settings file is not valid JSON: {}", self.path.display())
-                })?;
-                settings.data_connectors.ensure_profiles();
-                Ok(settings)
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(AppSettings::default()),
-            Err(err) => Err(err)
-                .with_context(|| format!("failed to read settings file: {}", self.path.display())),
-        }
-    }
-
-    pub fn save(&self, settings: &AppSettings) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create settings directory: {}", parent.display())
-            })?;
-        }
-        let raw = serde_json::to_vec_pretty(settings).context("serialize NetDiag settings")?;
-        let tmp_path = temp_path_for(&self.path);
-        fs::write(&tmp_path, raw).with_context(|| {
-            format!("failed to write temporary settings: {}", tmp_path.display())
-        })?;
-        fs::rename(&tmp_path, &self.path)
-            .or_else(|err| replace_settings_file(&tmp_path, &self.path, err))
-            .with_context(|| format!("failed to replace settings file: {}", self.path.display()))
     }
 }
 
@@ -746,273 +765,5 @@ fn default_auto_run_diagnosis() -> bool {
     true
 }
 
-fn temp_path_for(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(SETTINGS_FILE)
-        .to_owned();
-    name.push_str(".tmp");
-    path.with_file_name(name)
-}
-
-fn replace_settings_file(tmp_path: &Path, path: &Path, rename_err: io::Error) -> io::Result<()> {
-    if rename_err.kind() != ErrorKind::AlreadyExists {
-        return Err(rename_err);
-    }
-    fs::remove_file(path)?;
-    fs::rename(tmp_path, path)
-}
-
-fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<&'a str> {
-    values.into_iter().flatten().find_map(non_empty)
-}
-
-fn non_empty(value: &str) -> Option<&str> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-fn non_empty_owned(value: String) -> Option<String> {
-    non_empty(&value).map(str::to_owned)
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::secrets::{MemorySecretStore, SecretStore};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-    #[test]
-    fn defaults_are_product_safe() {
-        let settings = AppSettings::default();
-        assert_eq!(settings.language, LanguageSetting::Zh);
-        assert_eq!(settings.default_source, DefaultSource::Simulation);
-        assert_eq!(settings.last_imported_trace, None);
-        assert_eq!(settings.simulation_scenario, SimScenario::Congestion);
-        assert_eq!(settings.api.endpoint, "");
-        assert_eq!(settings.api.timeout_secs, DEFAULT_API_TIMEOUT_SECS);
-        assert_eq!(
-            settings.data_connectors.default_connector,
-            ConnectorKind::WebsiteProbe
-        );
-        assert_eq!(settings.data_connectors.website_probe.targets.len(), 3);
-        assert!(settings.artifacts_root.ends_with("artifacts"));
-        assert_eq!(settings.what_if.topology, "line");
-        assert_eq!(settings.what_if.action, "reroute_path_b");
-        assert_eq!(settings.startup.default_tab, StartupTab::Overview);
-        assert!(settings.startup.auto_run_diagnosis);
-        assert!(default_settings_path().ends_with("NetDiag Twin/settings.json"));
-    }
-
-    #[test]
-    fn default_profiles_cover_every_connector_kind_once() {
-        let profiles = default_source_profiles();
-        let mut kinds = profiles
-            .iter()
-            .map(|profile| profile.kind)
-            .collect::<Vec<_>>();
-        kinds.sort();
-
-        let mut expected = ConnectorKind::ALL.to_vec();
-        expected.sort();
-
-        assert_eq!(kinds, expected);
-        assert_eq!(profiles.len(), ConnectorKind::ALL.len());
-        for profile in profiles {
-            assert!(!profile.id.trim().is_empty());
-            assert!(!profile.name.trim().is_empty());
-        }
-    }
-
-    #[test]
-    fn missing_nested_fields_use_product_defaults() {
-        let settings: AppSettings = serde_json::from_str(r#"{"api":{},"what_if":{},"startup":{}}"#)
-            .expect("partial settings");
-        assert_eq!(settings.api.timeout_secs, DEFAULT_API_TIMEOUT_SECS);
-        assert_eq!(
-            settings.data_connectors.default_connector,
-            ConnectorKind::WebsiteProbe
-        );
-        assert_eq!(settings.what_if.topology, "line");
-        assert_eq!(settings.what_if.action, "reroute_path_b");
-        assert_eq!(settings.startup.default_tab, StartupTab::Overview);
-        assert!(settings.startup.auto_run_diagnosis);
-        assert!(settings.artifacts_root.ends_with("artifacts"));
-    }
-
-    #[test]
-    fn save_and_load_round_trips_without_token() {
-        let path = temp_settings_path();
-        let store = SettingsStore::new(path.clone());
-        let settings = AppSettings {
-            language: LanguageSetting::En,
-            default_source: DefaultSource::LiveApi,
-            last_imported_trace: Some(PathBuf::from("/tmp/trace.json")),
-            simulation_scenario: SimScenario::DnsFailure,
-            api: ApiSettings {
-                endpoint: "https://example.invalid/trace".to_string(),
-                timeout_secs: 12,
-            },
-            data_connectors: DataConnectorsSettings {
-                default_connector: ConnectorKind::HttpJson,
-                ..DataConnectorsSettings::default()
-            },
-            artifacts_root: PathBuf::from("/tmp/netdiag-artifacts"),
-            what_if: WhatIfSettings {
-                topology: "mesh".to_string(),
-                action: "isolate_node_c".to_string(),
-                custom_topology: None,
-            },
-            startup: StartupSettings {
-                default_tab: StartupTab::Settings,
-                auto_run_diagnosis: false,
-            },
-        };
-
-        store.save(&settings).expect("save settings");
-        let raw = fs::read_to_string(&path).expect("settings json");
-        assert!(!raw.contains("secret-token"));
-        let loaded = store.load().expect("load settings");
-        assert_eq!(loaded, settings);
-        cleanup_temp_path(path);
-    }
-
-    #[test]
-    fn corrupt_json_falls_back_to_defaults() {
-        let path = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).expect("settings dir");
-        fs::write(&path, "{not json").expect("write corrupt settings");
-        let store = SettingsStore::new(path.clone());
-
-        let (settings, warning) = store.load_or_default();
-        assert_eq!(settings, AppSettings::default());
-        assert!(warning.expect("warning").contains("not valid JSON"));
-        cleanup_temp_path(path);
-    }
-
-    #[test]
-    fn app_settings_load_from_path_uses_corrupt_json_fallback() {
-        let path = temp_settings_path();
-        fs::create_dir_all(path.parent().unwrap()).expect("settings dir");
-        fs::write(&path, "{not json").expect("write corrupt settings");
-
-        let settings = AppSettings::load_from_path(path.clone()).expect("fallback settings");
-        assert_eq!(settings, AppSettings::default());
-        cleanup_temp_path(path);
-    }
-
-    #[test]
-    fn api_config_uses_settings_and_secret_before_env_fallbacks() {
-        let settings = AppSettings {
-            api: ApiSettings {
-                endpoint: "https://settings.example.test/traces".to_string(),
-                timeout_secs: 14,
-            },
-            ..AppSettings::default()
-        };
-        let secrets = MemorySecretStore::with_token("stored-secret");
-
-        let config = settings
-            .api_config_with_env(
-                &secrets,
-                [
-                    (NETDIAG_API_URL_ENV, "https://env.example.test/traces"),
-                    (NETDIAG_API_TOKEN_ENV, "env-secret"),
-                    (NETDIAG_API_TIMEOUT_SECONDS_ENV, "22"),
-                ],
-            )
-            .expect("api config");
-
-        assert_eq!(config.endpoint, "https://settings.example.test/traces");
-        assert_eq!(config.bearer_token(), Some("stored-secret"));
-        assert_eq!(config.timeout_secs(), 14);
-        assert!(!format!("{config:?}").contains("stored-secret"));
-    }
-
-    #[test]
-    fn api_config_falls_back_to_env_endpoint_token_and_timeout() {
-        let settings = AppSettings {
-            api: ApiSettings {
-                endpoint: String::new(),
-                timeout_secs: 0,
-            },
-            ..AppSettings::default()
-        };
-        let secrets = MemorySecretStore::new();
-
-        let config = settings
-            .api_config_with_env(
-                &secrets,
-                [
-                    (NETDIAG_API_URL_ENV, " https://env.example.test/traces "),
-                    (NETDIAG_API_TOKEN_ENV, " env-secret "),
-                    (NETDIAG_API_TIMEOUT_SECONDS_ENV, "23"),
-                ],
-            )
-            .expect("api config");
-
-        assert_eq!(config.endpoint, "https://env.example.test/traces");
-        assert_eq!(config.bearer_token(), Some("env-secret"));
-        assert_eq!(config.timeout_secs(), 23);
-    }
-
-    #[test]
-    fn api_config_requires_endpoint_after_fallbacks() {
-        let settings = AppSettings::default();
-        let secrets = MemorySecretStore::new();
-
-        let err = settings
-            .api_config_with_env(&secrets, std::iter::empty::<(&str, &str)>())
-            .expect_err("missing endpoint");
-        assert!(err.to_string().contains(NETDIAG_API_URL_ENV));
-    }
-
-    #[test]
-    fn memory_secret_store_supports_api_config_without_echoing_token() {
-        let settings = AppSettings {
-            api: ApiSettings {
-                endpoint: "https://settings.example.test/traces".to_string(),
-                timeout_secs: DEFAULT_API_TIMEOUT_SECS,
-            },
-            ..AppSettings::default()
-        };
-        let secrets = MemorySecretStore::new();
-
-        secrets
-            .set_live_api_token("secret-token")
-            .expect("set token");
-        let config = settings
-            .api_config_with_env(&secrets, std::iter::empty::<(&str, &str)>())
-            .expect("api config");
-        assert_eq!(config.bearer_token(), Some("secret-token"));
-        assert!(!format!("{config:?}").contains("secret-token"));
-    }
-
-    fn temp_settings_path() -> PathBuf {
-        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        env::temp_dir()
-            .join(format!(
-                "netdiag-settings-test-{}-{nanos}-{id}",
-                std::process::id()
-            ))
-            .join("settings.json")
-    }
-
-    fn cleanup_temp_path(path: PathBuf) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir_all(parent);
-        }
-    }
-}
+mod tests;

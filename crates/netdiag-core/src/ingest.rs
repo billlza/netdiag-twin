@@ -1,12 +1,13 @@
-use crate::error::{IoContext, NetdiagError, Result};
+use crate::error::{NetdiagError, Result};
 use crate::models::{
     IngestResult, IngestWarning, MetricProvenance, MetricQuality, TraceRecord, TraceSchema,
 };
+use crate::resource_limits::{MAX_SOURCE_INPUT_BYTES, MAX_SOURCE_RECORDS};
+use crate::storage::read_stable_regular_file_bounded;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
+use std::io::Cursor;
 use std::path::Path;
 
 pub const CANONICAL_COLUMNS: [&str; 11] = [
@@ -68,27 +69,50 @@ struct RawTrace {
     warnings: Vec<IngestWarning>,
 }
 
+#[derive(Debug)]
+pub(crate) struct TraceIngestLoad {
+    pub(crate) ingest: IngestResult,
+    pub(crate) input_bytes: u64,
+}
+
 pub fn ingest_trace(path: impl AsRef<Path>) -> Result<IngestResult> {
+    Ok(ingest_trace_with_usage(path)?.ingest)
+}
+
+pub(crate) fn ingest_trace_with_usage(path: impl AsRef<Path>) -> Result<TraceIngestLoad> {
     let path = path.as_ref();
     let sample = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("uploaded")
         .to_string();
+    let bytes =
+        read_stable_regular_file_bounded(path, MAX_SOURCE_INPUT_BYTES)?.ok_or_else(|| {
+            NetdiagError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "trace input is missing"),
+            }
+        })?;
+    let input_bytes = u64::try_from(bytes.len()).map_err(|_| {
+        NetdiagError::InvalidTrace("trace input byte count cannot fit in u64".to_string())
+    })?;
     let raw_trace = if path
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
     {
-        load_json(path)?
+        load_json(&bytes)?
     } else {
-        load_csv(path)?
+        load_csv(&bytes)?
     };
-    normalize(raw_trace, sample)
+    Ok(TraceIngestLoad {
+        ingest: normalize(raw_trace, sample)?,
+        input_bytes,
+    })
 }
 
 pub fn ingest_json_value(value: Value, sample: impl Into<String>) -> Result<IngestResult> {
-    normalize(raw_trace_from_json(value), sample.into())
+    normalize(raw_trace_from_json(value)?, sample.into())
 }
 
 pub fn build_ingest_result(
@@ -98,6 +122,7 @@ pub fn build_ingest_result(
     if records.is_empty() {
         return Err(NetdiagError::EmptyTrace);
     }
+    validate_trace_record_count(records.len(), MAX_SOURCE_RECORDS)?;
     let start_time = records
         .iter()
         .map(|record| record.timestamp)
@@ -108,7 +133,7 @@ pub fn build_ingest_result(
         .map(|record| record.timestamp)
         .max()
         .ok_or(NetdiagError::EmptyTrace)?;
-    validate_records(&records)?;
+    validate_trace_records(&records)?;
     let schema = TraceSchema {
         columns: CANONICAL_COLUMNS
             .iter()
@@ -182,17 +207,24 @@ pub fn set_metric_provenance(
     });
 }
 
-fn load_csv(path: &Path) -> Result<RawTrace> {
-    let file = File::open(path).with_path(path)?;
+fn load_csv(bytes: &[u8]) -> Result<RawTrace> {
+    load_csv_bounded(bytes, MAX_SOURCE_RECORDS)
+}
+
+fn load_csv_bounded(bytes: &[u8], max_records: usize) -> Result<RawTrace> {
     let mut reader = csv::ReaderBuilder::new()
         .flexible(true)
-        .from_reader(BufReader::new(file));
+        .from_reader(Cursor::new(bytes));
     let headers = reader.headers()?.clone();
     let canonical: Vec<String> = headers.iter().map(alias).collect();
     let present_columns = present_columns(&canonical);
     let mut rows = Vec::new();
     for record in reader.records() {
         let record = record?;
+        let next_count = rows.len().checked_add(1).ok_or_else(|| {
+            NetdiagError::InvalidTrace("trace record count overflowed".to_string())
+        })?;
+        validate_trace_record_count(next_count, max_records)?;
         let mut row = RawRecord::default();
         for (idx, value) in record.iter().enumerate() {
             let Some(column) = canonical.get(idx).map(String::as_str) else {
@@ -213,27 +245,47 @@ fn load_csv(path: &Path) -> Result<RawTrace> {
     })
 }
 
-fn load_json(path: &Path) -> Result<RawTrace> {
-    let file = File::open(path).with_path(path)?;
-    let value: Value = serde_json::from_reader(BufReader::new(file))?;
-    Ok(raw_trace_from_json(value))
+fn load_json(bytes: &[u8]) -> Result<RawTrace> {
+    let value = crate::strict_json::parse_unique_value(bytes)?;
+    raw_trace_from_json(value)
 }
 
-fn raw_trace_from_json(value: Value) -> RawTrace {
+fn raw_trace_from_json(value: Value) -> Result<RawTrace> {
+    raw_trace_from_json_bounded(value, MAX_SOURCE_RECORDS)
+}
+
+fn raw_trace_from_json_bounded(value: Value, max_records: usize) -> Result<RawTrace> {
     let rows = match value {
         Value::Array(items) => items,
-        Value::Object(mut object) => object
-            .remove("records")
-            .and_then(|value| value.as_array().cloned())
-            .unwrap_or_default(),
-        _ => Vec::new(),
+        Value::Object(mut object) => match object.remove("records") {
+            Some(Value::Array(items)) => items,
+            Some(_) => {
+                return Err(NetdiagError::InvalidTrace(
+                    "JSON field records must be an array".to_string(),
+                ));
+            }
+            None => {
+                return Err(NetdiagError::InvalidTrace(
+                    "JSON object is missing records array".to_string(),
+                ));
+            }
+        },
+        _ => {
+            return Err(NetdiagError::InvalidTrace(
+                "JSON trace root must be an array or an object with records".to_string(),
+            ));
+        }
     };
+    validate_trace_record_count(rows.len(), max_records)?;
     let mut records = Vec::new();
     let mut present_columns = Vec::new();
-    for item in rows {
+    for (index, item) in rows.into_iter().enumerate() {
         let mut row = RawRecord::default();
         let Value::Object(object) = item else {
-            continue;
+            return Err(NetdiagError::InvalidTrace(format!(
+                "JSON trace row {} must be an object",
+                index + 1
+            )));
         };
         for (column, value) in object {
             let canonical = alias(&column);
@@ -250,11 +302,20 @@ fn raw_trace_from_json(value: Value) -> RawTrace {
         }
         records.push(row);
     }
-    RawTrace {
+    Ok(RawTrace {
         rows: records,
         present_columns,
         warnings: Vec::new(),
+    })
+}
+
+fn validate_trace_record_count(records: usize, max_records: usize) -> Result<()> {
+    if records > max_records {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "trace record count {records} exceeds the {max_records}-record source limit"
+        )));
     }
+    Ok(())
 }
 
 fn normalize(mut raw_trace: RawTrace, sample: String) -> Result<IngestResult> {
@@ -357,7 +418,7 @@ fn validate_columns(columns: &[&'static str]) -> Result<()> {
     Ok(())
 }
 
-fn validate_records(records: &[TraceRecord]) -> Result<()> {
+pub(crate) fn validate_trace_records(records: &[TraceRecord]) -> Result<()> {
     for (idx, record) in records.iter().enumerate() {
         let row = idx + 1;
         for (column, value) in [
@@ -373,7 +434,22 @@ fn validate_records(records: &[TraceRecord]) -> Result<()> {
             ("quic_blocked_ratio", record.quic_blocked_ratio),
         ] {
             validate_finite_non_negative(row, column, value)?;
+            validate_canonical_metric_range(row, column, value)?;
         }
+    }
+    Ok(())
+}
+
+fn validate_canonical_metric_range(row: usize, column: &str, value: f64) -> Result<()> {
+    let maximum = match column {
+        "packet_loss_rate" | "retransmission_rate" => 100.0,
+        "quic_blocked_ratio" => 1.0,
+        _ => return Ok(()),
+    };
+    if value > maximum {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "row {row} {column} exceeds the canonical maximum {maximum}"
+        )));
     }
     Ok(())
 }
@@ -436,7 +512,15 @@ fn validate_finite_non_negative(row: usize, column: &str, value: f64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
+
+    const MINIMAL_HEADER: &str =
+        "timestamp,latency_ms,jitter_ms,packet_loss_rate,retransmission_rate,throughput_mbps";
+
+    fn minimal_csv() -> String {
+        format!("{MINIMAL_HEADER}\n2026-05-02T00:00:00Z,10,1,0,0,100\n")
+    }
 
     fn metric_quality(ingest: &IngestResult, field: &str) -> Option<MetricQuality> {
         ingest
@@ -477,5 +561,190 @@ mod tests {
             metric_quality(&ingest, "latency_ms"),
             Some(MetricQuality::Measured)
         );
+    }
+
+    #[test]
+    fn trace_file_ingest_reports_exact_snapshot_resource_usage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("trace.csv");
+        let csv = minimal_csv();
+        std::fs::write(&path, csv.as_bytes()).expect("trace");
+
+        let loaded = ingest_trace_with_usage(&path).expect("bounded trace snapshot");
+
+        assert_eq!(loaded.input_bytes, csv.len() as u64);
+        assert_eq!(loaded.ingest.schema.rows, 1);
+    }
+
+    #[test]
+    fn trace_file_ingest_distinguishes_missing_corrupt_and_oversized_inputs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing.csv");
+        let missing_error = ingest_trace(&missing).expect_err("missing trace must fail");
+        assert!(matches!(
+            missing_error,
+            NetdiagError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        ));
+
+        let corrupt = temp.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{").expect("corrupt trace");
+        assert!(matches!(
+            ingest_trace(&corrupt).expect_err("corrupt JSON must fail"),
+            NetdiagError::Json(_)
+        ));
+
+        let oversized = temp.path().join("oversized.csv");
+        let file = File::create(&oversized).expect("oversized trace");
+        file.set_len(MAX_SOURCE_INPUT_BYTES + 1)
+            .expect("sparse oversized trace");
+        let limit_error = ingest_trace(&oversized).expect_err("oversized trace must fail");
+        assert!(
+            matches!(limit_error, NetdiagError::InvalidTrace(_)),
+            "{limit_error}"
+        );
+        assert!(limit_error.to_string().contains("byte read limit"));
+    }
+
+    #[test]
+    fn trace_file_ingest_rejects_duplicate_json_keys_without_echoing_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("duplicate.json");
+        std::fs::write(
+            &path,
+            br#"{"records":[{"private-metric":1,"private-metric":2}]}"#,
+        )
+        .expect("duplicate JSON trace");
+
+        let error = ingest_trace(&path).expect_err("duplicate JSON key must fail");
+        assert!(matches!(error, NetdiagError::Json(_)), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("duplicate key"), "{message}");
+        assert!(!message.contains("private-metric"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_file_ingest_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("target.csv");
+        let link = temp.path().join("trace.csv");
+        std::fs::write(&target, minimal_csv()).expect("trace target");
+        symlink(&target, &link).expect("trace symlink");
+
+        let error = ingest_trace(&link).expect_err("symlink must fail closed");
+
+        assert!(matches!(error, NetdiagError::InvalidTrace(_)), "{error}");
+        assert!(error.to_string().contains("non-symlink file required"));
+    }
+
+    #[test]
+    fn csv_and_json_record_limits_fail_before_retaining_excess_rows() {
+        let csv = format!(
+            "{MINIMAL_HEADER}\n2026-05-02T00:00:00Z,10,1,0,0,100\n2026-05-02T00:00:01Z,11,1,0,0,100\n"
+        );
+        let csv_error = load_csv_bounded(csv.as_bytes(), 1).expect_err("CSV row limit");
+        assert!(csv_error.to_string().contains("2 exceeds the 1-record"));
+
+        let json_error = raw_trace_from_json_bounded(
+            serde_json::json!([{"timestamp": "a"}, {"timestamp": "b"}]),
+            1,
+        )
+        .expect_err("JSON row limit");
+        assert!(json_error.to_string().contains("2 exceeds the 1-record"));
+    }
+
+    #[test]
+    fn canonical_ratio_ranges_are_enforced_for_records_csv_and_json() {
+        let exact = TraceRecord {
+            timestamp: Utc
+                .timestamp_opt(1_800_000_000, 0)
+                .single()
+                .expect("timestamp"),
+            latency_ms: 1.0,
+            jitter_ms: 1.0,
+            packet_loss_rate: 100.0,
+            retransmission_rate: 100.0,
+            timeout_events: 0.0,
+            retry_events: 0.0,
+            throughput_mbps: 1.0,
+            dns_failure_events: 0.0,
+            tls_failure_events: 0.0,
+            quic_blocked_ratio: 1.0,
+        };
+        build_ingest_result(vec![exact.clone()], "exact-ranges").expect("inclusive maxima");
+
+        for (field, invalid) in [
+            (
+                "packet_loss_rate",
+                TraceRecord {
+                    packet_loss_rate: 100.000_001,
+                    ..exact.clone()
+                },
+            ),
+            (
+                "retransmission_rate",
+                TraceRecord {
+                    retransmission_rate: 100.000_001,
+                    ..exact.clone()
+                },
+            ),
+            (
+                "quic_blocked_ratio",
+                TraceRecord {
+                    quic_blocked_ratio: 1.000_001,
+                    ..exact.clone()
+                },
+            ),
+        ] {
+            let error = build_ingest_result(vec![invalid], "invalid-range")
+                .expect_err("canonical maximum plus epsilon must fail");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let csv_path = temp.path().join("invalid.csv");
+        std::fs::write(
+            &csv_path,
+            format!(
+                "{MINIMAL_HEADER},quic_blocked_ratio\n2026-05-02T00:00:00Z,10,1,100.1,0,100,0\n"
+            ),
+        )
+        .expect("invalid CSV");
+        assert!(
+            ingest_trace(&csv_path)
+                .expect_err("CSV range violation")
+                .to_string()
+                .contains("packet_loss_rate")
+        );
+
+        let mut json_record = serde_json::to_value(exact).expect("record JSON");
+        json_record["quic_blocked_ratio"] = serde_json::json!(1.1);
+        assert!(
+            ingest_json_value(
+                serde_json::json!({ "records": [json_record] }),
+                "invalid-json"
+            )
+            .expect_err("JSON range violation")
+            .to_string()
+            .contains("quic_blocked_ratio")
+        );
+    }
+
+    #[test]
+    fn json_ingest_rejects_missing_or_malformed_record_envelopes() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"records": {}}),
+            serde_json::json!({"records": ["not-an-object"]}),
+            serde_json::json!("not-a-trace"),
+        ] {
+            assert!(
+                ingest_json_value(value, "invalid-json-trace").is_err(),
+                "malformed JSON shape must fail explicitly"
+            );
+        }
     }
 }

@@ -1,15 +1,26 @@
 use crate::error::{NetdiagError, Result};
+use crate::identifiers::validate_portable_id;
 use crate::models::{
-    OverallTelemetry, TelemetrySummary, TopologyCalibrationReport, TopologyLink, TopologyModel,
-    TopologyNode, TwinPolicyAction, TwinPolicyActionKind, TwinPolicyImpact, TwinPolicyTarget,
-    WhatIfResult,
+    OverallTelemetry, TopologyLink, TopologyModel, TopologyNode, TwinPolicyAction,
+    TwinPolicyActionKind, TwinPolicyImpact, TwinPolicyTarget, WhatIfResult,
 };
-use chrono::Utc;
-use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{NodeIndex, UnGraph};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+
+mod calibration;
+mod graph;
+mod input;
+
+pub use calibration::calibrate_topology_from_runs;
+pub use input::{load_policy_action_file, load_topology_file};
+
+const MAX_TOPOLOGY_NODES: usize = 4_096;
+const MAX_TOPOLOGY_LINKS: usize = 16_384;
+const MAX_TOPOLOGY_STRING_BYTES: usize = 16 * 1024;
+const MAX_TOPOLOGY_METADATA_ENTRIES: usize = 65_536;
+const MAX_POLICY_MAPPING_ENTRIES: usize = 4_096;
 
 #[derive(Debug, Clone)]
 pub struct Topology {
@@ -172,7 +183,7 @@ pub fn import_topology(input: &str, format: TopologyFormat) -> Result<TopologyMo
 
 pub fn import_policy_action(input: &str, format: TopologyFormat) -> Result<TwinPolicyAction> {
     let action: TwinPolicyAction = match format {
-        TopologyFormat::Json => serde_json::from_str(input)?,
+        TopologyFormat::Json => decode_json(input, "policy action")?,
         TopologyFormat::Yaml => serde_yaml::from_str(input)
             .map_err(|err| NetdiagError::InvalidTrace(format!("invalid policy YAML: {err}")))?,
     };
@@ -181,14 +192,28 @@ pub fn import_policy_action(input: &str, format: TopologyFormat) -> Result<TwinP
 }
 
 pub fn validate_policy_action_shape(action: &TwinPolicyAction) -> Result<()> {
-    if action.id.trim().is_empty() {
-        return Err(NetdiagError::InvalidTrace(
-            "policy action id is empty".to_string(),
-        ));
+    validate_portable_id("policy action id", &action.id)?;
+    validate_bounded_string("policy action qoe_risk", &action.qoe_risk, false)?;
+    validate_bounded_string("policy action notes", &action.notes, true)?;
+    for (kind, target) in [
+        ("policy target node id", action.target.node_id.as_deref()),
+        ("policy target link id", action.target.link_id.as_deref()),
+        ("policy target path id", action.target.path_id.as_deref()),
+    ] {
+        if let Some(target) = target {
+            validate_bounded_string(kind, target, false)?;
+        }
     }
-    if action.qoe_risk.trim().is_empty() {
+    let mapping_entries = action
+        .parameters
+        .len()
+        .checked_add(action.metadata.len())
+        .ok_or_else(|| {
+            NetdiagError::InvalidTrace("policy mapping entry count overflowed".to_string())
+        })?;
+    if mapping_entries > MAX_POLICY_MAPPING_ENTRIES {
         return Err(NetdiagError::InvalidTrace(format!(
-            "policy action {} qoe_risk is empty",
+            "policy action {} contains {mapping_entries} mapping entries, maximum is {MAX_POLICY_MAPPING_ENTRIES}",
             action.id
         )));
     }
@@ -214,8 +239,9 @@ pub fn validate_policy_action_shape(action: &TwinPolicyAction) -> Result<()> {
 }
 
 pub fn export_topology(model: &TopologyModel, format: TopologyFormat) -> Result<String> {
+    validate_topology_model(model)?;
     match format {
-        TopologyFormat::Json => export_topology_json(model),
+        TopologyFormat::Json => serde_json::to_string_pretty(model).map_err(NetdiagError::from),
         TopologyFormat::Yaml => serde_yaml::to_string(model).map_err(|err| {
             NetdiagError::InvalidTrace(format!("failed to encode topology YAML: {err}"))
         }),
@@ -223,242 +249,23 @@ pub fn export_topology(model: &TopologyModel, format: TopologyFormat) -> Result<
 }
 
 pub fn import_topology_json(input: &str) -> Result<TopologyModel> {
-    let model: TopologyModel = serde_json::from_str(input)?;
+    let model: TopologyModel = decode_json(input, "topology")?;
     validate_topology_model(&model)?;
     Ok(model)
+}
+
+fn decode_json<T: DeserializeOwned>(input: &str, kind: &str) -> Result<T> {
+    crate::strict_json::from_slice(input.as_bytes()).map_err(|source| {
+        NetdiagError::InvalidTrace(format!(
+            "invalid {kind} JSON: {}",
+            crate::strict_json::error_summary(&source)
+        ))
+    })
 }
 
 pub fn export_topology_json(model: &TopologyModel) -> Result<String> {
     validate_topology_model(model)?;
     serde_json::to_string_pretty(model).map_err(NetdiagError::from)
-}
-
-pub fn calibrate_topology_from_runs(
-    topology: &TopologyModel,
-    runs_path: impl AsRef<Path>,
-) -> Result<TopologyCalibrationReport> {
-    validate_topology_model(topology)?;
-    let runs_path = runs_path.as_ref();
-    let summaries = collect_telemetry_summaries(runs_path)?;
-    if summaries.is_empty() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "topology calibration found no telemetry_summary.json files under {}",
-            runs_path.display()
-        )));
-    }
-
-    let latency_values = summaries
-        .iter()
-        .map(|summary| summary.overall.latency.p95)
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .collect::<Vec<_>>();
-    let loss_values = summaries
-        .iter()
-        .map(|summary| summary.overall.packet_loss_rate)
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .collect::<Vec<_>>();
-    let throughput_values = summaries
-        .iter()
-        .map(|summary| summary.overall.throughput_mbps.mean)
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .collect::<Vec<_>>();
-
-    let observed_path_latency_p95_ms = mean_or_default(&latency_values, 1.0);
-    let observed_loss_pct = mean_or_default(&loss_values, 0.0);
-    let observed_throughput_mbps = mean_or_default(&throughput_values, 1.0);
-    let mut calibrated_topology = topology.clone();
-    let path_link_ids = shortest_path_link_ids(&calibrated_topology)?;
-    let path_link_count = path_link_ids.len().max(1) as f64;
-    let per_link_latency = (observed_path_latency_p95_ms / path_link_count).max(0.1);
-    let per_link_loss = (observed_loss_pct / path_link_count).max(0.0);
-    let calibrated_capacity = (observed_throughput_mbps * 1.20).max(1.0);
-    let redundancy_score = redundancy_score(&calibrated_topology);
-
-    for link in &mut calibrated_topology.links {
-        if !path_link_ids.iter().any(|id| id == &link.id) {
-            link.metadata
-                .insert("calibration_role".to_string(), json!("off_shortest_path"));
-            continue;
-        }
-        link.latency_ms = round2(per_link_latency);
-        link.loss_pct = round4(per_link_loss);
-        link.capacity_mbps = round2(calibrated_capacity);
-        link.metadata
-            .insert("calibrated_from_runs".to_string(), json!(summaries.len()));
-        link.metadata.insert(
-            "observed_path_latency_p95_ms".to_string(),
-            json!(round2(observed_path_latency_p95_ms)),
-        );
-        link.metadata.insert(
-            "observed_loss_pct".to_string(),
-            json!(round4(observed_loss_pct)),
-        );
-        link.metadata.insert(
-            "observed_throughput_mbps".to_string(),
-            json!(round2(observed_throughput_mbps)),
-        );
-    }
-    calibrated_topology
-        .metadata
-        .insert("calibrated_at".to_string(), json!(Utc::now().to_rfc3339()));
-    calibrated_topology
-        .metadata
-        .insert("calibrated_run_count".to_string(), json!(summaries.len()));
-    calibrated_topology.metadata.insert(
-        "redundancy_score".to_string(),
-        json!(round4(redundancy_score)),
-    );
-
-    let path_bottleneck_link_id = calibrated_topology
-        .links
-        .iter()
-        .filter(|link| path_link_ids.iter().any(|id| id == &link.id))
-        .min_by(|left, right| left.capacity_mbps.total_cmp(&right.capacity_mbps))
-        .map(|link| link.id.clone())
-        .unwrap_or_default();
-
-    let mut warnings = calibration_warnings(&latency_values, &loss_values, &throughput_values);
-    warnings.push(
-        "source telemetry has no per-link attribution; observed path metrics were distributed only across the current shortest client-to-server path"
-            .to_string(),
-    );
-
-    Ok(TopologyCalibrationReport {
-        schema: "netdiag-topology-calibration/v1".to_string(),
-        generated_at: Utc::now(),
-        topology_key: calibrated_topology.key.clone(),
-        source_runs: summaries.len(),
-        updated_metrics: vec![
-            "link_latency_ms".to_string(),
-            "loss_pct".to_string(),
-            "capacity_mbps".to_string(),
-            "path_bottleneck".to_string(),
-            "redundancy_score".to_string(),
-        ],
-        observed_path_latency_p95_ms: round2(observed_path_latency_p95_ms),
-        observed_loss_pct: round4(observed_loss_pct),
-        observed_throughput_mbps: round2(observed_throughput_mbps),
-        path_bottleneck_link_id,
-        redundancy_score: round4(redundancy_score),
-        warnings,
-        calibrated_topology,
-    })
-}
-
-fn collect_telemetry_summaries(path: &Path) -> Result<Vec<TelemetrySummary>> {
-    let mut summaries = Vec::new();
-    collect_telemetry_summaries_inner(path, &mut summaries)?;
-    Ok(summaries)
-}
-
-fn collect_telemetry_summaries_inner(
-    path: &Path,
-    summaries: &mut Vec<TelemetrySummary>,
-) -> Result<()> {
-    if path.is_file() {
-        if path.file_name().and_then(|value| value.to_str()) == Some("telemetry_summary.json") {
-            let raw = std::fs::read_to_string(path).map_err(|source| NetdiagError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            let summary: TelemetrySummary = serde_json::from_str(&raw)?;
-            summaries.push(summary);
-        }
-        return Ok(());
-    }
-    if !path.exists() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "runs path does not exist: {}",
-            path.display()
-        )));
-    }
-    for entry in std::fs::read_dir(path).map_err(|source| NetdiagError::Io {
-        path: path.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| NetdiagError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        collect_telemetry_summaries_inner(&entry.path(), summaries)?;
-    }
-    Ok(())
-}
-
-fn mean_or_default(values: &[f64], default: f64) -> f64 {
-    if values.is_empty() {
-        default
-    } else {
-        values.iter().sum::<f64>() / values.len() as f64
-    }
-}
-
-fn calibration_warnings(latency: &[f64], loss: &[f64], throughput: &[f64]) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if latency.is_empty() {
-        warnings.push(
-            "no finite latency p95 observations; kept conservative latency defaults".to_string(),
-        );
-    }
-    if loss.is_empty() {
-        warnings.push("no finite loss observations; kept zero-loss calibration".to_string());
-    }
-    if throughput.is_empty() {
-        warnings.push(
-            "no finite throughput observations; capacity calibration used 1 Mbps floor".to_string(),
-        );
-    }
-    warnings
-}
-
-fn shortest_path_link_ids(model: &TopologyModel) -> Result<Vec<String>> {
-    let mut graph = UnGraph::<&str, f64>::new_undirected();
-    let mut indices = BTreeMap::<&str, NodeIndex>::new();
-    for node in &model.nodes {
-        indices.insert(node.id.as_str(), graph.add_node(node.id.as_str()));
-    }
-    for link in &model.links {
-        let source = *indices.get(link.source.as_str()).ok_or_else(|| {
-            NetdiagError::InvalidTrace(format!("unknown source node {}", link.source))
-        })?;
-        let target = *indices.get(link.target.as_str()).ok_or_else(|| {
-            NetdiagError::InvalidTrace(format!("unknown target node {}", link.target))
-        })?;
-        graph.add_edge(source, target, link.latency_ms.max(0.1));
-    }
-    let (start, end) = topology_endpoints(model, &indices)?;
-    let Some((_, nodes)) = astar(
-        &graph,
-        start,
-        |candidate| candidate == end,
-        |edge| *edge.weight(),
-        |_| 0.0,
-    ) else {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "topology {} has no connected client-to-server path",
-            model.key
-        )));
-    };
-    let mut link_ids = Vec::new();
-    for pair in nodes.windows(2) {
-        let left = graph[pair[0]];
-        let right = graph[pair[1]];
-        let link = model
-            .links
-            .iter()
-            .find(|link| {
-                (link.source == left && link.target == right)
-                    || (link.source == right && link.target == left)
-            })
-            .ok_or_else(|| {
-                NetdiagError::InvalidTrace(format!(
-                    "topology {} path references missing link {left}<->{right}",
-                    model.key
-                ))
-            })?;
-        link_ids.push(link.id.clone());
-    }
-    Ok(link_ids)
 }
 
 pub fn topology_graph(key: &str) -> Result<UnGraph<String, ()>> {
@@ -481,18 +288,34 @@ pub fn topology_model(key: &str) -> Result<TopologyModel> {
 }
 
 pub fn validate_topology_model(model: &TopologyModel) -> Result<()> {
+    validate_portable_id("topology key", &model.key)?;
+    validate_bounded_string("topology name", &model.name, false)?;
     if model.nodes.is_empty() {
         return Err(NetdiagError::InvalidTrace(
             "topology has no nodes".to_string(),
         ));
     }
+    if model.nodes.len() > MAX_TOPOLOGY_NODES {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "topology contains {} nodes, maximum is {MAX_TOPOLOGY_NODES}",
+            model.nodes.len()
+        )));
+    }
+    if model.links.len() > MAX_TOPOLOGY_LINKS {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "topology contains {} links, maximum is {MAX_TOPOLOGY_LINKS}",
+            model.links.len()
+        )));
+    }
+    let mut metadata_entries = model.metadata.len();
     let mut node_ids = BTreeSet::new();
     for node in &model.nodes {
-        if node.id.trim().is_empty() {
-            return Err(NetdiagError::InvalidTrace(
-                "topology node id is empty".to_string(),
-            ));
-        }
+        validate_bounded_string("topology node id", &node.id, false)?;
+        validate_bounded_string("topology node label", &node.label, false)?;
+        validate_bounded_string("topology node role", &node.role, true)?;
+        metadata_entries = metadata_entries
+            .checked_add(node.metadata.len())
+            .ok_or_else(|| metadata_count_overflow(&model.key))?;
         if !node_ids.insert(node.id.as_str()) {
             return Err(NetdiagError::InvalidTrace(format!(
                 "duplicate topology node id: {}",
@@ -507,11 +330,12 @@ pub fn validate_topology_model(model: &TopologyModel) -> Result<()> {
     }
     let mut link_ids = BTreeSet::new();
     for link in &model.links {
-        if link.id.trim().is_empty() {
-            return Err(NetdiagError::InvalidTrace(
-                "topology link id is empty".to_string(),
-            ));
-        }
+        validate_bounded_string("topology link id", &link.id, false)?;
+        validate_bounded_string("topology link source", &link.source, false)?;
+        validate_bounded_string("topology link target", &link.target, false)?;
+        metadata_entries = metadata_entries
+            .checked_add(link.metadata.len())
+            .ok_or_else(|| metadata_count_overflow(&model.key))?;
         if !link_ids.insert(link.id.as_str()) {
             return Err(NetdiagError::InvalidTrace(format!(
                 "duplicate topology link id: {}",
@@ -521,6 +345,12 @@ pub fn validate_topology_model(model: &TopologyModel) -> Result<()> {
         if !node_ids.contains(link.source.as_str()) || !node_ids.contains(link.target.as_str()) {
             return Err(NetdiagError::InvalidTrace(format!(
                 "topology link {} references an unknown node",
+                link.id
+            )));
+        }
+        if link.source == link.target {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "topology link {} is a self-loop",
                 link.id
             )));
         }
@@ -542,8 +372,40 @@ pub fn validate_topology_model(model: &TopologyModel) -> Result<()> {
                 link.id
             )));
         }
+        if link.loss_pct > 100.0 {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "topology link {} loss_pct must not exceed 100",
+                link.id
+            )));
+        }
+    }
+    if metadata_entries > MAX_TOPOLOGY_METADATA_ENTRIES {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "topology {} contains {metadata_entries} metadata entries, maximum is {MAX_TOPOLOGY_METADATA_ENTRIES}",
+            model.key
+        )));
+    }
+    graph::validate_connected(model)?;
+    graph::shortest_path_link_indices(model)?;
+    Ok(())
+}
+
+fn validate_bounded_string(kind: &str, value: &str, allow_empty: bool) -> Result<()> {
+    if !allow_empty && value.trim().is_empty() {
+        return Err(NetdiagError::InvalidTrace(format!("{kind} is empty")));
+    }
+    if value.len() > MAX_TOPOLOGY_STRING_BYTES {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "{kind} exceeds the {MAX_TOPOLOGY_STRING_BYTES}-byte limit"
+        )));
     }
     Ok(())
+}
+
+fn metadata_count_overflow(topology_key: &str) -> NetdiagError {
+    NetdiagError::InvalidTrace(format!(
+        "topology {topology_key} metadata entry count overflowed"
+    ))
 }
 
 pub fn run_simulated_whatif(
@@ -890,39 +752,22 @@ struct TopologyStats {
 }
 
 fn topology_stats(model: &TopologyModel) -> Result<TopologyStats> {
-    let mut graph = UnGraph::<&str, f64>::new_undirected();
-    let mut indices = BTreeMap::<&str, NodeIndex>::new();
-    for node in &model.nodes {
-        indices.insert(node.id.as_str(), graph.add_node(node.id.as_str()));
+    let path = graph::shortest_path_link_indices(model)?;
+    let mut path_latency_ms = 0.0;
+    let mut path_loss_pct = 0.0;
+    let mut bottleneck_mbps = f64::INFINITY;
+    for link in path.into_iter().map(|index| &model.links[index]) {
+        path_latency_ms += link.latency_ms;
+        path_loss_pct += link.loss_pct;
+        bottleneck_mbps = bottleneck_mbps.min(link.capacity_mbps);
     }
-    for link in &model.links {
-        let source = *indices.get(link.source.as_str()).ok_or_else(|| {
-            NetdiagError::InvalidTrace(format!("unknown source node {}", link.source))
-        })?;
-        let target = *indices.get(link.target.as_str()).ok_or_else(|| {
-            NetdiagError::InvalidTrace(format!("unknown target node {}", link.target))
-        })?;
-        graph.add_edge(source, target, link.latency_ms.max(0.1));
-    }
-    let (start, end) = topology_endpoints(model, &indices)?;
-    let distances = dijkstra(&graph, start, Some(end), |edge| *edge.weight());
-    let path_latency_ms = distances.get(&end).copied().ok_or_else(|| {
-        NetdiagError::InvalidTrace(format!(
-            "topology {} has no connected client-to-server path",
+    if !path_latency_ms.is_finite() || !path_loss_pct.is_finite() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "topology {} path metrics overflowed",
             model.key
-        ))
-    })?;
-    let path_loss_pct = if model.links.is_empty() {
-        0.0
-    } else {
-        model.links.iter().map(|link| link.loss_pct).sum::<f64>() / model.links.len() as f64
-    };
-    let bottleneck_mbps = model
-        .links
-        .iter()
-        .map(|link| link.capacity_mbps)
-        .fold(f64::INFINITY, f64::min)
-        .max(1.0);
+        )));
+    }
+    let bottleneck_mbps = bottleneck_mbps.max(1.0);
     let redundant_paths = model.links.len() >= model.nodes.len();
     Ok(TopologyStats {
         path_latency_ms,
@@ -977,11 +822,21 @@ fn redundancy_score(model: &TopologyModel) -> f64 {
 }
 
 fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+    round_decimal(value, 100.0)
 }
 
 fn round4(value: f64) -> f64 {
-    (value * 10_000.0).round() / 10_000.0
+    round_decimal(value, 10_000.0)
+}
+
+pub(crate) fn round_decimal(value: f64, scale: f64) -> f64 {
+    if value.abs() > f64::MAX / scale {
+        // At this magnitude f64 has no fractional precision at the requested
+        // decimal scale, so the finite input is already effectively rounded.
+        value
+    } else {
+        (value * scale).round() / scale
+    }
 }
 
 fn pct_delta(proposed: f64, baseline: f64) -> f64 {
@@ -989,201 +844,4 @@ fn pct_delta(proposed: f64, baseline: f64) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::{
-        DistributionStats, OverallTelemetry, ThroughputStats, TwinPolicyActionKind,
-    };
-    use serde_json::json;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn built_in_topology_models_are_valid() {
-        for name in topology_names() {
-            validate_topology_model(&topology_model(name).expect("topology")).expect("valid");
-        }
-    }
-
-    #[test]
-    fn custom_topology_changes_what_if_output() {
-        let telemetry = telemetry();
-        let mut line = topology_model("line").expect("line");
-        line.key = "custom_line".to_string();
-        line.links[0].capacity_mbps = 25.0;
-
-        let result =
-            run_simulated_whatif_with_model(&telemetry, &line, "reroute_path_b").expect("whatif");
-
-        assert_eq!(result.topology, "custom_line");
-        assert!(result.topology_snapshot.is_some());
-        assert!(
-            result
-                .baseline
-                .get("bottleneck_mbps")
-                .and_then(|value| value.as_f64())
-                .is_some_and(|value| (value - 25.0).abs() < f64::EPSILON)
-        );
-    }
-
-    #[test]
-    fn invalid_topology_rejects_unknown_link_node() {
-        let mut model = topology_model("line").expect("line");
-        model.links[0].target = "missing".to_string();
-        let err = validate_topology_model(&model).expect_err("invalid");
-        assert!(err.to_string().contains("unknown node"));
-    }
-
-    #[test]
-    fn topology_json_import_export_round_trips_and_validates() {
-        let model = topology_model("mesh").expect("mesh");
-
-        let exported = export_topology(&model, TopologyFormat::Json).expect("export");
-        let imported = import_topology(&exported, TopologyFormat::Json).expect("import");
-
-        assert_eq!(imported, model);
-
-        let yaml = export_topology(&model, TopologyFormat::Yaml).expect("yaml export");
-        let imported_yaml = import_topology(&yaml, TopologyFormat::Yaml).expect("yaml import");
-
-        assert_eq!(imported_yaml, model);
-    }
-
-    #[test]
-    fn topology_json_import_rejects_invalid_model() {
-        let mut model = topology_model("line").expect("line");
-        model.links[0].capacity_mbps = 0.0;
-        let invalid_json = serde_json::to_string(&model).expect("json");
-
-        let err = import_topology_json(&invalid_json).expect_err("invalid topology");
-
-        assert!(err.to_string().contains("capacity must be greater than 0"));
-    }
-
-    #[test]
-    fn topology_stats_rejects_disconnected_endpoint_path() {
-        let mut model = topology_model("line").expect("line");
-        model.links.truncate(1);
-
-        let err = topology_stats(&model).expect_err("disconnected topology");
-
-        assert!(
-            err.to_string()
-                .contains("no connected client-to-server path")
-        );
-    }
-
-    #[test]
-    fn topology_calibration_updates_link_metrics_from_run_summaries() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let run_dir = temp.path().join("runs").join("run-1");
-        std::fs::create_dir_all(&run_dir).expect("run dir");
-        let summary = TelemetrySummary {
-            overall: telemetry(),
-            windows: Vec::new(),
-            metric_provenance: Vec::new(),
-        };
-        std::fs::write(
-            run_dir.join("telemetry_summary.json"),
-            serde_json::to_vec_pretty(&summary).expect("summary"),
-        )
-        .expect("write summary");
-
-        let report =
-            calibrate_topology_from_runs(&topology_model("line").expect("line"), temp.path())
-                .expect("calibration");
-
-        assert_eq!(report.source_runs, 1);
-        assert!(
-            report
-                .updated_metrics
-                .contains(&"capacity_mbps".to_string())
-        );
-        assert!(report.calibrated_topology.links[0].latency_ms > 0.0);
-        assert!(
-            report.calibrated_topology.links[0]
-                .metadata
-                .contains_key("calibrated_from_runs")
-        );
-    }
-
-    #[test]
-    fn policy_action_traffic_shift_scales_deltas() {
-        let telemetry = telemetry();
-        let line = topology_model("line").expect("line");
-        let action = TwinPolicyAction {
-            id: "shift_half_to_path_b".to_string(),
-            kind: TwinPolicyActionKind::TrafficShift,
-            target: TwinPolicyTarget {
-                path_id: Some("path_b".to_string()),
-                ..TwinPolicyTarget::default()
-            },
-            parameters: BTreeMap::from([("traffic_shift_pct".to_string(), json!(50.0))]),
-            impact: TwinPolicyImpact {
-                latency_delta_pct: -0.20,
-                loss_delta_pct: -0.30,
-                throughput_delta_pct: 0.20,
-            },
-            qoe_risk: "medium".to_string(),
-            notes: "Shift half of matching traffic to path B".to_string(),
-            metadata: BTreeMap::new(),
-        };
-
-        let result = run_simulated_whatif_with_policy(&telemetry, &line, &action).expect("whatif");
-
-        assert_eq!(result.action_id, "shift_half_to_path_b");
-        assert_eq!(
-            result.policy_action.as_ref().map(|action| action.kind),
-            Some(TwinPolicyActionKind::TrafficShift)
-        );
-        assert!(result.delta["latency_pct"] < 0.0);
-        assert!(result.delta["throughput_pct"] > 0.0);
-        assert!(result.modified_topology_snapshot.is_some());
-    }
-
-    #[test]
-    fn policy_presets_keep_legacy_action_ids() {
-        let presets = policy_action_presets();
-
-        assert_eq!(presets.len(), action_names().len());
-        assert_eq!(
-            action("reroute_path_b").expect("action").id,
-            "reroute_path_b"
-        );
-        assert_eq!(
-            action("increase_queue").expect("action").kind,
-            TwinPolicyActionKind::QueueLimit
-        );
-        assert_eq!(
-            action("reduce_bandwidth").expect("action").kind,
-            TwinPolicyActionKind::CapacityChange
-        );
-    }
-
-    fn telemetry() -> OverallTelemetry {
-        OverallTelemetry {
-            duration_s: 30.0,
-            samples: 10,
-            latency: DistributionStats {
-                mean: 80.0,
-                ..DistributionStats::default()
-            },
-            jitter_ms: DistributionStats {
-                mean: 5.0,
-                ..DistributionStats::default()
-            },
-            packet_loss_rate: 1.0,
-            retransmission_rate: 0.5,
-            timeout_events: 0.0,
-            retry_events: 0.0,
-            throughput_mbps: ThroughputStats {
-                mean: 20.0,
-                p95: 22.0,
-                min: Some(18.0),
-            },
-            dns_failure_events: 0.0,
-            tls_failure_events: 0.0,
-            quic_blocked_ratio: 0.0,
-            window_count: 1,
-        }
-    }
-}
+mod tests;

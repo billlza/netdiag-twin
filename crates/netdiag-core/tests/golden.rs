@@ -1,26 +1,26 @@
 use float_cmp::approx_eq;
 use netdiag_core::error::NetdiagError;
+use netdiag_core::hil_review::review_recommendation;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
     LabPreflightMode, LabPreflightOptions, load_lab_scenario, preflight_lab_scenario,
 };
 use netdiag_core::ml::{
-    MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, export_feedback_training_dataset,
-    load_or_train_model, train_model_from_jsonl,
+    MODEL_CURRENT_FILE_NAME, MODEL_FILE_NAME, export_feedback_training_dataset,
+    load_existing_model_bundle_identity, load_or_train_model, train_model_from_jsonl,
 };
 use netdiag_core::models::{
     ConnectorHealthStatus, FaultLabel, HilFeedbackRecord, HilReviewSummary, HilState,
-    MetricProvenance, MetricQuality, ModelManifest, Recommendation, RecommendationKind,
-    RunHistoryFilter, RunIndexEntry, RunManifest, TwinPolicyActionKind,
+    MetricProvenance, MetricQuality, Recommendation, RecommendationKind, RunHistoryFilter,
+    RunIndexEntry, RunManifest, TwinPolicyActionKind,
 };
 use netdiag_core::pipeline::{PipelineResult, diagnose_file};
 use netdiag_core::report::Report;
 use netdiag_core::rules::diagnose_rules;
 use netdiag_core::storage::{
-    list_run_history_filtered, read_connector_health, review_recommendation, run_artifacts,
-    run_evidence, save_json_atomic,
+    list_run_history_filtered, read_connector_health, run_artifacts, run_evidence, save_json_atomic,
 };
-use netdiag_core::telemetry::summarize_telemetry;
+use netdiag_core::telemetry::{summarize_ingest, summarize_telemetry};
 use netdiag_core::twin::run_simulated_whatif;
 use serde::ser::{Error as _, Serialize, Serializer};
 use serde_json::json;
@@ -57,7 +57,7 @@ fn sample_rules_match_expected_business_labels() {
     for (name, expected) in cases {
         let ingest = ingest_trace(sample(name)).expect("sample ingest");
         assert_eq!(ingest.schema.rows, 80, "{name}");
-        let summary = summarize_telemetry(&ingest.records, 5).expect("summary");
+        let summary = summarize_ingest(&ingest, 5).expect("summary");
         assert_eq!(summary.windows.len(), 16, "{name}");
         let first_window = &summary.windows[0].latency_ms;
         assert!(first_window.p50 <= first_window.p95, "{name}");
@@ -221,11 +221,9 @@ fn full_pipeline_writes_artifacts_and_rust_ml_top_label() {
             .all(|entry| entry.status == "pending_review")
     );
 
-    let model_manifest: ModelManifest = serde_json::from_slice(
-        &fs::read(temp.path().join("model").join(MODEL_MANIFEST_FILE_NAME))
-            .expect("model manifest"),
-    )
-    .expect("model manifest json");
+    let model_manifest = load_existing_model_bundle_identity(&temp.path().join("model"))
+        .expect("model identity")
+        .manifest;
     assert!(model_manifest.synthetic_fallback);
     assert_eq!(model_manifest.model_file, MODEL_FILE_NAME);
     assert_eq!(model_manifest.feature_names.len(), 11);
@@ -259,8 +257,8 @@ fn training_jsonl_writes_model_manifest() {
     assert_eq!(manifest.training_examples, FaultLabel::ALL.len());
     assert_eq!(manifest.feature_names.len(), 11);
     assert_eq!(manifest.labels.len(), FaultLabel::ALL.len());
-    assert!(model_dir.join(MODEL_FILE_NAME).exists());
-    assert!(model_dir.join(MODEL_MANIFEST_FILE_NAME).exists());
+    assert!(model_dir.join(MODEL_CURRENT_FILE_NAME).exists());
+    assert!(!model_dir.join(MODEL_FILE_NAME).exists());
 }
 
 #[test]
@@ -269,10 +267,9 @@ fn load_or_train_model_writes_synthetic_fallback_manifest() {
     let model_dir = temp.path().join("model");
     load_or_train_model(&model_dir).expect("fallback model");
 
-    let manifest: ModelManifest = serde_json::from_slice(
-        &fs::read(model_dir.join(MODEL_MANIFEST_FILE_NAME)).expect("model manifest"),
-    )
-    .expect("model manifest json");
+    let manifest = load_existing_model_bundle_identity(&model_dir)
+        .expect("model identity")
+        .manifest;
     assert!(manifest.synthetic_fallback);
     assert_eq!(manifest.training_source, "synthetic_fallback");
     assert_eq!(manifest.model_file, MODEL_FILE_NAME);

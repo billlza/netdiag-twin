@@ -174,7 +174,7 @@ fn quality(summary: &TelemetrySummary, field: &str) -> MetricQuality {
         .iter()
         .find(|item| item.field == field)
         .map(|item| item.quality)
-        .unwrap_or(MetricQuality::Measured)
+        .unwrap_or(MetricQuality::Missing)
 }
 
 fn severity_for_ratio(ratio: f64) -> Severity {
@@ -262,6 +262,9 @@ fn metric(name: &str, value: f64, unit: &str) -> MetricPoint {
 trait RoundTo2 {
     fn round_to_2(self) -> f64;
 }
+
+#[cfg(test)]
+mod tests;
 
 impl RoundTo2 for f64 {
     fn round_to_2(self) -> f64 {

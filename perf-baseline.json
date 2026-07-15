@@ -28,6 +28,11 @@
       "rows": 0,
       "iterations": 1
     },
+    "ml_secure_bundle_load": {
+      "max_millis": 50.0,
+      "rows": 0,
+      "iterations": 1
+    },
     "pipeline_six_samples_cached_model": {
       "max_millis": 2500.0,
       "rows": 480,

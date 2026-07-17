@@ -1,0 +1,23 @@
+[package]
+name = "netdiag-platform"
+description = "Audited native platform boundaries for NetDiag Twin"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[dependencies]
+getrandom.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

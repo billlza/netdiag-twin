@@ -1,30 +1,75 @@
 use crate::error::{NetdiagError, Result};
 use crate::ingest::{
-    CANONICAL_COLUMNS, build_ingest_result, finalize_warning_metric_provenance,
-    measured_metric_provenance, set_metric_provenance,
+    build_ingest_result, finalize_warning_metric_provenance, measured_metric_provenance,
+    set_metric_provenance,
 };
 use crate::models::{IngestResult, IngestWarning, MetricQuality, TraceRecord};
+use crate::resource_limits::MAX_SOURCE_INPUT_BYTES;
+use crate::storage::read_stable_regular_file_bounded_with_checkpoint;
 use chrono::{DateTime, TimeZone, Utc};
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
-use opentelemetry_proto::tonic as otlp;
-use otlp::collector::metrics::v1::{
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
-    metrics_service_server::{MetricsService, MetricsServiceServer},
-};
-use otlp::metrics::v1::{Metric, metric, number_data_point};
 use pcap::Capture;
-use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::process::Command;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tonic::{Request, Response, Status};
+
+pub mod authentication;
+mod capture_deadline;
+mod http_client;
+mod http_endpoint;
+mod http_json;
+mod metric_mapping;
+mod otlp;
+mod pcap_file;
+mod pcap_read_error;
+mod pcap_validation;
+mod probe;
+mod prometheus;
+mod prometheus_mapping;
+mod prometheus_matrix;
+mod resource_budget;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+mod system_counters_process;
+mod validation;
+use capture_deadline::CaptureDeadline;
+pub(crate) use http_endpoint::parse_http_endpoint;
+pub use http_endpoint::{
+    HttpEndpointError, validate_http_connector_bearer_endpoint, validate_http_connector_endpoint,
+};
+pub use http_json::{load_http_json, validate_http_json_metadata};
+pub use metric_mapping::{
+    MetricMappingError, validate_prometheus_query_mapping, validate_wire_metric_mapping,
+};
+use metric_mapping::{merge_prometheus_query_mapping, merge_wire_metric_mapping};
+pub(crate) use otlp::parse_loopback_bind_addr;
+#[cfg(test)]
+use otlp::parse_otlp_metrics_request;
+pub use otlp::{
+    OtlpGrpcReceiverConfig, OtlpReceiverSession, OtlpShutdownOutcome, load_otlp_grpc_receiver,
+};
+use pcap_file::PcapFileReader;
+use pcap_read_error::pcap_device_read_error;
+use pcap_validation::validated_capture_window;
+pub use probe::{
+    LocalProbeConfig, ProbeExecutionOptions, WebsiteProbeConfig, load_local_probe,
+    load_local_probe_with_control, load_website_probe, load_website_probe_with_control,
+};
+pub use prometheus::{load_prometheus_exposition, load_prometheus_query_range};
+pub use prometheus_mapping::load_prometheus_mapping_file;
+use resource_budget::NetworkSourceBudget;
+#[cfg(all(test, target_os = "macos"))]
+use system_counters_process::NETSTAT_PROGRAM;
+#[cfg(target_os = "macos")]
+use system_counters_process::read_netstat_output;
+pub use validation::{PrometheusQueryWindowError, validate_prometheus_query_window};
+use validation::{validate_native_pcap_config, validate_system_counters_config};
 
 const REQUIRED_METRICS: [&str; 6] = [
     "latency_ms",
@@ -49,6 +94,13 @@ pub struct ConnectorLoadResult {
     pub sample: String,
     pub provenance: BTreeMap<String, String>,
     pub payload: Option<Value>,
+    pub resource_usage: ConnectorResourceUsage,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnectorResourceUsage {
+    pub input_bytes: u64,
+    pub records: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,17 +163,25 @@ impl CaptureControl {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpJsonConfig {
     pub endpoint: String,
-    pub bearer_token: Option<String>,
     pub timeout: Duration,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for HttpJsonConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpJsonConfig")
+            .field("endpoint", &crate::reliability::redact_url(&self.endpoint))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct PrometheusQueryRangeConfig {
     pub base_url: String,
-    pub bearer_token: Option<String>,
     pub timeout: Duration,
     pub lookback_seconds: i64,
     pub step_seconds: u64,
@@ -129,190 +189,37 @@ pub struct PrometheusQueryRangeConfig {
     pub sample: String,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for PrometheusQueryRangeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrometheusQueryRangeConfig")
+            .field("base_url", &crate::reliability::redact_url(&self.base_url))
+            .field("timeout", &self.timeout)
+            .field("lookback_seconds", &self.lookback_seconds)
+            .field("step_seconds", &self.step_seconds)
+            .field("query_entries", &self.queries.len())
+            .field("sample", &self.sample)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct PrometheusExpositionConfig {
     pub endpoint: String,
-    pub bearer_token: Option<String>,
     pub timeout: Duration,
     pub metrics: BTreeMap<String, String>,
     pub sample: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct OtlpGrpcReceiverConfig {
-    pub bind_addr: String,
-    pub timeout: Duration,
-    pub metrics: BTreeMap<String, String>,
-    pub sample: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct OtlpMetricFrame {
-    pub received_at: DateTime<Utc>,
-    pub request: ExportMetricsServiceRequest,
-}
-
-#[derive(Debug)]
-pub struct OtlpReceiverSession {
-    bind_addr: SocketAddr,
-    metrics: BTreeMap<String, String>,
-    sample: String,
-    buffer: Arc<Mutex<VecDeque<OtlpMetricFrame>>>,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    server: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
-}
-
-impl OtlpReceiverSession {
-    pub fn start(config: &OtlpGrpcReceiverConfig) -> Result<Self> {
-        let bind_addr: SocketAddr =
-            config.bind_addr.trim().parse().map_err(|err| {
-                NetdiagError::Connector(format!("invalid OTLP bind address: {err}"))
-            })?;
-        let buffer = Arc::new(Mutex::new(VecDeque::new()));
-        let service = OtlpMetricsReceiver {
-            buffer: Arc::clone(&buffer),
-            max_frames: 256,
-        };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|err| err.to_string())?;
-            runtime
-                .block_on(async move {
-                    tonic::transport::Server::builder()
-                        .add_service(MetricsServiceServer::new(service))
-                        .serve_with_shutdown(bind_addr, async {
-                            let _ = shutdown_rx.await;
-                        })
-                        .await
-                        .map_err(|err| err.to_string())
-                })
-                .map_err(|err| err.to_string())
-        });
-        std::thread::sleep(Duration::from_millis(50));
-        if server.is_finished() {
-            let outcome = server
-                .join()
-                .unwrap_or_else(|_| Err("OTLP receiver thread panicked".to_string()));
-            let err = outcome
-                .err()
-                .unwrap_or_else(|| "OTLP receiver exited immediately".to_string());
-            return Err(NetdiagError::Connector(format!(
-                "OTLP gRPC receiver failed to start: {err}"
-            )));
-        }
-        Ok(Self {
-            bind_addr,
-            metrics: merged_mapping(&config.metrics),
-            sample: config.sample.clone(),
-            buffer,
-            shutdown: Some(shutdown_tx),
-            server: Some(server),
-        })
-    }
-
-    pub fn snapshot(&self, lookback: Duration) -> Result<ConnectorLoadResult> {
-        let cutoff = Utc::now()
-            - chrono::Duration::from_std(lookback).unwrap_or_else(|_| chrono::Duration::seconds(1));
-        let frames = self
-            .buffer
-            .lock()
-            .map_err(|_| NetdiagError::Connector("OTLP receiver buffer poisoned".to_string()))?
-            .iter()
-            .filter(|frame| frame.received_at >= cutoff)
-            .cloned()
-            .collect::<Vec<_>>();
-        if frames.is_empty() {
-            return Err(NetdiagError::Connector(
-                "OTLP receiver is listening but has not received metrics yet".to_string(),
-            ));
-        }
-        let mut records = Vec::new();
-        let mut warnings = Vec::new();
-        let mut dropped_frames = 0usize;
-        for frame in frames {
-            let (values, timestamp_ms) = parse_otlp_metrics_request(&frame.request, &self.metrics)?;
-            if !required_payload_metrics()
-                .iter()
-                .all(|metric| values.contains_key(*metric))
-            {
-                dropped_frames += 1;
-                continue;
-            }
-            warnings.extend(fallback_warnings_for_missing_events(
-                &values,
-                "OTLP metric is missing",
-            ));
-            records.push(record_from_values(timestamp_ms, &values, &mut warnings)?);
-        }
-        if dropped_frames > 0 {
-            warnings.push(IngestWarning {
-                row: None,
-                column: "otlp_frame".to_string(),
-                reason: format!(
-                    "OTLP frames missing required metrics were dropped: {dropped_frames}"
-                ),
-                fallback: "drop frame".to_string(),
-            });
-        }
-        if records.is_empty() {
-            return Err(NetdiagError::Connector(
-                "OTLP receiver has no complete metric frame to diagnose".to_string(),
-            ));
-        }
-        let mut ingest = build_ingest_result(records, self.sample.clone())?;
-        ingest.warnings.extend(warnings);
-        replace_metric_provenance(&mut ingest, "otlp_grpc_session");
-        Ok(ConnectorLoadResult {
-            sample: self.sample.clone(),
-            ingest,
-            provenance: BTreeMap::from([
-                ("kind".to_string(), "otlp_grpc_session".to_string()),
-                ("bind_addr".to_string(), self.bind_addr.to_string()),
-            ]),
-            payload: Some(serde_json::json!({
-                "frames_buffered": self.buffer.lock().map(|buffer| buffer.len()).unwrap_or_default(),
-            })),
-        })
-    }
-
-    pub fn buffered_frames(&self) -> usize {
-        self.buffer
-            .lock()
-            .map(|buffer| buffer.len())
-            .unwrap_or_default()
-    }
-
-    pub fn last_received_at(&self) -> Option<DateTime<Utc>> {
-        self.buffer
-            .lock()
-            .ok()
-            .and_then(|buffer| buffer.back().map(|frame| frame.received_at))
-    }
-
-    pub fn stop(mut self) -> Result<()> {
-        self.stop_inner()
-    }
-
-    fn stop_inner(&mut self) -> Result<()> {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(server) = self.server.take() {
-            server
-                .join()
-                .map_err(|_| NetdiagError::Connector("OTLP receiver thread panicked".to_string()))?
-                .map_err(|err| NetdiagError::Connector(format!("OTLP receiver failed: {err}")))?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for OtlpReceiverSession {
-    fn drop(&mut self) {
-        let _ = self.stop_inner();
+impl std::fmt::Debug for PrometheusExpositionConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrometheusExpositionConfig")
+            .field("endpoint", &crate::reliability::redact_url(&self.endpoint))
+            .field("timeout", &self.timeout)
+            .field("metric_entries", &self.metrics.len())
+            .field("sample", &self.sample)
+            .finish()
     }
 }
 
@@ -360,245 +267,6 @@ fn replace_metric_provenance(ingest: &mut IngestResult, source: &str) {
     finalize_warning_metric_provenance(ingest, source);
 }
 
-pub fn load_http_json(config: &HttpJsonConfig) -> Result<ConnectorLoadResult> {
-    if config.endpoint.trim().is_empty() {
-        return Err(NetdiagError::Connector(
-            "HTTP/JSON endpoint is empty".to_string(),
-        ));
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .map_err(|err| NetdiagError::Connector(err.to_string()))?;
-    let mut request = client.get(config.endpoint.trim());
-    if let Some(token) = config
-        .bearer_token
-        .as_deref()
-        .filter(|token| !token.is_empty())
-    {
-        request = request.bearer_auth(token);
-    }
-    let value: Value = request
-        .send()
-        .map_err(|err| NetdiagError::Connector(format!("HTTP/JSON request failed: {err}")))?
-        .error_for_status()
-        .map_err(|err| NetdiagError::Connector(format!("HTTP/JSON returned error status: {err}")))?
-        .json()
-        .map_err(|err| {
-            NetdiagError::Connector(format!("HTTP/JSON response is not valid JSON: {err}"))
-        })?;
-    let records_value = value
-        .get("records")
-        .cloned()
-        .unwrap_or_else(|| value.clone());
-    let records: Vec<TraceRecord> = serde_json::from_value(records_value).map_err(|err| {
-        NetdiagError::Connector(format!(
-            "HTTP/JSON must return TraceRecord[] or {{ records: TraceRecord[] }}: {err}"
-        ))
-    })?;
-    let sample = value
-        .get("sample")
-        .and_then(Value::as_str)
-        .unwrap_or("http_json")
-        .to_string();
-    let mut ingest = build_ingest_result(records, sample.clone())?;
-    replace_metric_provenance(&mut ingest, "http_json");
-    Ok(ConnectorLoadResult {
-        ingest,
-        sample,
-        provenance: BTreeMap::from([("endpoint".to_string(), config.endpoint.clone())]),
-        payload: Some(value),
-    })
-}
-
-pub fn load_prometheus_query_range(
-    config: &PrometheusQueryRangeConfig,
-) -> Result<ConnectorLoadResult> {
-    if config.base_url.trim().is_empty() {
-        return Err(NetdiagError::Connector(
-            "Prometheus base URL is empty".to_string(),
-        ));
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .map_err(|err| NetdiagError::Connector(err.to_string()))?;
-    let endpoint = prometheus_query_endpoint(&config.base_url);
-    let end = Utc::now();
-    let start = end - chrono::Duration::seconds(config.lookback_seconds.max(1));
-    let mut row_values: BTreeMap<i64, BTreeMap<String, f64>> = BTreeMap::new();
-    let mapping = merged_mapping(&config.queries);
-    let mut warnings = Vec::new();
-
-    for metric in CANONICAL_COLUMNS {
-        if metric == "timestamp" {
-            continue;
-        }
-        let Some(query) = mapping.get(metric).filter(|query| !query.trim().is_empty()) else {
-            if EVENT_METRICS.contains(&metric) {
-                warnings.push(fallback_warning(
-                    metric,
-                    "Prometheus query is not configured",
-                ));
-                continue;
-            }
-            return Err(NetdiagError::Connector(format!(
-                "Prometheus query is missing required metric {metric}"
-            )));
-        };
-        let matrix = query_prometheus_matrix(
-            &client,
-            &endpoint,
-            config.bearer_token.as_deref(),
-            query,
-            start.timestamp(),
-            end.timestamp(),
-            config.step_seconds.max(1),
-        )?;
-        if matrix.is_empty() {
-            if EVENT_METRICS.contains(&metric) {
-                warnings.push(fallback_warning(
-                    metric,
-                    "Prometheus query returned no data",
-                ));
-                continue;
-            }
-            return Err(NetdiagError::Connector(format!(
-                "Prometheus query returned no data for required metric {metric}"
-            )));
-        }
-        for (timestamp_ms, value) in matrix {
-            row_values
-                .entry(timestamp_ms)
-                .or_default()
-                .insert(metric.to_string(), value);
-        }
-    }
-
-    let mut dropped_rows = 0usize;
-    let mut records = Vec::new();
-    for (timestamp_ms, values) in row_values {
-        if !required_payload_metrics()
-            .iter()
-            .all(|metric| values.contains_key(*metric))
-        {
-            dropped_rows += 1;
-            continue;
-        }
-        records.push(record_from_values(timestamp_ms, &values, &mut warnings)?);
-    }
-    if dropped_rows > 0 {
-        warnings.push(IngestWarning {
-            row: None,
-            column: "timestamp".to_string(),
-            reason: format!(
-                "Prometheus rows missing required metrics were dropped: {dropped_rows}"
-            ),
-            fallback: "drop row".to_string(),
-        });
-    }
-    if records.is_empty() {
-        return Err(NetdiagError::Connector(
-            "Prometheus query_range produced no complete TraceRecord rows".to_string(),
-        ));
-    }
-    let mut ingest = build_ingest_result(records, config.sample.clone())?;
-    ingest.warnings.extend(warnings);
-    replace_metric_provenance(&mut ingest, "prometheus_query_range");
-    Ok(ConnectorLoadResult {
-        ingest,
-        sample: config.sample.clone(),
-        provenance: BTreeMap::from([
-            ("base_url".to_string(), config.base_url.clone()),
-            ("endpoint".to_string(), endpoint),
-        ]),
-        payload: None,
-    })
-}
-
-pub fn load_prometheus_exposition(
-    config: &PrometheusExpositionConfig,
-) -> Result<ConnectorLoadResult> {
-    if config.endpoint.trim().is_empty() {
-        return Err(NetdiagError::Connector(
-            "Prometheus exposition endpoint is empty".to_string(),
-        ));
-    }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .map_err(|err| NetdiagError::Connector(err.to_string()))?;
-    let mut request = client.get(config.endpoint.trim());
-    if let Some(token) = config
-        .bearer_token
-        .as_deref()
-        .filter(|token| !token.is_empty())
-    {
-        request = request.bearer_auth(token);
-    }
-    let body = request
-        .send()
-        .map_err(|err| NetdiagError::Connector(format!("Prometheus scrape failed: {err}")))?
-        .error_for_status()
-        .map_err(|err| NetdiagError::Connector(format!("Prometheus scrape status error: {err}")))?
-        .text()
-        .map_err(|err| NetdiagError::Connector(format!("Prometheus scrape body failed: {err}")))?;
-    let values = parse_prometheus_exposition(&body, &merged_mapping(&config.metrics))?;
-    let mut warnings = Vec::new();
-    for metric in EVENT_METRICS {
-        if !values.contains_key(metric) {
-            warnings.push(fallback_warning(
-                metric,
-                "Prometheus exposition metric is missing",
-            ));
-        }
-    }
-    for metric in required_payload_metrics() {
-        if !values.contains_key(metric) {
-            return Err(NetdiagError::Connector(format!(
-                "Prometheus exposition missing required metric {metric}"
-            )));
-        }
-    }
-    let record = record_from_values(Utc::now().timestamp_millis(), &values, &mut warnings)?;
-    let mut ingest = build_ingest_result(vec![record], config.sample.clone())?;
-    ingest.warnings.extend(warnings);
-    replace_metric_provenance(&mut ingest, "prometheus_exposition");
-    Ok(ConnectorLoadResult {
-        ingest,
-        sample: config.sample.clone(),
-        provenance: BTreeMap::from([("endpoint".to_string(), config.endpoint.clone())]),
-        payload: None,
-    })
-}
-
-pub fn load_otlp_grpc_receiver(config: &OtlpGrpcReceiverConfig) -> Result<ConnectorLoadResult> {
-    let session = OtlpReceiverSession::start(config)?;
-    let started = Instant::now();
-    loop {
-        match session.snapshot(config.timeout) {
-            Ok(result) => {
-                session.stop()?;
-                return Ok(result);
-            }
-            Err(err) if started.elapsed() < config.timeout => {
-                if !err.to_string().contains("has not received metrics yet") {
-                    session.stop()?;
-                    return Err(err);
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => {
-                session.stop()?;
-                return Err(NetdiagError::Connector(format!(
-                    "OTLP gRPC receiver timed out after {}s waiting for metrics",
-                    config.timeout.as_secs().max(1)
-                )));
-            }
-        }
-    }
-}
-
 pub fn load_native_pcap(config: &NativePcapConfig) -> Result<ConnectorLoadResult> {
     load_native_pcap_with_control(config, &CaptureControl::default())
 }
@@ -607,64 +275,33 @@ pub fn load_native_pcap_with_control(
     config: &NativePcapConfig,
     control: &CaptureControl,
 ) -> Result<ConnectorLoadResult> {
+    validate_native_pcap_config(config)?;
+    let deadline = CaptureDeadline::new(config.timeout, "native pcap capture")?;
+    deadline.ensure_remaining(control)?;
     let mut stats = PacketStats::default();
-    let started = Instant::now();
+    let mut input_budget = NetworkSourceBudget::default();
     report_pcap_progress(
         control,
         &stats,
-        started,
-        config.timeout,
+        deadline.started(),
+        deadline.timeout(),
         config.packet_limit,
         "starting",
         "opening capture source",
     );
-    if control.is_cancelled() {
-        return Err(NetdiagError::Connector(
-            "native pcap capture cancelled".to_string(),
-        ));
-    }
     match &config.source {
         NativePcapSource::File(path) => {
-            let mut capture = Capture::from_file(path).map_err(|err| {
-                NetdiagError::Connector(format!(
-                    "failed to open pcap file {}: {err}",
-                    path.display()
-                ))
-            })?;
-            let mut last_report = Instant::now();
-            while let Ok(packet) = capture.next_packet() {
-                if control.is_cancelled() {
-                    return Err(NetdiagError::Connector(
-                        "native pcap capture cancelled".to_string(),
-                    ));
-                }
-                observe_packet(
-                    packet_timestamp_ms(
-                        packet.header.ts.tv_sec,
-                        i64::from(packet.header.ts.tv_usec),
-                    ),
-                    packet.header.len as usize,
-                    packet.data,
-                    &mut stats,
-                );
-                if should_report_progress(last_report, &stats) {
-                    last_report = Instant::now();
-                    report_pcap_progress(
-                        control,
-                        &stats,
-                        started,
-                        config.timeout,
-                        config.packet_limit,
-                        "capturing",
-                        "reading pcap file",
-                    );
-                }
-                if stats.packet_count >= config.packet_limit.max(1) {
-                    break;
-                }
-            }
+            load_native_pcap_file(
+                path,
+                config.packet_limit,
+                deadline,
+                control,
+                &mut stats,
+                &mut input_budget,
+            )?;
         }
         NativePcapSource::Interface(interface) => {
+            deadline.ensure_remaining(control)?;
             let mut capture = Capture::from_device(interface.as_str())
                 .map_err(|err| {
                     NetdiagError::Connector(format!(
@@ -680,32 +317,29 @@ pub fn load_native_pcap_with_control(
                     ))
                 })?;
             let mut last_report = Instant::now();
-            while started.elapsed() < config.timeout
-                && stats.packet_count < config.packet_limit.max(1)
-            {
+            while !deadline.is_expired() && stats.packet_count < config.packet_limit {
                 if control.is_cancelled() {
-                    return Err(NetdiagError::Connector(
-                        "native pcap capture cancelled".to_string(),
-                    ));
+                    return Err(NetdiagError::CaptureCancelled {
+                        context: "native pcap capture",
+                    });
                 }
-                if let Ok(packet) = capture.next_packet() {
-                    observe_packet(
-                        packet_timestamp_ms(
-                            packet.header.ts.tv_sec,
-                            i64::from(packet.header.ts.tv_usec),
-                        ),
-                        packet.header.len as usize,
-                        packet.data,
+                match capture.next_packet() {
+                    Ok(packet) => observe_captured_packet(
+                        &packet,
                         &mut stats,
-                    );
+                        &mut input_budget,
+                        "native pcap interface",
+                    )?,
+                    Err(pcap::Error::TimeoutExpired) => {}
+                    Err(err) => return Err(pcap_device_read_error(interface, &err)),
                 }
                 if should_report_progress(last_report, &stats) {
                     last_report = Instant::now();
                     report_pcap_progress(
                         control,
                         &stats,
-                        started,
-                        config.timeout,
+                        deadline.started(),
+                        deadline.timeout(),
                         config.packet_limit,
                         "capturing",
                         "capturing live packets",
@@ -717,13 +351,60 @@ pub fn load_native_pcap_with_control(
     report_pcap_progress(
         control,
         &stats,
-        started,
-        config.timeout,
+        deadline.started(),
+        deadline.timeout(),
         config.packet_limit,
         "finishing",
         "building capture sample",
     );
     packet_stats_to_result(stats, &config.sample, &config.source)
+}
+
+fn load_native_pcap_file(
+    path: &Path,
+    packet_limit: usize,
+    deadline: CaptureDeadline,
+    control: &CaptureControl,
+    stats: &mut PacketStats,
+    input_budget: &mut NetworkSourceBudget,
+) -> Result<()> {
+    deadline.ensure_remaining(control)?;
+    let bytes =
+        read_stable_regular_file_bounded_with_checkpoint(path, MAX_SOURCE_INPUT_BYTES, || {
+            deadline.ensure_remaining(control)
+        })?
+        .ok_or_else(|| NetdiagError::Connector("native pcap file does not exist".to_string()))?;
+    deadline.ensure_remaining(control)?;
+    let mut reader = PcapFileReader::new(&bytes)?;
+    let mut last_report = Instant::now();
+    while stats.packet_count < packet_limit {
+        deadline.ensure_remaining(control)?;
+        let Some(packet) = reader.next_packet()? else {
+            break;
+        };
+        observe_captured_packet_parts(
+            packet.seconds,
+            packet.microseconds,
+            packet.original_length,
+            packet.data,
+            stats,
+            input_budget,
+            "native pcap file",
+        )?;
+        if should_report_progress(last_report, stats) {
+            last_report = Instant::now();
+            report_pcap_progress(
+                control,
+                stats,
+                deadline.started(),
+                deadline.timeout(),
+                packet_limit,
+                "capturing",
+                "reading pcap file",
+            );
+        }
+    }
+    deadline.ensure_remaining(control)
 }
 
 pub fn load_system_counters(config: &SystemCountersConfig) -> Result<ConnectorLoadResult> {
@@ -734,8 +415,9 @@ pub fn load_system_counters_with_control(
     config: &SystemCountersConfig,
     control: &CaptureControl,
 ) -> Result<ConnectorLoadResult> {
+    validate_system_counters_config(config)?;
     let started = Instant::now();
-    let interval = config.interval.min(Duration::from_secs(10));
+    let interval = config.interval;
     report_counter_progress(
         control,
         started,
@@ -746,16 +428,16 @@ pub fn load_system_counters_with_control(
         "reading initial interface counters",
     );
     if control.is_cancelled() {
-        return Err(NetdiagError::Connector(
-            "system counters capture cancelled".to_string(),
-        ));
+        return Err(NetdiagError::CaptureCancelled {
+            context: "system counters capture",
+        });
     }
-    let before = read_netstat_counters()?;
+    let before = read_netstat_counters(control)?;
     while started.elapsed() < interval {
         if control.is_cancelled() {
-            return Err(NetdiagError::Connector(
-                "system counters capture cancelled".to_string(),
-            ));
+            return Err(NetdiagError::CaptureCancelled {
+                context: "system counters capture",
+            });
         }
         report_counter_progress(
             control,
@@ -769,7 +451,7 @@ pub fn load_system_counters_with_control(
         let remaining = interval.saturating_sub(started.elapsed());
         std::thread::sleep(remaining.min(Duration::from_millis(100)));
     }
-    let after = read_netstat_counters()?;
+    let after = read_netstat_counters(control)?;
     let delta = diff_counters(&before, &after, config.interface.as_deref())?;
     report_counter_progress(
         control,
@@ -791,7 +473,11 @@ fn system_counter_delta_to_result(
 ) -> Result<ConnectorLoadResult> {
     let interval_s = interval.as_secs_f64().max(1e-6);
     let throughput_mbps = (delta.bytes as f64 * 8.0) / interval_s / 1_000_000.0;
-    let total_packets = delta.packets + delta.errors;
+    let total_packets = delta.packets.checked_add(delta.errors).ok_or_else(|| {
+        NetdiagError::Connector(
+            "system counter packet and error totals exceeded the supported u64 range".to_string(),
+        )
+    })?;
     let drop_rate = if total_packets > 0 {
         (delta.errors as f64 / total_packets as f64) * 100.0
     } else {
@@ -840,6 +526,10 @@ fn system_counter_delta_to_result(
         "system_counters",
         "derived from interface byte counters",
     );
+    let resource_usage = ConnectorResourceUsage {
+        input_bytes: 0,
+        records: ingest.records.len(),
+    };
     Ok(ConnectorLoadResult {
         ingest,
         sample: config.sample.clone(),
@@ -859,126 +549,11 @@ fn system_counter_delta_to_result(
             "errors": delta.errors,
             "interval_seconds": interval_s,
         })),
+        resource_usage,
     })
 }
 
-fn query_prometheus_matrix(
-    client: &reqwest::blocking::Client,
-    endpoint: &str,
-    bearer_token: Option<&str>,
-    query: &str,
-    start: i64,
-    end: i64,
-    step: u64,
-) -> Result<Vec<(i64, f64)>> {
-    let mut request = client.get(endpoint).query(&[
-        ("query", query.to_string()),
-        ("start", start.to_string()),
-        ("end", end.to_string()),
-        ("step", step.to_string()),
-    ]);
-    if let Some(token) = bearer_token.filter(|token| !token.is_empty()) {
-        request = request.bearer_auth(token);
-    }
-    let envelope: PrometheusEnvelope = request
-        .send()
-        .map_err(|err| NetdiagError::Connector(format!("Prometheus query_range failed: {err}")))?
-        .error_for_status()
-        .map_err(|err| {
-            NetdiagError::Connector(format!("Prometheus query_range status error: {err}"))
-        })?
-        .json()
-        .map_err(|err| {
-            NetdiagError::Connector(format!("Prometheus query_range JSON error: {err}"))
-        })?;
-    if envelope.status != "success" {
-        return Err(NetdiagError::Connector(format!(
-            "Prometheus query failed: {} {}",
-            envelope.error_type.unwrap_or_default(),
-            envelope.error.unwrap_or_default()
-        )));
-    }
-    let mut values = Vec::new();
-    let Some(data) = envelope.data else {
-        return Ok(values);
-    };
-    for result in data.result {
-        for pair in result.values {
-            let Some(timestamp) = pair.first().and_then(Value::as_f64) else {
-                continue;
-            };
-            let Some(value_text) = pair.get(1).and_then(Value::as_str) else {
-                continue;
-            };
-            let Ok(value) = value_text.parse::<f64>() else {
-                continue;
-            };
-            if value.is_finite() && value >= 0.0 {
-                values.push(((timestamp * 1000.0).round() as i64, value));
-            }
-        }
-    }
-    Ok(values)
-}
-
-fn parse_prometheus_exposition(
-    body: &str,
-    mapping: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, f64>> {
-    let wanted: BTreeMap<&str, &str> = mapping
-        .iter()
-        .map(|(canonical, metric)| (metric.as_str(), canonical.as_str()))
-        .collect();
-    let mut values = BTreeMap::new();
-    for raw_line in body.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((name, rest)) = split_metric_line(line) else {
-            continue;
-        };
-        let Some(canonical) = wanted.get(name) else {
-            continue;
-        };
-        let Some(value_text) = rest.split_whitespace().next() else {
-            continue;
-        };
-        let value = value_text.parse::<f64>().map_err(|_| {
-            NetdiagError::Connector(format!("Prometheus metric {name} has invalid value"))
-        })?;
-        if !value.is_finite() || value < 0.0 {
-            return Err(NetdiagError::Connector(format!(
-                "Prometheus metric {name} is not finite and non-negative"
-            )));
-        }
-        values.insert((*canonical).to_string(), value);
-    }
-    Ok(values)
-}
-
-fn split_metric_line(line: &str) -> Option<(&str, &str)> {
-    let name_end = line
-        .find(|ch: char| ch == '{' || ch.is_whitespace())
-        .unwrap_or(line.len());
-    let name = &line[..name_end];
-    if name.is_empty() {
-        return None;
-    }
-    let rest = if line.as_bytes().get(name_end) == Some(&b'{') {
-        let labels_end = line[name_end..].find('}')? + name_end + 1;
-        &line[labels_end..]
-    } else {
-        &line[name_end..]
-    };
-    Some((name, rest.trim()))
-}
-
-fn record_from_values(
-    timestamp_ms: i64,
-    values: &BTreeMap<String, f64>,
-    _warnings: &mut Vec<IngestWarning>,
-) -> Result<TraceRecord> {
+fn record_from_values(timestamp_ms: i64, values: &BTreeMap<String, f64>) -> Result<TraceRecord> {
     let timestamp = Utc
         .timestamp_millis_opt(timestamp_ms)
         .single()
@@ -1006,31 +581,12 @@ fn required_value(values: &BTreeMap<String, f64>, metric: &str) -> Result<f64> {
         .ok_or_else(|| NetdiagError::Connector(format!("missing required metric {metric}")))
 }
 
-fn merged_mapping(overrides: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut mapping = default_prometheus_mapping();
-    for (key, value) in overrides {
-        if key != "timestamp" {
-            mapping.insert(key.clone(), value.clone());
-        }
-    }
-    mapping
-}
-
 fn required_payload_metrics() -> BTreeSet<&'static str> {
     REQUIRED_METRICS
         .iter()
         .copied()
         .filter(|metric| *metric != "timestamp")
         .collect()
-}
-
-fn prometheus_query_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/api/v1/query_range") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/api/v1/query_range")
-    }
 }
 
 fn fallback_warning(column: &str, reason: impl Into<String>) -> IngestWarning {
@@ -1051,98 +607,6 @@ fn fallback_warnings_for_missing_events(
         .filter(|metric| !values.contains_key(*metric))
         .map(|metric| fallback_warning(metric, reason))
         .collect()
-}
-
-#[derive(Debug)]
-struct OtlpMetricsReceiver {
-    buffer: Arc<Mutex<VecDeque<OtlpMetricFrame>>>,
-    max_frames: usize,
-}
-
-#[tonic::async_trait]
-impl MetricsService for OtlpMetricsReceiver {
-    async fn export(
-        &self,
-        request: Request<ExportMetricsServiceRequest>,
-    ) -> std::result::Result<Response<ExportMetricsServiceResponse>, Status> {
-        let mut buffer = self
-            .buffer
-            .lock()
-            .map_err(|_| Status::internal("receiver buffer lock poisoned"))?;
-        buffer.push_back(OtlpMetricFrame {
-            received_at: Utc::now(),
-            request: request.into_inner(),
-        });
-        while buffer.len() > self.max_frames {
-            buffer.pop_front();
-        }
-        Ok(Response::new(ExportMetricsServiceResponse {
-            partial_success: None,
-        }))
-    }
-}
-
-fn parse_otlp_metrics_request(
-    request: &ExportMetricsServiceRequest,
-    mapping: &BTreeMap<String, String>,
-) -> Result<(BTreeMap<String, f64>, i64)> {
-    let wanted: BTreeMap<&str, &str> = mapping
-        .iter()
-        .map(|(canonical, metric)| (metric.as_str(), canonical.as_str()))
-        .collect();
-    let mut values = BTreeMap::new();
-    let mut latest_time_nanos = 0_u64;
-    for resource in &request.resource_metrics {
-        for scope in &resource.scope_metrics {
-            for metric in &scope.metrics {
-                let Some(canonical) = wanted.get(metric.name.as_str()) else {
-                    continue;
-                };
-                if let Some((value, timestamp)) = latest_metric_number(metric)
-                    && value.is_finite()
-                    && value >= 0.0
-                {
-                    values.insert((*canonical).to_string(), value);
-                    latest_time_nanos = latest_time_nanos.max(timestamp);
-                }
-            }
-        }
-    }
-    if values.is_empty() {
-        return Err(NetdiagError::Connector(
-            "OTLP export did not contain mapped numeric metrics".to_string(),
-        ));
-    }
-    let timestamp_ms = if latest_time_nanos > 0 {
-        (latest_time_nanos / 1_000_000) as i64
-    } else {
-        Utc::now().timestamp_millis()
-    };
-    Ok((values, timestamp_ms))
-}
-
-fn latest_metric_number(metric: &Metric) -> Option<(f64, u64)> {
-    let points = match metric.data.as_ref()? {
-        metric::Data::Gauge(gauge) => &gauge.data_points,
-        metric::Data::Sum(sum) => &sum.data_points,
-        _ => return None,
-    };
-    points
-        .iter()
-        .filter_map(number_point_value)
-        .max_by(|left, right| {
-            left.1
-                .cmp(&right.1)
-                .then_with(|| left.0.total_cmp(&right.0))
-        })
-}
-
-fn number_point_value(point: &otlp::metrics::v1::NumberDataPoint) -> Option<(f64, u64)> {
-    let value = match point.value.as_ref()? {
-        number_data_point::Value::AsDouble(value) => *value,
-        number_data_point::Value::AsInt(value) => *value as f64,
-    };
-    Some((value, point.time_unix_nano))
 }
 
 #[derive(Debug, Default)]
@@ -1184,7 +648,7 @@ fn report_pcap_progress(
         samples_seen: usize::from(stats.packet_count > 0),
         elapsed_ms: started.elapsed().as_millis() as u64,
         timeout_ms: timeout.as_millis() as u64,
-        packet_limit: Some(packet_limit.max(1)),
+        packet_limit: Some(packet_limit),
         last_sample_at: stats
             .last_ts_ms
             .and_then(|ts| Utc.timestamp_millis_opt(ts).single()),
@@ -1275,6 +739,54 @@ fn observe_packet(timestamp_ms: i64, packet_len: usize, data: &[u8], stats: &mut
     }
 }
 
+fn observe_captured_packet(
+    packet: &pcap::Packet<'_>,
+    stats: &mut PacketStats,
+    input_budget: &mut NetworkSourceBudget,
+    context: &str,
+) -> Result<()> {
+    observe_captured_packet_parts(
+        packet_time_component(packet.header.ts.tv_sec, "seconds")?,
+        packet_time_component(packet.header.ts.tv_usec, "microseconds")?,
+        packet.header.len,
+        packet.data,
+        stats,
+        input_budget,
+        context,
+    )
+}
+
+fn packet_time_component<T>(value: T, component: &str) -> Result<i64>
+where
+    i64: TryFrom<T>,
+{
+    i64::try_from(value).map_err(|_| {
+        NetdiagError::Connector(format!(
+            "native pcap timestamp {component} do not fit the supported i64 range"
+        ))
+    })
+}
+
+fn observe_captured_packet_parts(
+    seconds: i64,
+    microseconds: i64,
+    original_length: u32,
+    data: &[u8],
+    stats: &mut PacketStats,
+    input_budget: &mut NetworkSourceBudget,
+    context: &str,
+) -> Result<()> {
+    input_budget.reserve_input_bytes(u64::from(original_length), context)?;
+    let packet_len = usize::try_from(original_length).map_err(|_| {
+        NetdiagError::Connector(format!(
+            "{context} packet length does not fit the platform address space"
+        ))
+    })?;
+    let timestamp_ms = packet_timestamp_ms(seconds, microseconds)?;
+    observe_packet(timestamp_ms, packet_len, data, stats);
+    Ok(())
+}
+
 fn ip_pair(net: Option<&NetSlice<'_>>) -> (String, String) {
     match net {
         Some(NetSlice::Ipv4(ip)) => (
@@ -1299,21 +811,22 @@ fn packet_stats_to_result(
             "native pcap capture produced no packets".to_string(),
         ));
     }
-    let duration_s = stats
-        .first_ts_ms
-        .zip(stats.last_ts_ms)
-        .map(|(start, end)| ((end - start) as f64 / 1000.0).max(1e-3))
-        .unwrap_or(1.0);
+    let (last_ts_ms, elapsed_ms) = validated_capture_window(stats.first_ts_ms, stats.last_ts_ms)?;
+    let duration_s = (elapsed_ms as f64 / 1000.0).max(1e-3);
     let retransmission_rate = if stats.tcp_packets > 0 {
         (stats.retransmissions as f64 / stats.tcp_packets as f64) * 100.0
     } else {
         0.0
     };
     let throughput_mbps = (stats.total_bytes as f64 * 8.0) / duration_s / 1_000_000.0;
-    let timestamp = stats
-        .last_ts_ms
-        .and_then(|ts| Utc.timestamp_millis_opt(ts).single())
-        .unwrap_or_else(Utc::now);
+    let timestamp = Utc
+        .timestamp_millis_opt(last_ts_ms)
+        .single()
+        .ok_or_else(|| {
+            NetdiagError::Connector(format!(
+                "native pcap capture timestamp is outside the supported range: {last_ts_ms}"
+            ))
+        })?;
     let mut ingest = build_ingest_result(
         vec![TraceRecord {
             timestamp,
@@ -1363,6 +876,15 @@ fn packet_stats_to_result(
         "native_pcap",
         "estimated from repeated TCP sequence observations",
     );
+    let resource_usage = ConnectorResourceUsage {
+        input_bytes: stats.total_bytes,
+        records: ingest.records.len(),
+    };
+    let flow_count = u64::try_from(stats.flows.len()).map_err(|_| {
+        NetdiagError::Connector(
+            "native pcap flow count exceeded the supported u64 range".to_string(),
+        )
+    })?;
     let mut top_talkers = stats.flows.into_iter().collect::<Vec<_>>();
     top_talkers.sort_by_key(|talker| std::cmp::Reverse(talker.1));
     top_talkers.truncate(5);
@@ -1384,6 +906,7 @@ fn packet_stats_to_result(
         ]),
         payload: Some(serde_json::json!({
             "total_bytes": stats.total_bytes,
+            "flow_count": flow_count,
             "duration_seconds": duration_s,
             "tcp_packets": stats.tcp_packets,
             "udp_packets": stats.udp_packets,
@@ -1395,14 +918,27 @@ fn packet_stats_to_result(
                 serde_json::json!({ "label": label, "bytes": bytes })
             }).collect::<Vec<_>>(),
         })),
+        resource_usage,
     })
 }
 
-fn packet_timestamp_ms(seconds: i64, micros: i64) -> i64 {
-    seconds.saturating_mul(1000) + micros.saturating_div(1000)
+fn packet_timestamp_ms(seconds: i64, micros: i64) -> Result<i64> {
+    if !(0..1_000_000).contains(&micros) {
+        return Err(NetdiagError::Connector(format!(
+            "native pcap timestamp microseconds are outside [0, 1000000): {micros}"
+        )));
+    }
+    seconds
+        .checked_mul(1_000)
+        .and_then(|millis| millis.checked_add(micros / 1_000))
+        .ok_or_else(|| {
+            NetdiagError::Connector(
+                "native pcap timestamp is outside the supported millisecond range".to_string(),
+            )
+        })
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct InterfaceCounters {
     bytes: u64,
     packets: u64,
@@ -1416,21 +952,22 @@ struct CounterDelta {
     errors: u64,
 }
 
-fn read_netstat_counters() -> Result<BTreeMap<String, InterfaceCounters>> {
-    let output = Command::new("netstat")
-        .args(["-ibn"])
-        .output()
-        .map_err(|err| NetdiagError::Connector(format!("failed to run netstat -ibn: {err}")))?;
-    if !output.status.success() {
-        return Err(NetdiagError::Connector(format!(
-            "netstat -ibn failed with status {}",
-            output.status
-        )));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+#[cfg(target_os = "macos")]
+fn read_netstat_counters(control: &CaptureControl) -> Result<BTreeMap<String, InterfaceCounters>> {
+    let text = String::from_utf8(read_netstat_output(control)?).map_err(|error| {
+        NetdiagError::Connector(format!("netstat -ibn emitted invalid UTF-8: {error}"))
+    })?;
     parse_netstat_counters(&text)
 }
 
+#[cfg(not(target_os = "macos"))]
+fn read_netstat_counters(_control: &CaptureControl) -> Result<BTreeMap<String, InterfaceCounters>> {
+    Err(NetdiagError::Connector(
+        "system counters are supported only on macOS".to_string(),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn parse_netstat_counters(text: &str) -> Result<BTreeMap<String, InterfaceCounters>> {
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
     let header = lines
@@ -1451,25 +988,42 @@ fn parse_netstat_counters(text: &str) -> Result<BTreeMap<String, InterfaceCounte
     let oerrs_idx = index("Oerrs")?;
     let obytes_idx = index("Obytes")?;
     let mut counters = BTreeMap::<String, InterfaceCounters>::new();
-    for line in lines {
+    for (row_index, line) in lines.enumerate() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() <= obytes_idx {
-            continue;
+            return Err(NetdiagError::Connector(format!(
+                "netstat row {} is missing required counter columns",
+                row_index + 2
+            )));
         }
         let name = fields[name_idx].to_string();
         let parsed = InterfaceCounters {
-            bytes: parse_u64_field(fields[ibytes_idx])? + parse_u64_field(fields[obytes_idx])?,
-            packets: parse_u64_field(fields[ipkts_idx])? + parse_u64_field(fields[opkts_idx])?,
-            errors: parse_u64_field(fields[ierrs_idx])? + parse_u64_field(fields[oerrs_idx])?,
+            bytes: checked_counter_pair(
+                &name,
+                "bytes",
+                parse_u64_field(fields[ibytes_idx])?,
+                parse_u64_field(fields[obytes_idx])?,
+            )?,
+            packets: checked_counter_pair(
+                &name,
+                "packets",
+                parse_u64_field(fields[ipkts_idx])?,
+                parse_u64_field(fields[opkts_idx])?,
+            )?,
+            errors: checked_counter_pair(
+                &name,
+                "errors",
+                parse_u64_field(fields[ierrs_idx])?,
+                parse_u64_field(fields[oerrs_idx])?,
+            )?,
         };
-        counters
-            .entry(name)
-            .and_modify(|current| {
-                current.bytes = current.bytes.max(parsed.bytes);
-                current.packets = current.packets.max(parsed.packets);
-                current.errors = current.errors.max(parsed.errors);
-            })
-            .or_insert(parsed);
+        if let Some(current) = counters.insert(name.clone(), parsed)
+            && current != parsed
+        {
+            return Err(NetdiagError::Connector(format!(
+                "netstat emitted inconsistent duplicate counters for interface {name}"
+            )));
+        }
     }
     if counters.is_empty() {
         return Err(NetdiagError::Connector(
@@ -1479,13 +1033,25 @@ fn parse_netstat_counters(text: &str) -> Result<BTreeMap<String, InterfaceCounte
     Ok(counters)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_u64_field(value: &str) -> Result<u64> {
     if value == "-" {
-        return Ok(0);
+        return Err(NetdiagError::Connector(
+            "netstat counter is unavailable (`-`)".to_string(),
+        ));
     }
     value
         .parse::<u64>()
         .map_err(|_| NetdiagError::Connector(format!("invalid netstat counter: {value}")))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn checked_counter_pair(interface: &str, kind: &str, incoming: u64, outgoing: u64) -> Result<u64> {
+    incoming.checked_add(outgoing).ok_or_else(|| {
+        NetdiagError::Connector(format!(
+            "netstat {kind} counter overflowed for interface {interface}"
+        ))
+    })
 }
 
 fn diff_counters(
@@ -1493,676 +1059,90 @@ fn diff_counters(
     after: &BTreeMap<String, InterfaceCounters>,
     interface: Option<&str>,
 ) -> Result<CounterDelta> {
-    let mut delta = CounterDelta::default();
-    let mut matched = 0usize;
-    for (name, after_value) in after {
-        if interface.is_some_and(|wanted| wanted != "all" && wanted != name) {
-            continue;
-        }
-        matched += 1;
-        let before_value = before.get(name).copied().unwrap_or_default();
-        delta.bytes += after_value.bytes.saturating_sub(before_value.bytes);
-        delta.packets += after_value.packets.saturating_sub(before_value.packets);
-        delta.errors += after_value.errors.saturating_sub(before_value.errors);
+    if let Some(wanted) = interface.filter(|wanted| *wanted != "all") {
+        let before_value = before.get(wanted).ok_or_else(|| {
+            NetdiagError::Connector(format!(
+                "system counter interface not found in initial sample: {wanted}"
+            ))
+        })?;
+        let after_value = after.get(wanted).ok_or_else(|| {
+            NetdiagError::Connector(format!(
+                "system counter interface disappeared during sampling: {wanted}"
+            ))
+        })?;
+        return counter_delta(wanted, *before_value, *after_value);
     }
-    if matched == 0
-        && let Some(wanted) = interface.filter(|wanted| *wanted != "all")
-    {
-        return Err(NetdiagError::Connector(format!(
-            "system counter interface not found: {wanted}"
-        )));
+
+    ensure_interface_set_stable(before, after)?;
+    let mut delta = CounterDelta::default();
+    for (name, before_value) in before {
+        let after_value = after.get(name).ok_or_else(|| {
+            NetdiagError::Connector(format!(
+                "system counter interface disappeared during sampling: {name}"
+            ))
+        })?;
+        delta = checked_delta_sum(delta, counter_delta(name, *before_value, *after_value)?)?;
     }
     Ok(delta)
 }
 
-#[derive(Debug, Deserialize)]
-struct PrometheusEnvelope {
-    status: String,
-    data: Option<PrometheusData>,
-    #[serde(rename = "errorType")]
-    error_type: Option<String>,
-    error: Option<String>,
+fn ensure_interface_set_stable(
+    before: &BTreeMap<String, InterfaceCounters>,
+    after: &BTreeMap<String, InterfaceCounters>,
+) -> Result<()> {
+    if let Some(name) = before.keys().find(|name| !after.contains_key(*name)) {
+        return Err(NetdiagError::Connector(format!(
+            "system counter interface disappeared during sampling: {name}"
+        )));
+    }
+    if let Some(name) = after.keys().find(|name| !before.contains_key(*name)) {
+        return Err(NetdiagError::Connector(format!(
+            "system counter interface appeared during sampling: {name}"
+        )));
+    }
+    Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct PrometheusData {
-    result: Vec<PrometheusSeries>,
+fn counter_delta(
+    interface: &str,
+    before: InterfaceCounters,
+    after: InterfaceCounters,
+) -> Result<CounterDelta> {
+    Ok(CounterDelta {
+        bytes: checked_counter_delta(interface, "bytes", before.bytes, after.bytes)?,
+        packets: checked_counter_delta(interface, "packets", before.packets, after.packets)?,
+        errors: checked_counter_delta(interface, "errors", before.errors, after.errors)?,
+    })
 }
 
-#[derive(Debug, Deserialize)]
-struct PrometheusSeries {
-    values: Vec<Vec<Value>>,
+fn checked_counter_delta(interface: &str, kind: &str, before: u64, after: u64) -> Result<u64> {
+    after.checked_sub(before).ok_or_else(|| {
+        NetdiagError::Connector(format!(
+            "system counter {kind} decreased during sampling for interface {interface}"
+        ))
+    })
+}
+
+fn checked_delta_sum(left: CounterDelta, right: CounterDelta) -> Result<CounterDelta> {
+    Ok(CounterDelta {
+        bytes: left.bytes.checked_add(right.bytes).ok_or_else(|| {
+            NetdiagError::Connector(
+                "aggregate system counter byte delta exceeded the supported u64 range".to_string(),
+            )
+        })?,
+        packets: left.packets.checked_add(right.packets).ok_or_else(|| {
+            NetdiagError::Connector(
+                "aggregate system counter packet delta exceeded the supported u64 range"
+                    .to_string(),
+            )
+        })?,
+        errors: left.errors.checked_add(right.errors).ok_or_else(|| {
+            NetdiagError::Connector(
+                "aggregate system counter error delta exceeded the supported u64 range".to_string(),
+            )
+        })?,
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs::File;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::path::Path;
-    use std::thread;
-
-    #[test]
-    fn prometheus_exposition_maps_metrics_to_trace_record() {
-        let body = r#"
-# HELP netdiag_latency_ms RTT
-netdiag_latency_ms{target="lab"} 42
-netdiag_jitter_ms 3
-netdiag_packet_loss_rate 0.2
-netdiag_retransmission_rate 0.4
-netdiag_throughput_mbps 99
-"#;
-        let values = parse_prometheus_exposition(body, &default_prometheus_mapping())
-            .expect("parse exposition");
-
-        assert_eq!(values["latency_ms"], 42.0);
-        assert_eq!(values["throughput_mbps"], 99.0);
-    }
-
-    #[test]
-    fn prometheus_exposition_errors_when_required_metric_missing() {
-        let (url, handle) = serve_once(
-            200,
-            "netdiag_latency_ms 42\nnetdiag_jitter_ms 3\n".to_string(),
-            None,
-        );
-        let err = load_prometheus_exposition(&PrometheusExpositionConfig {
-            endpoint: url,
-            bearer_token: None,
-            timeout: Duration::from_secs(2),
-            metrics: BTreeMap::new(),
-            sample: "prom_text".to_string(),
-        })
-        .expect_err("missing required metric");
-        handle.join().expect("server thread");
-        assert!(err.to_string().contains("missing required metric"));
-    }
-
-    #[test]
-    fn prometheus_query_range_accepts_matrix_and_bearer_token() {
-        let response = serde_json::json!({
-            "status": "success",
-            "data": {
-                "resultType": "matrix",
-                "result": [{
-                    "metric": {},
-                    "values": [[1.0, "42"], [2.0, "43"]]
-                }]
-            }
-        })
-        .to_string();
-        let (url, handle) =
-            serve_repeated(10, 200, response, Some("authorization: Bearer prom-token"));
-        let mut queries = BTreeMap::new();
-        for metric in default_prometheus_mapping().keys() {
-            queries.insert(metric.clone(), format!("query_{metric}"));
-        }
-        let result = load_prometheus_query_range(&PrometheusQueryRangeConfig {
-            base_url: url,
-            bearer_token: Some("prom-token".to_string()),
-            timeout: Duration::from_secs(2),
-            lookback_seconds: 30,
-            step_seconds: 5,
-            queries,
-            sample: "prom_query".to_string(),
-        })
-        .expect("query range");
-        handle.join().expect("server thread");
-
-        assert_eq!(result.ingest.records.len(), 2);
-        assert_eq!(result.ingest.records[0].latency_ms, 42.0);
-    }
-
-    #[test]
-    fn prometheus_query_range_reports_error_envelope() {
-        let response = serde_json::json!({
-            "status": "error",
-            "errorType": "bad_data",
-            "error": "parse failed"
-        })
-        .to_string();
-        let (url, handle) = serve_repeated(1, 200, response, None);
-        let err = load_prometheus_query_range(&PrometheusQueryRangeConfig {
-            base_url: url,
-            bearer_token: None,
-            timeout: Duration::from_secs(2),
-            lookback_seconds: 30,
-            step_seconds: 5,
-            queries: BTreeMap::new(),
-            sample: "prom_query".to_string(),
-        })
-        .expect_err("prom error");
-        handle.join().expect("server thread");
-        assert!(err.to_string().contains("bad_data"));
-    }
-
-    #[test]
-    fn prometheus_exposition_missing_optional_events_emit_warnings() {
-        let body = r#"
-netdiag_latency_ms 42
-netdiag_jitter_ms 3
-netdiag_packet_loss_rate 0.2
-netdiag_retransmission_rate 0.4
-netdiag_throughput_mbps 99
-"#;
-        let (url, handle) = serve_once(200, body.to_string(), None);
-        let loaded = load_prometheus_exposition(&PrometheusExpositionConfig {
-            endpoint: url,
-            bearer_token: None,
-            timeout: Duration::from_secs(2),
-            metrics: BTreeMap::new(),
-            sample: "prom_text".to_string(),
-        })
-        .expect("prom exposition with optional fallbacks");
-        handle.join().expect("server thread");
-
-        assert_eq!(loaded.ingest.records.len(), 1);
-        for column in EVENT_METRICS {
-            assert!(
-                loaded
-                    .ingest
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.column == column),
-                "{column}"
-            );
-        }
-    }
-
-    #[test]
-    fn otlp_metrics_parse_required_matrix_and_warn_for_optional_events() {
-        let timestamp = 1_777_000_000_000_000_000;
-        let request = ExportMetricsServiceRequest {
-            resource_metrics: vec![otlp::metrics::v1::ResourceMetrics {
-                scope_metrics: vec![otlp::metrics::v1::ScopeMetrics {
-                    metrics: vec![
-                        otlp_metric("netdiag_latency_ms", 41.0, timestamp),
-                        otlp_metric("netdiag_jitter_ms", 2.0, timestamp),
-                        otlp_metric("netdiag_packet_loss_rate", 0.1, timestamp),
-                        otlp_metric("netdiag_retransmission_rate", 0.3, timestamp),
-                        otlp_metric("netdiag_throughput_mbps", 88.0, timestamp),
-                    ],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-
-        let (values, timestamp_ms) =
-            parse_otlp_metrics_request(&request, &default_prometheus_mapping())
-                .expect("otlp values");
-        let warnings = fallback_warnings_for_missing_events(&values, "OTLP metric is missing");
-
-        assert_eq!(values["latency_ms"], 41.0);
-        assert_eq!(timestamp_ms, (timestamp / 1_000_000) as i64);
-        assert_eq!(warnings.len(), EVENT_METRICS.len());
-    }
-
-    #[test]
-    fn otlp_metrics_use_latest_numeric_sum_point() {
-        let early = 1_777_000_000_000_000_000;
-        let late = early + 1_000_000;
-        let request = ExportMetricsServiceRequest {
-            resource_metrics: vec![otlp::metrics::v1::ResourceMetrics {
-                scope_metrics: vec![otlp::metrics::v1::ScopeMetrics {
-                    metrics: vec![otlp_sum_metric("netdiag_latency_ms", 40, early, 42, late)],
-                    ..Default::default()
-                }],
-                ..Default::default()
-            }],
-        };
-
-        let (values, timestamp_ms) =
-            parse_otlp_metrics_request(&request, &default_prometheus_mapping())
-                .expect("otlp values");
-
-        assert_eq!(values["latency_ms"], 42.0);
-        assert_eq!(timestamp_ms, (late / 1_000_000) as i64);
-    }
-
-    #[test]
-    fn native_pcap_stats_keep_observed_values_and_warn_on_missing_fields() {
-        let mut stats = PacketStats {
-            packet_count: 4,
-            total_bytes: 4_000,
-            tcp_packets: 4,
-            retransmissions: 1,
-            first_ts_ms: Some(1_000),
-            last_ts_ms: Some(2_000),
-            ..PacketStats::default()
-        };
-        stats
-            .flows
-            .insert("10.0.0.1:443 -> 10.0.0.2:51515".to_string(), 4_000);
-
-        let loaded = packet_stats_to_result(
-            stats,
-            "pcap_fixture",
-            &NativePcapSource::Interface("lo0".to_string()),
-        )
-        .expect("pcap stats");
-
-        assert_eq!(loaded.ingest.records[0].throughput_mbps, 0.032);
-        assert_eq!(loaded.ingest.records[0].retransmission_rate, 25.0);
-        assert!(
-            loaded
-                .ingest
-                .warnings
-                .iter()
-                .any(|warning| warning.column == "packet_loss_rate")
-        );
-        assert_eq!(
-            loaded
-                .payload
-                .as_ref()
-                .and_then(|value| value.get("total_bytes"))
-                .and_then(Value::as_u64),
-            Some(4_000)
-        );
-    }
-
-    #[test]
-    fn native_pcap_file_fixture_runs_full_loader() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("tcp_retransmission.pcap");
-        let tcp = ethernet_ipv4_tcp_packet(443, 51_515, 7, b"payload");
-        write_pcap_fixture(&path, &[tcp.clone(), tcp]).expect("pcap fixture");
-
-        let loaded = load_native_pcap(&NativePcapConfig {
-            source: NativePcapSource::File(path),
-            timeout: Duration::from_secs(1),
-            packet_limit: 32,
-            sample: "pcap_file_fixture".to_string(),
-        })
-        .expect("pcap file load");
-
-        assert_eq!(loaded.ingest.records.len(), 1);
-        assert_eq!(loaded.ingest.records[0].retransmission_rate, 50.0);
-        assert_eq!(
-            quality(&loaded.ingest, "throughput_mbps"),
-            MetricQuality::Measured
-        );
-        assert_eq!(
-            quality(&loaded.ingest, "quic_blocked_ratio"),
-            MetricQuality::Fallback
-        );
-        assert_eq!(loaded.provenance["kind"], "native_pcap");
-    }
-
-    #[test]
-    fn native_pcap_observe_extracts_flow_bytes_and_retransmission_hints() {
-        let mut stats = PacketStats::default();
-        let tcp = ethernet_ipv4_tcp_packet(443, 51_515, 7, b"payload");
-
-        observe_packet(1_000, tcp.len(), &tcp, &mut stats);
-        observe_packet(1_050, tcp.len(), &tcp, &mut stats);
-
-        assert_eq!(stats.packet_count, 2);
-        assert_eq!(stats.tcp_packets, 2);
-        assert_eq!(stats.retransmissions, 1);
-        assert_eq!(stats.tls_packets, 2);
-        assert_eq!(
-            stats.flows.get("10.0.0.1:443 -> 10.0.0.2:51515"),
-            Some(&(tcp.len() as u64 * 2))
-        );
-    }
-
-    #[test]
-    fn native_pcap_observe_extracts_dns_and_quic_hints_without_policy_claims() {
-        let mut stats = PacketStats::default();
-        let dns = ethernet_ipv4_udp_packet(53, 53_000, b"dns");
-        let quic_like = ethernet_ipv4_udp_packet(44_444, 443, b"quic");
-
-        observe_packet(1_000, dns.len(), &dns, &mut stats);
-        observe_packet(1_010, quic_like.len(), &quic_like, &mut stats);
-
-        assert_eq!(stats.udp_packets, 2);
-        assert_eq!(stats.dns_packets, 1);
-        assert_eq!(stats.quic_packets, 1);
-        let loaded = packet_stats_to_result(
-            stats,
-            "pcap_hints",
-            &NativePcapSource::Interface("fixture".to_string()),
-        )
-        .expect("pcap result");
-        assert!(
-            loaded
-                .ingest
-                .warnings
-                .iter()
-                .any(|warning| warning.column == "quic_blocked_ratio")
-        );
-    }
-
-    #[test]
-    fn native_pcap_malformed_short_packet_does_not_invent_transport_metrics() {
-        let mut stats = PacketStats::default();
-        observe_packet(1_000, 4, &[0xde, 0xad, 0xbe, 0xef], &mut stats);
-
-        assert_eq!(stats.packet_count, 1);
-        assert_eq!(stats.total_bytes, 4);
-        assert_eq!(stats.tcp_packets, 0);
-        assert_eq!(stats.udp_packets, 0);
-        assert_eq!(stats.retransmissions, 0);
-        assert!(stats.flows.is_empty());
-    }
-
-    fn ethernet_ipv4_tcp_packet(
-        source_port: u16,
-        target_port: u16,
-        seq: u32,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut packet = ethernet_ipv4_header(6, 20 + payload.len());
-        packet.extend_from_slice(&source_port.to_be_bytes());
-        packet.extend_from_slice(&target_port.to_be_bytes());
-        packet.extend_from_slice(&seq.to_be_bytes());
-        packet.extend_from_slice(&0_u32.to_be_bytes());
-        packet.extend_from_slice(&[0x50, 0x18]);
-        packet.extend_from_slice(&16_384_u16.to_be_bytes());
-        packet.extend_from_slice(&0_u16.to_be_bytes());
-        packet.extend_from_slice(&0_u16.to_be_bytes());
-        packet.extend_from_slice(payload);
-        packet
-    }
-
-    fn ethernet_ipv4_udp_packet(source_port: u16, target_port: u16, payload: &[u8]) -> Vec<u8> {
-        let mut packet = ethernet_ipv4_header(17, 8 + payload.len());
-        packet.extend_from_slice(&source_port.to_be_bytes());
-        packet.extend_from_slice(&target_port.to_be_bytes());
-        packet.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
-        packet.extend_from_slice(&0_u16.to_be_bytes());
-        packet.extend_from_slice(payload);
-        packet
-    }
-
-    fn ethernet_ipv4_header(protocol: u8, transport_and_payload_len: usize) -> Vec<u8> {
-        let total_len = 20 + transport_and_payload_len;
-        let mut packet = vec![
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x08, 0x00,
-            0x45, 0x00,
-        ];
-        packet.extend_from_slice(&(total_len as u16).to_be_bytes());
-        packet.extend_from_slice(&0_u16.to_be_bytes());
-        packet.extend_from_slice(&0_u16.to_be_bytes());
-        packet.push(64);
-        packet.push(protocol);
-        packet.extend_from_slice(&0_u16.to_be_bytes());
-        packet.extend_from_slice(&[10, 0, 0, 1]);
-        packet.extend_from_slice(&[10, 0, 0, 2]);
-        packet
-    }
-
-    #[test]
-    fn netstat_parser_computes_interface_counter_deltas() {
-        let before = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
-        )
-        .expect("before");
-        let after = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n",
-        )
-        .expect("after");
-
-        let delta = diff_counters(&before, &after, Some("en0")).expect("delta");
-
-        assert_eq!(delta.bytes, 1_200);
-        assert_eq!(delta.packets, 15);
-        assert_eq!(delta.errors, 1);
-    }
-
-    #[test]
-    fn netstat_counter_delta_allows_quiet_interfaces() {
-        let before = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
-        )
-        .expect("before");
-        let after = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
-        )
-        .expect("after");
-
-        let delta = diff_counters(&before, &after, Some("en0")).expect("quiet delta");
-
-        assert_eq!(delta.bytes, 0);
-        assert_eq!(delta.packets, 0);
-        assert_eq!(delta.errors, 0);
-    }
-
-    #[test]
-    fn netstat_counter_delta_reports_unknown_interface() {
-        let before = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n",
-        )
-        .expect("before");
-        let after = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n",
-        )
-        .expect("after");
-
-        let err = diff_counters(&before, &after, Some("utun404")).expect_err("unknown interface");
-
-        assert!(err.to_string().contains("interface not found: utun404"));
-    }
-
-    #[test]
-    fn netstat_counter_delta_aggregates_all_interfaces() {
-        let before = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 10 1 1000 20 2 2000 0\n\
-             en1 1500 <Link#5> bb 4 0 400 6 1 600 0\n",
-        )
-        .expect("before");
-        let after = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa 15 1 1600 30 3 2600 0\n\
-             en1 1500 <Link#5> bb 8 1 900 9 1 900 0\n",
-        )
-        .expect("after");
-
-        let delta = diff_counters(&before, &after, Some("all")).expect("all interfaces");
-
-        assert_eq!(delta.bytes, 2_000);
-        assert_eq!(delta.packets, 22);
-        assert_eq!(delta.errors, 2);
-    }
-
-    #[test]
-    fn netstat_parser_treats_dash_counters_as_zero() {
-        let counters = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             utun0 1380 <Link#9> aa - - - 4 - 800 0\n",
-        )
-        .expect("dash counters");
-
-        let value = counters.get("utun0").expect("utun0");
-        assert_eq!(value.bytes, 800);
-        assert_eq!(value.packets, 4);
-        assert_eq!(value.errors, 0);
-    }
-
-    #[test]
-    fn netstat_parser_rejects_malformed_counter_values() {
-        let err = parse_netstat_counters(
-            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
-             en0 1500 <Link#4> aa nope 1 1000 20 2 2000 0\n",
-        )
-        .expect_err("bad counter");
-
-        assert!(err.to_string().contains("invalid netstat counter"));
-    }
-
-    #[test]
-    fn system_counter_delta_to_result_marks_quality_without_netstat() {
-        let loaded = system_counter_delta_to_result(
-            CounterDelta {
-                bytes: 2_000_000,
-                packets: 95,
-                errors: 5,
-            },
-            Duration::from_secs(2),
-            Utc::now(),
-            &SystemCountersConfig {
-                interface: Some("en0".to_string()),
-                interval: Duration::from_secs(2),
-                sample: "counter_fixture".to_string(),
-            },
-        )
-        .expect("counter result");
-
-        assert_eq!(loaded.ingest.records[0].throughput_mbps, 8.0);
-        assert_eq!(loaded.ingest.records[0].packet_loss_rate, 5.0);
-        assert_eq!(
-            quality(&loaded.ingest, "throughput_mbps"),
-            MetricQuality::Measured
-        );
-        assert_eq!(
-            quality(&loaded.ingest, "retransmission_rate"),
-            MetricQuality::Fallback
-        );
-        assert_eq!(loaded.provenance["interface"], "en0");
-    }
-
-    #[test]
-    fn capture_control_reports_progress_and_cancels_before_work() {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let observed = Arc::new(Mutex::new(Vec::<CaptureProgress>::new()));
-        let observed_sink = Arc::clone(&observed);
-        let control = CaptureControl::new(Arc::clone(&cancel)).with_progress(move |progress| {
-            observed_sink.lock().expect("progress lock").push(progress);
-        });
-
-        report_counter_progress(
-            &control,
-            Instant::now(),
-            Duration::from_secs(1),
-            0,
-            None,
-            "sampling",
-            "test progress",
-        );
-        control.cancel();
-
-        assert!(control.is_cancelled());
-        let progress = observed.lock().expect("progress lock");
-        assert_eq!(progress.len(), 1);
-        assert_eq!(progress[0].stage, "sampling");
-        assert_eq!(progress[0].message, "test progress");
-    }
-
-    fn serve_once(
-        status: u16,
-        body: String,
-        expected_header: Option<&'static str>,
-    ) -> (String, thread::JoinHandle<()>) {
-        serve_repeated(1, status, body, expected_header)
-    }
-
-    fn serve_repeated(
-        count: usize,
-        status: u16,
-        body: String,
-        expected_header: Option<&'static str>,
-    ) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let addr = listener.local_addr().expect("local addr");
-        let handle = thread::spawn(move || {
-            for _ in 0..count {
-                let (mut stream, _) = listener.accept().expect("accept");
-                let mut request = [0_u8; 4096];
-                let bytes = stream.read(&mut request).expect("read request");
-                let request_text = String::from_utf8_lossy(&request[..bytes]);
-                if let Some(header) = expected_header {
-                    assert!(request_text.contains(header), "{request_text}");
-                }
-                let status_text = if status == 200 { "OK" } else { "ERROR" };
-                let response = format!(
-                    "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write response");
-            }
-        });
-        (format!("http://{addr}"), handle)
-    }
-
-    fn otlp_metric(name: &str, value: f64, timestamp: u64) -> Metric {
-        Metric {
-            name: name.to_string(),
-            data: Some(metric::Data::Gauge(otlp::metrics::v1::Gauge {
-                data_points: vec![otlp::metrics::v1::NumberDataPoint {
-                    time_unix_nano: timestamp,
-                    value: Some(number_data_point::Value::AsDouble(value)),
-                    ..Default::default()
-                }],
-            })),
-            ..Default::default()
-        }
-    }
-
-    fn otlp_sum_metric(
-        name: &str,
-        early_value: i64,
-        early_timestamp: u64,
-        late_value: i64,
-        late_timestamp: u64,
-    ) -> Metric {
-        Metric {
-            name: name.to_string(),
-            data: Some(metric::Data::Sum(otlp::metrics::v1::Sum {
-                data_points: vec![
-                    otlp::metrics::v1::NumberDataPoint {
-                        time_unix_nano: early_timestamp,
-                        value: Some(number_data_point::Value::AsInt(early_value)),
-                        ..Default::default()
-                    },
-                    otlp::metrics::v1::NumberDataPoint {
-                        time_unix_nano: late_timestamp,
-                        value: Some(number_data_point::Value::AsInt(late_value)),
-                        ..Default::default()
-                    },
-                ],
-                ..Default::default()
-            })),
-            ..Default::default()
-        }
-    }
-
-    fn quality(ingest: &IngestResult, field: &str) -> MetricQuality {
-        ingest
-            .metric_provenance
-            .iter()
-            .find(|item| item.field == field)
-            .map(|item| item.quality)
-            .expect("metric quality")
-    }
-
-    fn write_pcap_fixture(path: &Path, packets: &[Vec<u8>]) -> std::io::Result<()> {
-        let mut file = File::create(path)?;
-        file.write_all(&0xa1b2c3d4_u32.to_le_bytes())?;
-        file.write_all(&2_u16.to_le_bytes())?;
-        file.write_all(&4_u16.to_le_bytes())?;
-        file.write_all(&0_i32.to_le_bytes())?;
-        file.write_all(&0_u32.to_le_bytes())?;
-        file.write_all(&65_535_u32.to_le_bytes())?;
-        file.write_all(&1_u32.to_le_bytes())?;
-        for (idx, packet) in packets.iter().enumerate() {
-            file.write_all(&1_777_000_000_u32.to_le_bytes())?;
-            file.write_all(&((idx as u32) * 1_000).to_le_bytes())?;
-            file.write_all(&(packet.len() as u32).to_le_bytes())?;
-            file.write_all(&(packet.len() as u32).to_le_bytes())?;
-            file.write_all(packet)?;
-        }
-        Ok(())
-    }
-}
+mod tests;

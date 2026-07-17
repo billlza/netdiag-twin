@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+mod comparison;
+pub(crate) use comparison::percent_delta;
+pub use comparison::{MetricQualityChange, RecommendationStateChange};
+mod connector_health;
+pub(crate) use connector_health::missing_metric_names;
+mod topology;
+pub use topology::{TopologyLink, TopologyModel, TopologyNode};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FaultLabel {
@@ -417,7 +425,7 @@ impl FromStr for ConnectorHealthStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectorHealthSnapshot {
     #[serde(default)]
     pub status: ConnectorHealthStatus,
@@ -711,6 +719,13 @@ pub struct ModelManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset_manifest_hash_sha256: Option<String>,
     pub model_file: String,
+    /// SHA-256 of the exact serialized model file named by `model_file`.
+    ///
+    /// This field is required by `netdiag-model-manifest/v2`. The serde default
+    /// keeps legacy documents parseable long enough to return an explicit
+    /// unsupported-schema error; bundle validation never accepts an empty hash.
+    #[serde(default)]
+    pub model_file_hash_sha256: String,
     pub feature_names: Vec<String>,
     pub labels: Vec<String>,
     pub training_examples: usize,
@@ -838,38 +853,6 @@ pub struct TwinPolicyImpact {
     pub loss_delta_pct: f64,
     #[serde(default)]
     pub throughput_delta_pct: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TopologyModel {
-    pub key: String,
-    pub name: String,
-    pub nodes: Vec<TopologyNode>,
-    pub links: Vec<TopologyLink>,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TopologyNode {
-    pub id: String,
-    pub label: String,
-    #[serde(default)]
-    pub role: String,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TopologyLink {
-    pub id: String,
-    pub source: String,
-    pub target: String,
-    pub latency_ms: f64,
-    pub loss_pct: f64,
-    pub capacity_mbps: f64,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1003,7 +986,7 @@ impl HilReviewSummary {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunManifest {
     pub run_id: String,
     pub sample: String,
@@ -1012,7 +995,7 @@ pub struct RunManifest {
     pub artifact_paths: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RunIndexEntry {
     pub run_id: String,
     pub sample: String,
@@ -1153,18 +1136,4 @@ pub struct ActionVerification {
     pub verdict: ActionVerificationVerdict,
     #[serde(default)]
     pub reasons: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecommendationStateChange {
-    pub recommendation_id: String,
-    pub left_state: HilState,
-    pub right_state: HilState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricQualityChange {
-    pub field: String,
-    pub left_quality: MetricQuality,
-    pub right_quality: MetricQuality,
 }

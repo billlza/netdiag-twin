@@ -10,11 +10,11 @@ BASELINE_SCALE="${NETDIAG_PERF_BASELINE_SCALE:-3.0}"
 SAMPLES="${NETDIAG_PERF_SAMPLES:-3}"
 MODE="${1:-check}"
 
-rm -rf "$ARTIFACTS"
 mkdir -p "$(dirname "$OUTPUT")"
 
 args=(
   run
+  --locked
   --quiet
   --release
   -p

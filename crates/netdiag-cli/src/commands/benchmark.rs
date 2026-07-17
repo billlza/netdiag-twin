@@ -12,6 +12,8 @@ pub enum BenchmarkCommand {
         output: PathBuf,
         #[arg(long)]
         suite: Option<String>,
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
     },
 }
 
@@ -21,11 +23,13 @@ pub fn run(command: BenchmarkCommand) -> anyhow::Result<()> {
             artifacts,
             output,
             suite,
+            model_dir,
         } => {
             let report = run_benchmark(BenchmarkOptions {
                 artifacts: artifacts.clone(),
                 output: output.clone(),
                 suite,
+                model_dir,
             })
             .with_context(|| {
                 format!(

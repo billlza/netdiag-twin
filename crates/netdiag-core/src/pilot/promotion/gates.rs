@@ -194,17 +194,21 @@ pub(super) fn ood_coverage_gate(benchmark: &BenchmarkReport) -> ModelPromotionGa
     let failed = section
         .checks
         .iter()
-        .filter(|check| check.status == ConnectorHealthStatus::Error)
+        .filter(|check| check.status != ConnectorHealthStatus::Ok)
         .map(|check| check.name.clone())
         .collect::<Vec<_>>();
     gate(
         "ood_coverage",
-        failed.is_empty(),
+        section.status == ConnectorHealthStatus::Ok && failed.is_empty(),
         if failed.is_empty() {
-            format!(
-                "{} explicit OOD examples passed benchmark preflight",
-                section.checks.len()
-            )
+            if section.status == ConnectorHealthStatus::Ok {
+                format!(
+                    "{} explicit OOD examples passed benchmark preflight",
+                    section.checks.len()
+                )
+            } else {
+                format!("OOD benchmark section status was {}", section.status)
+            }
         } else {
             format!("OOD benchmark failures: {}", failed.join(", "))
         },

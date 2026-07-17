@@ -2,22 +2,36 @@ use crate::error::{IoContext, NetdiagError, Result};
 use crate::evidence_bundle::export_evidence_bundle;
 use crate::ingest::ingest_trace;
 use crate::lab::{LabPreflightMode, LabPreflightOptions, preflight_lab_scenario};
-use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
+use crate::ml::ModelBundleSnapshot;
 use crate::models::{ConnectorHealthStatus, DiagnosisStatus, FaultLabel};
-use crate::perf_budget::{compare_perf_budget, load_perf_budget, run_perf_measurements_sampled};
-use crate::pipeline::diagnose_ingest_with_whatif_and_existing_model_dir;
+use crate::perf_budget::{
+    compare_perf_budget, load_perf_budget, run_perf_measurements_sampled_with_capability,
+};
+use crate::pipeline::{
+    diagnose_ingest_with_whatif_and_model_snapshot_and_capability,
+    ensure_run_directory_publication_supported,
+};
 use crate::reliability::{
     ReliabilityCheckOptions, ReliabilityCheckReport, check_reliability, write_text_atomic,
 };
-use crate::storage::{run_dir, save_json_atomic};
+use crate::storage::{
+    ArtifactRootCapability, prepare_artifact_root, run_dir, save_json_atomic,
+    with_artifact_root_capability,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
-const BENCHMARK_SCHEMA: &str = "netdiag-benchmark-report/v1";
+mod adapter_validation;
+mod benchmark_model_identity;
+mod ood_scenarios;
+use adapter_validation::run_adapter_validation_section;
+use benchmark_model_identity::{candidate_model_identity, provision_benchmark_model};
+use ood_scenarios::ood_scenario_paths;
+
+pub(crate) const BENCHMARK_SCHEMA: &str = "netdiag-benchmark-report/v1";
 const DEFAULT_SUITE: &str = "default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +40,8 @@ pub struct BenchmarkOptions {
     pub output: PathBuf,
     #[serde(default)]
     pub suite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +52,12 @@ pub struct BenchmarkReport {
     pub passed: bool,
     pub artifacts: String,
     pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_model_manifest_hash_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_model_file_hash_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_dataset_hash_sha256: Option<String>,
     pub environment: BenchmarkEnvironment,
     #[serde(default)]
     pub sections: Vec<BenchmarkSection>,
@@ -69,32 +91,46 @@ pub struct BenchmarkCheck {
 }
 
 pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkReport> {
-    let suite = options.suite.unwrap_or_else(|| DEFAULT_SUITE.to_string());
+    let suite = options
+        .suite
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SUITE.to_string());
     if suite != DEFAULT_SUITE {
         return Err(NetdiagError::InvalidTrace(format!(
             "unsupported benchmark suite: {suite}"
         )));
     }
-    std::fs::create_dir_all(&options.artifacts).with_path(&options.artifacts)?;
+    let known_sample_root = options.artifacts.join("known-samples");
+    ensure_run_directory_publication_supported(&known_sample_root)?;
+    let capability = prepare_artifact_root(&known_sample_root)?;
     std::fs::create_dir_all(&options.output).with_path(&options.output)?;
 
     let mut sections = Vec::new();
     let mut known_run_ids = Vec::new();
+    let candidate_model = match options.model_dir.as_deref() {
+        Some(model_dir) => Some(candidate_model_identity(model_dir)?),
+        None => None,
+    };
     sections.push(run_known_sample_section(
-        &options.artifacts.join("known-samples"),
+        &known_sample_root,
+        &capability,
+        candidate_model.as_ref().map(|identity| &identity.snapshot),
         &mut known_run_ids,
     )?);
-    sections.push(run_ood_preflight_section(&options.artifacts)?);
+    sections.push(run_ood_preflight_section(&known_sample_root)?);
     sections.push(run_adapter_validation_section()?);
-    sections.push(run_perf_section(&options.artifacts.join("perf"))?);
+    sections.push(run_perf_section(&capability)?);
     sections.push(run_evidence_bundle_section(
-        &options.artifacts.join("known-samples"),
-        &options.artifacts.join("evidence"),
+        &known_sample_root,
+        &known_sample_root.join("benchmark-evidence"),
         known_run_ids.first(),
+        &capability,
     )?);
-    let reliability = check_reliability(ReliabilityCheckOptions {
-        artifact_root: options.artifacts.join("known-samples"),
-        run_id: None,
+    let reliability = with_artifact_root_capability(&capability, |_| {
+        check_reliability(ReliabilityCheckOptions {
+            artifact_root: known_sample_root.clone(),
+            run_id: None,
+        })
     })?;
     sections.push(BenchmarkSection {
         name: "artifact integrity".to_string(),
@@ -118,7 +154,7 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkReport> {
 
     let passed = sections
         .iter()
-        .all(|section| section.status != ConnectorHealthStatus::Error);
+        .all(|section| section.status == ConnectorHealthStatus::Ok);
     let report = BenchmarkReport {
         schema: BENCHMARK_SCHEMA.to_string(),
         generated_at: Utc::now(),
@@ -126,6 +162,15 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkReport> {
         passed,
         artifacts: options.artifacts.display().to_string(),
         output: options.output.display().to_string(),
+        candidate_model_manifest_hash_sha256: candidate_model
+            .as_ref()
+            .map(|identity| identity.model_manifest_hash_sha256.clone()),
+        candidate_model_file_hash_sha256: candidate_model
+            .as_ref()
+            .map(|identity| identity.model_file_hash_sha256.clone()),
+        candidate_dataset_hash_sha256: candidate_model
+            .as_ref()
+            .and_then(|identity| identity.dataset_hash_sha256.clone()),
         environment: BenchmarkEnvironment {
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -148,31 +193,41 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkReport> {
 
 fn run_known_sample_section(
     artifact_root: &Path,
+    capability: &ArtifactRootCapability,
+    candidate_model: Option<&ModelBundleSnapshot>,
     known_run_ids: &mut Vec<String>,
 ) -> Result<BenchmarkSection> {
-    let model_dir = provision_benchmark_model(artifact_root)?;
+    let provisioned_model;
+    let model = match candidate_model {
+        Some(model) => model,
+        None => {
+            provisioned_model = with_artifact_root_capability(capability, |_| {
+                provision_benchmark_model(artifact_root)
+            })?;
+            &provisioned_model
+        }
+    };
     timed_section("known sample diagnosis", || {
         let mut checks = Vec::new();
         for (label, path) in known_sample_paths() {
             let ingest = ingest_trace(&path)?;
-            let result = diagnose_ingest_with_whatif_and_existing_model_dir(
-                ingest,
-                artifact_root,
-                &model_dir,
-                None,
+            let result = diagnose_ingest_with_whatif_and_model_snapshot_and_capability(
+                ingest, model, None, capability,
             )?;
-            let evidence_bundle = export_evidence_bundle(
-                artifact_root,
-                &result.run_id,
-                artifact_root
-                    .join("evidence")
-                    .join(format!("netdiag-evidence-{}.zip", result.run_id)),
-                &[],
-            )?;
-            save_json_atomic(
-                run_dir(artifact_root, &result.run_id).join("evidence_bundle.json"),
-                &evidence_bundle,
-            )?;
+            with_artifact_root_capability(capability, |_| {
+                let evidence_bundle = export_evidence_bundle(
+                    artifact_root,
+                    &result.run_id,
+                    artifact_root
+                        .join("evidence")
+                        .join(format!("netdiag-evidence-{}.zip", result.run_id)),
+                    &[],
+                )?;
+                save_json_atomic(
+                    run_dir(artifact_root, &result.run_id)?.join("evidence_bundle.json"),
+                    &evidence_bundle,
+                )
+            })?;
             known_run_ids.push(result.run_id.clone());
             let actual = result.report.diagnosis_decision.primary_label;
             let status = if result.report.diagnosis_status == DiagnosisStatus::Known
@@ -200,26 +255,10 @@ fn run_known_sample_section(
     })
 }
 
-fn provision_benchmark_model(artifact_root: &Path) -> Result<PathBuf> {
-    let dataset = repo_root().join("examples/datasets/pilot-smoke-training.jsonl");
-    let model_dir = artifact_root.join("model");
-    train_model_from_jsonl_with_options(
-        &dataset,
-        &model_dir,
-        TrainingOptions {
-            validation_split: 0.0,
-            shuffle_seed: Some(2026),
-            stratified: false,
-            min_rows_per_label: 1,
-        },
-    )?;
-    Ok(model_dir)
-}
-
 fn run_ood_preflight_section(artifact_root: &Path) -> Result<BenchmarkSection> {
     timed_section("ood benchmark preflight", || {
         let mut checks = Vec::new();
-        for scenario in ood_scenario_paths() {
+        for scenario in ood_scenario_paths(&repo_root())? {
             let report = preflight_lab_scenario(
                 &scenario,
                 LabPreflightOptions {
@@ -253,61 +292,12 @@ fn run_ood_preflight_section(artifact_root: &Path) -> Result<BenchmarkSection> {
     })
 }
 
-fn run_adapter_validation_section() -> Result<BenchmarkSection> {
-    timed_section("adapter schema and ingest", || {
-        let python = repo_root().join(".venv-jsonschema/bin/python");
-        let python = if python.exists() {
-            python
-        } else {
-            PathBuf::from("python3")
-        };
-        [
-            "validate_adapter_samples.py",
-            "validate_adapter_contract.py",
-        ]
-        .into_iter()
-        .map(|script_name| {
-            let script = repo_root().join("scripts").join(script_name);
-            let output = Command::new(&python)
-                .arg(&script)
-                .current_dir(repo_root())
-                .output()
-                .map_err(|err| {
-                    NetdiagError::Connector(format!(
-                        "failed to run adapter validator {script_name}: {err}"
-                    ))
-                })?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let status = if output.status.success() {
-                ConnectorHealthStatus::Ok
-            } else {
-                ConnectorHealthStatus::Error
-            };
-            Ok(BenchmarkCheck {
-                name: script_name.to_string(),
-                status,
-                message: if output.status.success() {
-                    "adapter contract passed schema and Rust ingest validation".to_string()
-                } else {
-                    "adapter contract validation failed".to_string()
-                },
-                details: Some(json!({
-                    "stdout": stdout.lines().collect::<Vec<_>>(),
-                    "stderr": stderr.lines().collect::<Vec<_>>(),
-                })),
-            })
-        })
-        .collect()
-    })
-}
-
-fn run_perf_section(artifact_root: &Path) -> Result<BenchmarkSection> {
+fn run_perf_section(capability: &ArtifactRootCapability) -> Result<BenchmarkSection> {
     timed_section("performance budget", || {
         let baseline_path = repo_root().join("perf-baseline.json");
         let budget = load_perf_budget(&baseline_path)?;
-        let measurements = run_perf_measurements_sampled(artifact_root, 1)?;
-        let report = compare_perf_budget(measurements, &budget, budget.threshold_percent);
+        let measurements = run_perf_measurements_sampled_with_capability(capability, 1)?;
+        let report = compare_perf_budget(measurements, &budget, budget.threshold_percent)?;
         let mut checks = report
             .measurements
             .iter()
@@ -341,6 +331,7 @@ fn run_evidence_bundle_section(
     artifact_root: &Path,
     output_root: &Path,
     run_id: Option<&String>,
+    capability: &ArtifactRootCapability,
 ) -> Result<BenchmarkSection> {
     timed_section("evidence bundle export", || {
         let Some(run_id) = run_id else {
@@ -352,11 +343,14 @@ fn run_evidence_bundle_section(
             }]);
         };
         let output = output_root.join(format!("netdiag-evidence-{run_id}.zip"));
-        let manifest = export_evidence_bundle(artifact_root, run_id, &output, &[])?;
-        save_json_atomic(
-            run_dir(artifact_root, run_id).join("evidence_bundle.json"),
-            &manifest,
-        )?;
+        let manifest = with_artifact_root_capability(capability, |_| {
+            let manifest = export_evidence_bundle(artifact_root, run_id, &output, &[])?;
+            save_json_atomic(
+                run_dir(artifact_root, run_id)?.join("evidence_bundle.json"),
+                &manifest,
+            )?;
+            Ok(manifest)
+        })?;
         Ok(vec![BenchmarkCheck {
             name: "evidence bundle export".to_string(),
             status: if manifest.files.is_empty() {
@@ -379,11 +373,18 @@ fn timed_section(
 ) -> Result<BenchmarkSection> {
     let started = Instant::now();
     let checks = action()?;
+    if checks.is_empty() {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "benchmark section {name:?} produced no checks"
+        )));
+    }
     let status = checks
         .iter()
         .map(|check| check.status)
         .max()
-        .unwrap_or(ConnectorHealthStatus::Ok);
+        .ok_or_else(|| {
+            NetdiagError::InvalidTrace(format!("benchmark section {name:?} produced no status"))
+        })?;
     Ok(BenchmarkSection {
         name: name.to_string(),
         status,
@@ -448,30 +449,8 @@ fn known_sample_paths() -> Vec<(FaultLabel, PathBuf)> {
     .collect()
 }
 
-fn ood_scenario_paths() -> Vec<PathBuf> {
-    let scenario_root = repo_root().join("examples/scenarios");
-    let mut paths = std::fs::read_dir(&scenario_root)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|name| name.starts_with("ood-") && name.ends_with(".yaml"))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    paths.sort();
-    paths
-}
-
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn round_millis(value: f64) -> f64 {
@@ -481,6 +460,38 @@ fn round_millis(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ml::{
+        TrainingOptions, load_existing_model_bundle_snapshot, train_model_from_jsonl_with_options,
+    };
+
+    #[test]
+    fn benchmark_model_identity_reads_candidate_hashes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dataset = repo_root().join("examples/datasets/pilot-smoke-training.jsonl");
+        let model_dir = temp.path().join("model");
+        let manifest = train_model_from_jsonl_with_options(
+            &dataset,
+            &model_dir,
+            TrainingOptions {
+                min_rows_per_label: 1,
+                ..TrainingOptions::default()
+            },
+        )
+        .expect("model");
+
+        let identity = candidate_model_identity(&model_dir).expect("candidate identity");
+        let snapshot = load_existing_model_bundle_snapshot(&model_dir).expect("snapshot");
+
+        assert_eq!(identity.dataset_hash_sha256, manifest.dataset_hash_sha256);
+        assert_eq!(
+            identity.model_manifest_hash_sha256,
+            snapshot.model_manifest_hash_sha256
+        );
+        assert_eq!(
+            identity.model_file_hash_sha256,
+            snapshot.model_file_hash_sha256
+        );
+    }
 
     #[test]
     fn benchmark_markdown_includes_sections() {
@@ -491,6 +502,9 @@ mod tests {
             passed: true,
             artifacts: "artifacts".to_string(),
             output: "target/report".to_string(),
+            candidate_model_manifest_hash_sha256: None,
+            candidate_model_file_hash_sha256: None,
+            candidate_dataset_hash_sha256: None,
             environment: BenchmarkEnvironment {
                 os: "test".to_string(),
                 arch: "test".to_string(),
@@ -512,5 +526,64 @@ mod tests {
         let markdown = render_benchmark_markdown(&report);
         assert!(markdown.contains("NetDiag Twin Benchmark Report"));
         assert!(markdown.contains("known sample diagnosis"));
+    }
+
+    #[test]
+    fn benchmark_section_with_no_checks_fails_closed() {
+        let error = timed_section("empty", || Ok(Vec::new()))
+            .expect_err("empty benchmark section must fail");
+        assert!(error.to_string().contains("produced no checks"));
+    }
+
+    #[test]
+    fn ood_scenario_paths_fail_closed_when_directory_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("missing-scenarios");
+
+        let message = ood_scenarios::ood_scenario_paths_in(&missing)
+            .expect_err("missing OOD scenario directory should fail")
+            .to_string();
+
+        assert!(message.contains("missing-scenarios"));
+    }
+
+    #[test]
+    fn ood_scenario_paths_fail_closed_when_no_ood_scenarios_exist() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("lab-congestion-001.yaml"),
+            "schema: netdiag-lab-scenario/v1\n",
+        )
+        .expect("write non-ood scenario");
+
+        let message = ood_scenarios::ood_scenario_paths_in(temp.path())
+            .expect_err("empty OOD benchmark suite should fail")
+            .to_string();
+
+        assert!(message.contains("no OOD benchmark scenarios"));
+    }
+
+    #[test]
+    fn ood_scenario_paths_return_sorted_ood_yaml_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("ood-z.yaml"),
+            "schema: netdiag-lab-scenario/v1\n",
+        )
+        .expect("write ood z");
+        std::fs::write(
+            temp.path().join("ood-a.yaml"),
+            "schema: netdiag-lab-scenario/v1\n",
+        )
+        .expect("write ood a");
+        std::fs::write(temp.path().join("ood-not-yaml.txt"), "ignored").expect("write ignored");
+
+        let paths = ood_scenarios::ood_scenario_paths_in(temp.path()).expect("ood paths");
+
+        let names = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["ood-a.yaml", "ood-z.yaml"]);
     }
 }

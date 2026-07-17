@@ -1,0 +1,198 @@
+name: Platform security
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: "Immutable commit to test; defaults to the caller event SHA."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  platform-security:
+    name: Platform security (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RUSTFLAGS: "-D warnings"
+      VCPKG_DISABLE_METRICS: "1"
+      NETDIAG_VCPKG_COMMIT: "f87344cac03158cbf1467264565f1fd36b382a24"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.checkout_ref || github.sha }}
+      - name: Verify immutable checkout
+        if: inputs.checkout_ref != ''
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.checkout_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || (echo "checkout_ref must be a full commit SHA" >&2 && exit 2)
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$EXPECTED_SHA" ]] || (echo "checked-out SHA mismatch: expected=$EXPECTED_SHA actual=$actual_sha" >&2 && exit 2)
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
+          components: clippy
+      - name: Install the compile-only unsupported platform target
+        if: runner.os == 'Linux'
+        run: rustup target add --toolchain 1.95.0 wasm32-wasip1
+      - name: Restore pinned Windows libpcap binary cache
+        if: runner.os == 'Windows'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/netdiag-vcpkg-binary-cache
+          key: netdiag-vcpkg-${{ runner.os }}-${{ env.NETDIAG_VCPKG_COMMIT }}-${{ hashFiles('.github/vcpkg/*.cmake') }}
+      - name: Install Linux native test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes acl libpcap-dev
+      - name: Install pinned Windows libpcap test runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/netdiag-vcpkg-binary-cache
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          if (!(Test-Path -LiteralPath $env:VCPKG_DEFAULT_BINARY_CACHE -PathType Container)) {
+            throw "vcpkg binary cache path is not a directory"
+          }
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "netdiag-vcpkg"
+          git -c init.defaultBranch=main init --quiet $vcpkgRoot
+          git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git
+          git -C $vcpkgRoot fetch --quiet --depth=1 origin $env:NETDIAG_VCPKG_COMMIT
+          git -C $vcpkgRoot -c advice.detachedHead=false checkout --detach --quiet FETCH_HEAD
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          $triplet = "x64-windows-netdiag"
+          $overlay = Join-Path $env:GITHUB_WORKSPACE ".github\vcpkg"
+          & "$vcpkgRoot\vcpkg.exe" install "libpcap:$triplet" "--overlay-triplets=$overlay"
+          $installed = Join-Path $vcpkgRoot "installed\$triplet"
+          $importLibrary = Join-Path $installed "lib\wpcap.lib"
+          $runtimeLibrary = Join-Path $installed "bin\wpcap.dll"
+          if (!(Test-Path -PathType Leaf $importLibrary)) {
+            throw "vcpkg did not produce the required wpcap import library"
+          }
+          if (!(Test-Path -PathType Leaf $runtimeLibrary)) {
+            throw "vcpkg did not produce the required wpcap runtime library"
+          }
+          "LIB=$($installed)\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIBPCAP_VER=1.10.6" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$($installed)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Lint platform and consumer layers with warnings denied
+        run: cargo clippy --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features -- -D warnings
+      - name: Lint the fail-closed unsupported platform boundary
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p netdiag-platform --target wasm32-wasip1 --all-targets --all-features -- -D warnings
+      - name: Test full platform and consumer layers on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.checkout_ref || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || (
+            echo "platform-security expected SHA must be a full lowercase commit SHA" >&2
+            exit 2
+          )
+          validate_trusted_ancestor() {
+            local ancestor mode owner
+            ancestor="$1"
+            if [[ -L "$ancestor" || ! -d "$ancestor" ]]; then
+              echo "trusted checkout ancestor is not a physical directory: $ancestor" >&2
+              exit 2
+            fi
+            owner="$(stat -c '%u' -- "$ancestor")"
+            if [[ "$owner" != 0 ]]; then
+              echo "trusted checkout ancestor is not root-owned: $ancestor" >&2
+              exit 2
+            fi
+            mode="$(stat -c '%a' -- "$ancestor")"
+            if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 8#022) != 0 )); then
+              echo "trusted checkout ancestor is group/world-writable: $ancestor" >&2
+              exit 2
+            fi
+          }
+          for trusted_ancestor in / /var /var/lib; do
+            validate_trusted_ancestor "$trusted_ancestor"
+          done
+          trusted_root="$(sudo -- /usr/bin/mktemp -d -- /var/lib/netdiag-platform-security.XXXXXX)"
+          [[ "$trusted_root" =~ ^/var/lib/netdiag-platform-security\.[A-Za-z0-9]{6}$ ]] || (
+            echo "mktemp returned an unexpected trusted checkout path" >&2
+            exit 2
+          )
+          readonly trusted_root
+          cleanup_trusted_root() {
+            status=$?
+            trap - EXIT
+            cd /
+            if [[ ! "$trusted_root" =~ ^/var/lib/netdiag-platform-security\.[A-Za-z0-9]{6}$ ]]; then
+              echo "refusing to clean an unexpected platform-security path" >&2
+              exit 1
+            fi
+            if ! sudo -- /usr/bin/rm -rf --one-file-system -- "$trusted_root"; then
+              echo "failed to remove trusted platform-security checkout" >&2
+              exit 1
+            fi
+            exit "$status"
+          }
+          trap cleanup_trusted_root EXIT
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          readonly runner_uid runner_gid
+          sudo -- /usr/bin/chown -- "$runner_uid:$runner_gid" "$trusted_root"
+          /usr/bin/chmod -- 0700 "$trusted_root"
+          [[ ! -L "$trusted_root" && -d "$trusted_root" ]]
+          [[ "$(stat -c '%u:%g:%a' -- "$trusted_root")" == "$runner_uid:$runner_gid:700" ]]
+          [[ -z "$(find "$trusted_root" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+          git clone --quiet --no-local --no-checkout -- "$GITHUB_WORKSPACE" "$trusted_root/repo"
+          git -C "$trusted_root/repo" checkout --quiet --detach "$EXPECTED_SHA"
+          actual_sha="$(git -C "$trusted_root/repo" rev-parse HEAD)"
+          [[ "$actual_sha" == "$EXPECTED_SHA" ]] || (
+            echo "trusted checkout SHA mismatch: expected=$EXPECTED_SHA actual=$actual_sha" >&2
+            exit 2
+          )
+          test_tmp="$trusted_root/test-tmp"
+          [[ "$test_tmp" =~ ^/var/lib/netdiag-platform-security\.[A-Za-z0-9]{6}/test-tmp$ ]]
+          readonly test_tmp
+          /usr/bin/mkdir --mode=0700 -- "$test_tmp"
+          [[ ! -L "$test_tmp" && -d "$test_tmp" ]]
+          [[ "$(/usr/bin/realpath -e -- "$test_tmp")" == "$test_tmp" ]]
+          [[ "$(stat -c '%u:%g:%a' -- "$test_tmp")" == "$runner_uid:$runner_gid:700" ]]
+          [[ -z "$(find "$test_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+          test_tmp_identity="$(stat -c '%d:%i' -- "$test_tmp")"
+          readonly test_tmp_identity
+          TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" \
+            /usr/bin/python3 -I - "$test_tmp" <<'PY'
+          from pathlib import Path
+          import sys
+          import tempfile
+
+          expected = Path(sys.argv[1]).resolve(strict=True)
+          actual = Path(tempfile.gettempdir()).resolve(strict=True)
+          if actual != expected:
+              raise SystemExit(f"test fixture temp root mismatch: expected={expected} actual={actual}")
+          PY
+          cd "$trusted_root/repo"
+          TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features
+          [[ ! -L "$test_tmp" && -d "$test_tmp" ]]
+          [[ "$(/usr/bin/realpath -e -- "$test_tmp")" == "$test_tmp" ]]
+          [[ "$(stat -c '%u:%g:%a' -- "$test_tmp")" == "$runner_uid:$runner_gid:700" ]]
+          [[ "$(stat -c '%d:%i' -- "$test_tmp")" == "$test_tmp_identity" ]]
+      - name: Test Windows platform primitives with warnings denied
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p netdiag-platform --all-targets --all-features
+      - name: Test Windows fail-closed mutation contracts
+        if: runner.os == 'Windows'
+        run: cargo test --locked -p netdiag-core --test windows_mutation_contract --all-features

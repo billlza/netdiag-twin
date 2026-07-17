@@ -1,49 +1,123 @@
+use crate::connectors::authentication::{BearerEnvironmentBindings, ResolvedBearerTokens};
 use crate::connectors::{
-    ConnectorLoadResult, HttpJsonConfig, NativePcapConfig, NativePcapSource,
-    OtlpGrpcReceiverConfig, PrometheusExpositionConfig, PrometheusQueryRangeConfig,
-    SystemCountersConfig, default_prometheus_mapping, load_http_json, load_native_pcap,
-    load_otlp_grpc_receiver, load_prometheus_exposition, load_prometheus_query_range,
-    load_system_counters,
+    ConnectorLoadResult, ConnectorResourceUsage, HttpJsonConfig, NativePcapConfig,
+    NativePcapSource, OtlpGrpcReceiverConfig, PrometheusExpositionConfig,
+    PrometheusQueryRangeConfig, SystemCountersConfig, default_prometheus_mapping, load_http_json,
+    load_native_pcap, load_otlp_grpc_receiver, load_prometheus_exposition,
+    load_prometheus_mapping_file, load_prometheus_query_range, load_system_counters,
+    parse_http_endpoint,
 };
 use crate::error::{IoContext, NetdiagError, Result};
-use crate::evidence_bundle::{EvidenceBundleManifest, export_evidence_bundle};
-use crate::ingest::{CANONICAL_COLUMNS, ingest_trace};
-use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model, sha256_file};
-use crate::models::{
-    ActionVerification, ActionVerificationVerdict, ConnectorHealthSnapshot, ConnectorHealthStatus,
-    CorroborationDecision, CorroborationSignal, DiagnosisEvent, DiagnosisStatus, EvidenceRecord,
-    EvidenceRef, FaultLabel, HilReviewSummary, HilState, IngestResult, MetricQuality,
-    MultiSourceEvidenceSummary, Recommendation, RunComparison, RunManifest, Severity,
-    SourceEvidenceSummary, TimeWindow, TwinPolicyImpact,
+use crate::evidence_bundle::{
+    EvidenceBundleManifest, EvidenceContext, export_evidence_bundle_from_staged_directory,
 };
-use crate::pipeline::{WhatIfRequest, diagnose_ingest_with_whatif_and_existing_model_dir};
+use crate::ingest::{CANONICAL_COLUMNS, ingest_trace, ingest_trace_with_usage};
+use crate::ml::{
+    load_existing_model_bundle_snapshot, load_existing_model_bundle_snapshot_if_present,
+};
+use crate::models::{
+    ActionVerification, ConnectorHealthSnapshot, ConnectorHealthStatus, CorroborationDecision,
+    CorroborationSignal, DiagnosisEvent, DiagnosisStatus, EvidenceRecord, EvidenceRef, FaultLabel,
+    HilState, IngestResult, MetricQuality, MultiSourceEvidenceSummary, RunComparison, Severity,
+    SourceEvidenceSummary, TimeWindow,
+};
+use crate::pipeline::{
+    WhatIfRequest,
+    diagnose_ingest_with_nested_artifact_root_and_model_snapshot_and_connector_health,
+    ensure_run_directory_publication_supported,
+};
 use crate::recommendation::recommend_actions;
-use crate::report::Report;
 use crate::report::{
-    compare_rule_ml, decide_diagnosis, refresh_report_evidence_timeline, render_report,
+    Report, compare_rule_ml, decide_diagnosis, refresh_report_evidence_timeline, render_report,
+};
+use crate::resource_limits::{
+    MAX_SCENARIO_RECORDS, MAX_SCENARIO_RETAINED_BYTES, MAX_SOURCE_INPUT_BYTES, MAX_SOURCE_RECORDS,
+};
+use crate::storage::typed_json::{
+    MAX_EVIDENCE_BUNDLE_MANIFEST_BYTES, MAX_LAB_ACCEPTANCE_BYTES, MAX_LAB_COMPARISON_BYTES,
+    MAX_LAB_CONNECTOR_HEALTH_BYTES, MAX_RUN_REPORT_BYTES, read_optional_stable_json_bounded,
+    save_json_atomic_bounded,
 };
 use crate::storage::{
-    RunLocation, compare_runs, connector_health_from_ingest, read_connector_health, read_json,
-    resolve_stored_path, run_artifacts, run_dir, save_json, write_connector_health,
+    ArtifactRootCapability, PathStatus, StagedAtomicDirectory, compare_runs,
+    create_root_bound_staged_directory, ensure_artifact_root_owned,
+    finish_root_bound_staged_directory, path_status, prepare_artifact_root, read_connector_health,
+    read_report, resolve_stored_path, run_artifacts, run_artifacts_allow_pending, run_dir,
+    save_json, with_artifact_root_capability,
 };
 use crate::twin::{
-    TopologyFormat, import_policy_action, import_topology, policy_action, topology_model,
+    load_policy_action_file, load_topology_file, policy_action, topology_model,
     validate_policy_action_for_topology, validate_policy_action_shape, validate_topology_model,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::net::{SocketAddr, TcpListener};
+use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
 
+const MAX_RUN_ID_FILE_BYTES: usize = 128;
+
+#[cfg(test)]
+use crate::evidence_bundle::export_evidence_bundle_with_context;
+#[cfg(test)]
+use crate::models::{ActionVerificationVerdict, RunManifest, TwinPolicyImpact};
+#[cfg(test)]
+use crate::storage::read_json;
+
+mod action_verification;
+mod action_verification_artifact;
+mod bearer;
 mod calibration;
+mod defaults;
+mod evidence_identity;
+mod index_contract;
+mod index_path;
+mod index_update;
+mod index_validation;
+mod review_sync;
+mod run_preparation;
+mod scenario_input;
+mod source_signal_metrics;
+mod summary;
+use source_signal_metrics::{
+    SourceSignalMetrics, metric_is_trustworthy, metrics_are_trustworthy, source_signal_metrics,
+};
+mod verification_objective;
+use action_verification::{
+    action_verification_verdict, observed_delta_pct_map, predicted_action_effect,
+    predicted_delta_pct_map, prediction_error_pct_map,
+};
+use action_verification_artifact::record_action_verification_artifact;
 pub use calibration::{
     LabCalibrationDistribution, LabCalibrationHotspot, LabCalibrationLabelStats,
     LabCalibrationOodStats, LabCalibrationReport, calibrate_lab_uncertainty,
 };
+use defaults::{
+    default_allowed_connector_status, default_allowed_diagnosis_statuses, default_interval_secs,
+    default_lookback_secs, default_min_ml_probability, default_min_rule_confidence,
+    default_packet_limit, default_required_artifacts, default_step_secs, default_timeout_secs,
+    default_true,
+};
+use index_path::stored_lab_index_path;
+use index_update::update_lab_run_index_owned;
+#[cfg(test)]
+use index_update::{update_lab_run_index, update_lab_run_index_passed};
+pub use index_validation::read_lab_run_index;
+pub(crate) use index_validation::validate_legacy_run_index_artifacts;
+pub(crate) use review_sync::{
+    LabReviewArtifactPlan, plan_lab_review_artifacts, preflight_lab_review_artifacts,
+};
+use run_preparation::{
+    LabArtifactRootAuthorization, PreparedLabInputs, prepare as prepare_lab_inputs,
+};
+use scenario_input::{LabScenarioSnapshot, load_lab_scenario_snapshot};
+pub use scenario_input::{load_lab_scenario, validate_lab_scenario};
+pub use summary::summarize_lab_runs;
+use verification_objective::read as read_verification_objective;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabScenario {
@@ -74,6 +148,8 @@ pub struct LabDataSource {
     pub role: LabDataSourceRole,
     pub kind: LabDataSourceKind,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<String>,
 }
@@ -445,65 +521,55 @@ struct LoadedLabSource {
     health: ConnectorHealthSnapshot,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LabRetainedResourceBudget {
+    input_bytes: u64,
+    records: usize,
+}
+
+impl LabRetainedResourceBudget {
+    fn reserve(&mut self, source: &str, usage: ConnectorResourceUsage) -> Result<()> {
+        if usage.input_bytes > MAX_SOURCE_INPUT_BYTES {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "lab source {source} input size {} exceeds the {MAX_SOURCE_INPUT_BYTES}-byte source limit",
+                usage.input_bytes
+            )));
+        }
+        if usage.records > MAX_SOURCE_RECORDS {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "lab source {source} record count {} exceeds the {MAX_SOURCE_RECORDS}-record source limit",
+                usage.records
+            )));
+        }
+        let input_bytes = self
+            .input_bytes
+            .checked_add(usage.input_bytes)
+            .ok_or_else(|| {
+                NetdiagError::InvalidTrace("lab retained input byte count overflowed".to_string())
+            })?;
+        let records = self.records.checked_add(usage.records).ok_or_else(|| {
+            NetdiagError::InvalidTrace("lab retained record count overflowed".to_string())
+        })?;
+        if input_bytes > MAX_SCENARIO_RETAINED_BYTES {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "lab retained input size {input_bytes} exceeds the {MAX_SCENARIO_RETAINED_BYTES}-byte scenario limit after source {source}"
+            )));
+        }
+        if records > MAX_SCENARIO_RECORDS {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "lab retained record count {records} exceeds the {MAX_SCENARIO_RECORDS}-record scenario limit after source {source}"
+            )));
+        }
+        self.input_bytes = input_bytes;
+        self.records = records;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LabRunResolution {
     artifact_root: PathBuf,
     index_entry: Option<LabRunIndexEntry>,
-}
-
-pub fn load_lab_scenario(path: impl AsRef<Path>) -> Result<LabScenario> {
-    let path = path.as_ref();
-    let raw = fs::read_to_string(path).with_path(path)?;
-    let scenario: LabScenario = serde_yaml::from_str(&raw)
-        .map_err(|err| NetdiagError::InvalidTrace(format!("invalid lab scenario YAML: {err}")))?;
-    validate_lab_scenario(&scenario)?;
-    Ok(scenario)
-}
-
-pub fn validate_lab_scenario(scenario: &LabScenario) -> Result<()> {
-    if scenario.schema.trim() != "netdiag-lab-scenario/v1" {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "unsupported lab scenario schema: {}",
-            scenario.schema
-        )));
-    }
-    if scenario.id.trim().is_empty() {
-        return Err(NetdiagError::InvalidTrace(
-            "lab scenario id is empty".to_string(),
-        ));
-    }
-    if scenario.name.trim().is_empty() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "lab scenario {} name is empty",
-            scenario.id
-        )));
-    }
-    if scenario.data_sources.is_empty() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "lab scenario {} has no data_sources",
-            scenario.id
-        )));
-    }
-    let primary_count = scenario
-        .data_sources
-        .iter()
-        .filter(|source| source.role == LabDataSourceRole::Primary)
-        .count();
-    if primary_count != 1 {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "lab scenario {} must declare exactly one primary data source",
-            scenario.id
-        )));
-    }
-    for source in &scenario.data_sources {
-        if source.endpoint.trim().is_empty() {
-            return Err(NetdiagError::InvalidTrace(format!(
-                "lab scenario {} data source {:?} endpoint is empty",
-                scenario.id, source.kind
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn scenario_expected_label(scenario: &LabScenario) -> Option<FaultLabel> {
@@ -517,6 +583,18 @@ pub fn preflight_lab_scenario(
     path: impl AsRef<Path>,
     options: LabPreflightOptions,
 ) -> Result<LabPreflightReport> {
+    preflight_lab_scenario_with_bearer_bindings(
+        path,
+        options,
+        &BearerEnvironmentBindings::default(),
+    )
+}
+
+pub fn preflight_lab_scenario_with_bearer_bindings(
+    path: impl AsRef<Path>,
+    options: LabPreflightOptions,
+    bindings: &BearerEnvironmentBindings,
+) -> Result<LabPreflightReport> {
     let scenario_path = path.as_ref();
     let fallback_id = scenario_path
         .file_stem()
@@ -525,15 +603,7 @@ pub fn preflight_lab_scenario(
         .to_string();
     let mut checks = Vec::new();
     let scenario = match load_lab_scenario(scenario_path) {
-        Ok(mut scenario) => {
-            if !scenario
-                .data_sources
-                .iter()
-                .any(|source| source.role == LabDataSourceRole::Primary)
-                && let Some(first) = scenario.data_sources.first_mut()
-            {
-                first.role = LabDataSourceRole::Primary;
-            }
+        Ok(scenario) => {
             checks.push(preflight_pass(
                 "scenario schema valid",
                 true,
@@ -551,6 +621,35 @@ pub fn preflight_lab_scenario(
         }
     };
 
+    let declarations = bearer::declarations(&scenario)?;
+    let resolved_tokens = match options.mode {
+        LabPreflightMode::Static => bindings
+            .validate_exact_declarations(&declarations)
+            .map(|()| ResolvedBearerTokens::default()),
+        LabPreflightMode::Live => bindings.resolve_all(&declarations),
+    };
+    let resolved_tokens = match resolved_tokens {
+        Ok(resolved_tokens) => {
+            checks.push(preflight_pass(
+                "bearer environment bindings valid",
+                true,
+                format!(
+                    "{} bearer declaration(s) exactly matched external bindings",
+                    declarations.len()
+                ),
+            ));
+            resolved_tokens
+        }
+        Err(error) => {
+            checks.push(preflight_fail(
+                "bearer environment bindings valid",
+                true,
+                error.to_string(),
+            ));
+            return Ok(preflight_report(scenario.id, options.mode, checks));
+        }
+    };
+
     let scenario_dir = scenario_path.parent().unwrap_or_else(|| Path::new("."));
     checks.push(check_artifact_directory_writable(&options.artifacts));
     checks.extend(check_topology_policy_preflight(&scenario, scenario_dir));
@@ -559,6 +658,7 @@ pub fn preflight_lab_scenario(
         &scenario,
         scenario_dir,
         options.mode,
+        &resolved_tokens,
     ));
 
     Ok(preflight_report(scenario.id, options.mode, checks))
@@ -633,7 +733,7 @@ fn check_artifact_directory_writable(artifact_root: &Path) -> LabPreflightCheck 
         "artifact directory writable",
         true,
         (|| {
-            fs::create_dir_all(artifact_root).with_path(artifact_root)?;
+            ensure_artifact_root_owned(artifact_root)?;
             let probe = artifact_root.join(format!(
                 ".netdiag-preflight-{}.tmp",
                 &Uuid::new_v4().simple().to_string()[..8]
@@ -757,6 +857,7 @@ fn check_source_reachability_preflight(
     scenario: &LabScenario,
     scenario_dir: &Path,
     mode: LabPreflightMode,
+    resolved_tokens: &ResolvedBearerTokens,
 ) -> Vec<LabPreflightCheck> {
     scenario
         .data_sources
@@ -769,7 +870,9 @@ fn check_source_reachability_preflight(
             };
             let result = match mode {
                 LabPreflightMode::Static => check_source_static(source, scenario_dir),
-                LabPreflightMode::Live => check_source_reachable(source, scenario, scenario_dir),
+                LabPreflightMode::Live => {
+                    check_source_reachable(source, scenario, scenario_dir, resolved_tokens)
+                }
             };
             preflight_check(name, true, result)
         })
@@ -777,10 +880,11 @@ fn check_source_reachability_preflight(
 }
 
 fn check_source_static(source: &LabDataSource, scenario_dir: &Path) -> Result<String> {
+    bearer::declaration(source)?;
     match source.kind {
         LabDataSourceKind::TraceFile => {
             let path = resolve_path(scenario_dir, &source.endpoint);
-            if !path.is_file() {
+            if path_status(&path)? != PathStatus::RegularFile {
                 Err(NetdiagError::InvalidTrace(format!(
                     "trace file does not exist: {}",
                     path.display()
@@ -803,42 +907,37 @@ fn check_source_static(source: &LabDataSource, scenario_dir: &Path) -> Result<St
                 source.kind.as_str()
             ))
         }
-        LabDataSourceKind::NativePcap => match native_pcap_source(&source.endpoint, scenario_dir) {
-            NativePcapSource::File(path) => {
-                if path.is_file() {
-                    Ok(format!("pcap file exists: {}", path.display()))
-                } else {
-                    Err(NetdiagError::InvalidTrace(format!(
-                        "pcap file does not exist: {}",
-                        path.display()
-                    )))
+        LabDataSourceKind::NativePcap => {
+            match native_pcap_source(&source.endpoint, scenario_dir)? {
+                NativePcapSource::File(path) => {
+                    if path_status(&path)? == PathStatus::RegularFile {
+                        Ok(format!("pcap file exists: {}", path.display()))
+                    } else {
+                        Err(NetdiagError::InvalidTrace(format!(
+                            "pcap file does not exist: {}",
+                            path.display()
+                        )))
+                    }
+                }
+                NativePcapSource::Interface(interface) => {
+                    if interface.trim().is_empty() {
+                        Err(NetdiagError::InvalidTrace(
+                            "pcap interface name is empty".to_string(),
+                        ))
+                    } else {
+                        Ok(format!("pcap interface configured: {interface}"))
+                    }
                 }
             }
-            NativePcapSource::Interface(interface) => {
-                if interface.trim().is_empty() {
-                    Err(NetdiagError::InvalidTrace(
-                        "pcap interface name is empty".to_string(),
-                    ))
-                } else {
-                    Ok(format!("pcap interface configured: {interface}"))
-                }
-            }
-        },
+        }
         LabDataSourceKind::OtlpGrpc => {
-            source
-                .endpoint
-                .trim()
-                .parse::<SocketAddr>()
-                .map_err(|err| {
-                    NetdiagError::InvalidTrace(format!(
-                        "OTLP bind address {} is not host:port: {err}",
-                        source.endpoint
-                    ))
+            let bind_addr =
+                crate::connectors::parse_loopback_bind_addr(&source.endpoint).map_err(|_| {
+                    NetdiagError::InvalidTrace(
+                        "OTLP bind address must be a valid loopback host:port value".to_string(),
+                    )
                 })?;
-            Ok(format!(
-                "OTLP bind address shape valid: {}",
-                source.endpoint
-            ))
+            Ok(format!("OTLP loopback bind address valid: {bind_addr}"))
         }
         LabDataSourceKind::SystemCounters => Ok(if source.endpoint.trim().is_empty() {
             "system counters will sample all interfaces".to_string()
@@ -849,21 +948,16 @@ fn check_source_static(source: &LabDataSource, scenario_dir: &Path) -> Result<St
 }
 
 fn validate_http_endpoint(endpoint: &str) -> Result<()> {
-    let url = reqwest::Url::parse(endpoint).map_err(|err| {
-        NetdiagError::InvalidTrace(format!("endpoint {endpoint} is not a valid URL: {err}"))
-    })?;
-    match url.scheme() {
-        "http" | "https" => Ok(()),
-        scheme => Err(NetdiagError::InvalidTrace(format!(
-            "endpoint {endpoint} must use http or https, got {scheme}"
-        ))),
-    }
+    parse_http_endpoint(endpoint)
+        .map(drop)
+        .map_err(|error| NetdiagError::InvalidTrace(error.to_string()))
 }
 
 fn check_source_reachable(
     source: &LabDataSource,
     scenario: &LabScenario,
     scenario_dir: &Path,
+    resolved_tokens: &ResolvedBearerTokens,
 ) -> Result<String> {
     match source.kind {
         LabDataSourceKind::TraceFile => {
@@ -876,71 +970,79 @@ fn check_source_reachable(
             ))
         }
         LabDataSourceKind::HttpJson => {
-            let loaded = load_http_json(&HttpJsonConfig {
-                endpoint: source.endpoint.clone(),
-                bearer_token: std::env::var("NETDIAG_API_TOKEN").ok(),
-                timeout: Duration::from_secs(scenario.collection.timeout_secs),
-            })?;
+            let loaded = load_http_json(
+                &HttpJsonConfig {
+                    endpoint: source.endpoint.clone(),
+                    timeout: Duration::from_secs(scenario.collection.timeout_secs),
+                },
+                bearer::token_for_source(source, resolved_tokens)?,
+            )?;
             Ok(format!(
                 "{} rows returned by HTTP/JSON",
                 loaded.ingest.schema.rows
             ))
         }
         LabDataSourceKind::PrometheusQuery => {
-            let loaded = load_prometheus_query_range(&PrometheusQueryRangeConfig {
-                base_url: source.endpoint.clone(),
-                bearer_token: std::env::var("NETDIAG_API_TOKEN").ok(),
-                timeout: Duration::from_secs(scenario.collection.timeout_secs),
-                lookback_seconds: scenario.collection.lookback_secs,
-                step_seconds: scenario.collection.step_secs,
-                queries: lab_mapping(source, scenario_dir)?,
-                sample: scenario.id.clone(),
-            })?;
+            let loaded = load_prometheus_query_range(
+                &PrometheusQueryRangeConfig {
+                    base_url: source.endpoint.clone(),
+                    timeout: Duration::from_secs(scenario.collection.timeout_secs),
+                    lookback_seconds: scenario.collection.lookback_secs,
+                    step_seconds: scenario.collection.step_secs,
+                    queries: lab_mapping(source, scenario_dir)?,
+                    sample: scenario.id.clone(),
+                },
+                bearer::token_for_source(source, resolved_tokens)?,
+            )?;
             Ok(format!(
                 "Prometheus returned {} canonical rows",
                 loaded.ingest.schema.rows
             ))
         }
         LabDataSourceKind::PrometheusMetrics => {
-            let loaded = load_prometheus_exposition(&PrometheusExpositionConfig {
-                endpoint: source.endpoint.clone(),
-                bearer_token: std::env::var("NETDIAG_API_TOKEN").ok(),
-                timeout: Duration::from_secs(scenario.collection.timeout_secs),
-                metrics: lab_mapping(source, scenario_dir)?,
-                sample: scenario.id.clone(),
-            })?;
+            let loaded = load_prometheus_exposition(
+                &PrometheusExpositionConfig {
+                    endpoint: source.endpoint.clone(),
+                    timeout: Duration::from_secs(scenario.collection.timeout_secs),
+                    metrics: lab_mapping(source, scenario_dir)?,
+                    sample: scenario.id.clone(),
+                },
+                bearer::token_for_source(source, resolved_tokens)?,
+            )?;
             Ok(format!(
                 "Prometheus exposition returned {} canonical rows",
                 loaded.ingest.schema.rows
             ))
         }
-        LabDataSourceKind::NativePcap => match native_pcap_source(&source.endpoint, scenario_dir) {
-            NativePcapSource::File(path) => {
-                let loaded = load_native_pcap(&NativePcapConfig {
-                    source: NativePcapSource::File(path.clone()),
-                    timeout: Duration::from_secs(1),
-                    packet_limit: 32,
-                    sample: scenario.id.clone(),
-                })?;
-                Ok(format!(
-                    "pcap file parsed: {} canonical rows from {}",
-                    loaded.ingest.schema.rows,
-                    path.display()
-                ))
+        LabDataSourceKind::NativePcap => {
+            match native_pcap_source(&source.endpoint, scenario_dir)? {
+                NativePcapSource::File(path) => {
+                    let loaded = load_native_pcap(&NativePcapConfig {
+                        source: NativePcapSource::File(path.clone()),
+                        timeout: Duration::from_secs(1),
+                        packet_limit: 32,
+                        sample: scenario.id.clone(),
+                    })?;
+                    Ok(format!(
+                        "pcap file parsed: {} canonical rows from {}",
+                        loaded.ingest.schema.rows,
+                        path.display()
+                    ))
+                }
+                NativePcapSource::Interface(interface) => {
+                    let loaded = load_native_pcap(&NativePcapConfig {
+                        source: NativePcapSource::Interface(interface.clone()),
+                        timeout: Duration::from_secs(scenario.collection.timeout_secs),
+                        packet_limit: scenario.collection.packet_limit.min(64),
+                        sample: scenario.id.clone(),
+                    })?;
+                    Ok(format!(
+                        "pcap interface {interface} captured {} rows",
+                        loaded.ingest.schema.rows
+                    ))
+                }
             }
-            NativePcapSource::Interface(interface) => {
-                let loaded = load_native_pcap(&NativePcapConfig {
-                    source: NativePcapSource::Interface(interface.clone()),
-                    timeout: Duration::from_secs(scenario.collection.timeout_secs),
-                    packet_limit: scenario.collection.packet_limit.min(64),
-                    sample: scenario.id.clone(),
-                })?;
-                Ok(format!(
-                    "pcap interface {interface} captured {} rows",
-                    loaded.ingest.schema.rows
-                ))
-            }
-        },
+        }
         LabDataSourceKind::OtlpGrpc => {
             let listener = TcpListener::bind(source.endpoint.trim()).map_err(|err| {
                 NetdiagError::Connector(format!(
@@ -955,7 +1057,7 @@ fn check_source_reachable(
             let loaded = load_system_counters(&SystemCountersConfig {
                 interface: (!source.endpoint.trim().is_empty() && source.endpoint.trim() != "all")
                     .then(|| source.endpoint.trim().to_string()),
-                interval: Duration::from_secs(scenario.collection.interval_secs.clamp(1, 3)),
+                interval: Duration::from_secs(scenario.collection.interval_secs),
                 sample: scenario.id.clone(),
             })?;
             Ok(format!(
@@ -1003,183 +1105,277 @@ fn source_label(source: &LabDataSource) -> String {
 }
 
 pub fn run_lab_scenario(path: impl AsRef<Path>, options: LabRunOptions) -> Result<LabRunResult> {
+    run_lab_scenario_with_bearer_bindings(path, options, &BearerEnvironmentBindings::default())
+}
+
+pub fn run_lab_scenario_with_bearer_bindings(
+    path: impl AsRef<Path>,
+    options: LabRunOptions,
+    bindings: &BearerEnvironmentBindings,
+) -> Result<LabRunResult> {
+    ensure_run_directory_publication_supported(&options.artifacts)?;
     let scenario_path = path.as_ref();
-    let mut scenario = load_lab_scenario(scenario_path)?;
-    if !scenario
-        .data_sources
-        .iter()
-        .any(|source| source.role == LabDataSourceRole::Primary)
-        && let Some(first) = scenario.data_sources.first_mut()
-    {
-        first.role = LabDataSourceRole::Primary;
-    }
-    let scenario_dir = scenario_path.parent().unwrap_or_else(|| Path::new("."));
+    let snapshot = load_lab_scenario_snapshot(scenario_path)?;
+    let declarations = bearer::declarations(snapshot.scenario())?;
+    let resolved_tokens = bindings.resolve_all(&declarations)?;
+    let prepared = prepare_lab_inputs(scenario_path, snapshot, &resolved_tokens)?;
+    let capability = prepare_artifact_root(&options.artifacts)?;
+    run_prepared_lab_scenario(prepared, options, &capability)
+}
+
+fn run_prepared_lab_scenario(
+    prepared: PreparedLabInputs,
+    options: LabRunOptions,
+    capability: &ArtifactRootCapability,
+) -> Result<LabRunResult> {
+    let PreparedLabInputs {
+        snapshot,
+        what_if,
+        loaded_sources,
+    } = prepared;
     let model_dir = options.artifacts.join("model");
-    load_existing_model(&model_dir)?;
+    let model_snapshot = with_artifact_root_capability(capability, |_| {
+        load_existing_model_bundle_snapshot(&model_dir)
+    })?;
 
     let created_at = Utc::now();
-    let lab_run_dir = options
-        .artifacts
-        .join("lab-runs")
-        .join(&scenario.id)
-        .join(lab_timestamp(created_at));
-    if let Some(parent) = lab_run_dir.parent() {
-        fs::create_dir_all(parent).with_path(parent)?;
-    }
-    fs::create_dir(&lab_run_dir).with_path(&lab_run_dir)?;
+    let relative_parent = Path::new("lab-runs").join(&snapshot.scenario().id);
+    let mut staged = with_artifact_root_capability(capability, |owned| {
+        create_root_bound_staged_directory(
+            owned,
+            &relative_parent,
+            lab_timestamp(created_at).into(),
+            "lab run staging failed",
+        )
+    })?;
+    let staged_lab_run_dir = staged.staging_path().to_path_buf();
+    let published_lab_run_dir = staged.target_path().to_path_buf();
+    let operation = (|| {
+        let staged_scenario_copy = staged_lab_run_dir.join("scenario.yaml");
+        snapshot.publish_to(&staged_scenario_copy)?;
+        let scenario = snapshot.into_scenario();
+        let primary = loaded_sources
+            .iter()
+            .find(|source| source.source.role == LabDataSourceRole::Primary)
+            .ok_or_else(|| NetdiagError::InvalidTrace("missing primary source".to_string()))?;
 
-    let scenario_copy = lab_run_dir.join("scenario.yaml");
-    fs::copy(scenario_path, &scenario_copy).with_path(&scenario_copy)?;
-    let loaded_sources = scenario
-        .data_sources
-        .iter()
-        .map(|source| load_lab_source(source, &scenario, scenario_dir))
-        .collect::<Result<Vec<_>>>()?;
-    let primary = loaded_sources
-        .iter()
-        .find(|source| source.source.role == LabDataSourceRole::Primary)
-        .ok_or_else(|| NetdiagError::InvalidTrace("missing primary source".to_string()))?;
-    let what_if_spec = scenario.what_if.clone().or_else(|| {
-        scenario.topology.as_ref().map(|topology| LabWhatIf {
-            topology: topology.clone(),
-            policy: "reroute_path_b".to_string(),
-        })
-    });
-    let what_if = what_if_spec
-        .as_ref()
-        .map(|what_if| build_what_if_request(what_if, scenario_dir))
-        .transpose()?;
+        let primary_health = primary.health.clone();
+        let mut pipeline =
+            diagnose_ingest_with_nested_artifact_root_and_model_snapshot_and_connector_health(
+                primary.loaded.ingest.clone(),
+                &staged,
+                &model_snapshot,
+                what_if.clone(),
+                primary_health.clone(),
+            )?;
+        let connector_health = loaded_sources
+            .iter()
+            .map(|source| source.health.clone())
+            .collect::<Vec<_>>();
+        let corroboration_signals = collect_corroboration_signals(&loaded_sources);
+        apply_corroboration_signals(&mut pipeline.diagnosis_events, &corroboration_signals);
+        pipeline.comparison = compare_rule_ml(&pipeline.diagnosis_events, &pipeline.ml_result);
+        let diagnosis_decision = decide_diagnosis(&pipeline.diagnosis_events, &pipeline.ml_result);
+        pipeline.recommendations = recommend_actions(
+            &pipeline.diagnosis_events,
+            pipeline.what_if.as_ref(),
+            &diagnosis_decision,
+        );
+        pipeline.report = render_report(
+            &pipeline.run_id,
+            &pipeline.telemetry,
+            &pipeline.diagnosis_events,
+            &pipeline.ml_result,
+            &diagnosis_decision,
+            pipeline.what_if.clone(),
+            &pipeline.recommendations,
+        );
+        let multi_source_evidence = multi_source_evidence(
+            &scenario,
+            &pipeline.report,
+            &loaded_sources,
+            &primary_health,
+            &corroboration_signals,
+        );
+        pipeline.report.multi_source_evidence = Some(multi_source_evidence.clone());
+        refresh_report_evidence_timeline(&mut pipeline.report);
+        save_json(
+            run_dir(&staged_lab_run_dir, &pipeline.run_id)?.join("diagnosis_events.json"),
+            &pipeline.diagnosis_events,
+        )?;
+        save_json(
+            run_dir(&staged_lab_run_dir, &pipeline.run_id)?.join("recommendations.json"),
+            &pipeline.recommendations,
+        )?;
+        save_json_atomic_bounded(
+            run_dir(&staged_lab_run_dir, &pipeline.run_id)?.join("report.json"),
+            &pipeline.report,
+            MAX_RUN_REPORT_BYTES,
+            "run report",
+        )?;
 
-    let mut pipeline = diagnose_ingest_with_whatif_and_existing_model_dir(
-        primary.loaded.ingest.clone(),
-        &lab_run_dir,
-        &model_dir,
-        what_if.clone(),
-    )?;
-    let primary_health = primary.health.clone();
-    write_connector_health(&lab_run_dir, &pipeline.run_id, &primary_health)?;
-    let connector_health = loaded_sources
-        .iter()
-        .map(|source| source.health.clone())
-        .collect::<Vec<_>>();
-    let corroboration_signals = collect_corroboration_signals(&loaded_sources);
-    apply_corroboration_signals(&mut pipeline.diagnosis_events, &corroboration_signals);
-    pipeline.comparison = compare_rule_ml(&pipeline.diagnosis_events, &pipeline.ml_result);
-    let diagnosis_decision = decide_diagnosis(&pipeline.diagnosis_events, &pipeline.ml_result);
-    pipeline.recommendations = recommend_actions(
-        &pipeline.diagnosis_events,
-        pipeline.what_if.as_ref(),
-        &diagnosis_decision,
-    );
-    pipeline.report = render_report(
-        &pipeline.run_id,
-        &pipeline.telemetry,
-        &pipeline.diagnosis_events,
-        &pipeline.ml_result,
-        &diagnosis_decision,
-        pipeline.what_if.clone(),
-        &pipeline.recommendations,
-    );
-    let multi_source_evidence = multi_source_evidence(
-        &scenario,
-        &pipeline.report,
-        &loaded_sources,
-        &primary_health,
-        &corroboration_signals,
-    );
-    pipeline.report.multi_source_evidence = Some(multi_source_evidence.clone());
-    refresh_report_evidence_timeline(&mut pipeline.report);
-    save_json(
-        run_dir(&lab_run_dir, &pipeline.run_id).join("diagnosis_events.json"),
-        &pipeline.diagnosis_events,
-    )?;
-    save_json(
-        run_dir(&lab_run_dir, &pipeline.run_id).join("recommendations.json"),
-        &pipeline.recommendations,
-    )?;
-    save_json(
-        run_dir(&lab_run_dir, &pipeline.run_id).join("report.json"),
-        &pipeline.report,
-    )?;
+        let validation_context = LabValidationContext {
+            connector_health: connector_health.clone(),
+            artifact_keys: run_artifacts(&staged_lab_run_dir, &pipeline.run_id)?
+                .into_iter()
+                .filter(|artifact| artifact.exists)
+                .map(|artifact| artifact.key)
+                .collect(),
+            model_manifest_hash: pipeline.report.model_manifest_hash.clone(),
+            model_file_hash: pipeline.report.model_file_hash.clone(),
+        };
+        let acceptance = validate_lab_report(&scenario, &pipeline.report, &validation_context)?;
+        persist_lab_run_id(&mut staged, &pipeline.run_id)?;
+        let comparison = lab_run_comparison(&scenario, &pipeline.report, &acceptance, None);
 
-    let validation_context = LabValidationContext {
-        connector_health: connector_health.clone(),
-        artifact_keys: run_artifacts(&lab_run_dir, &pipeline.run_id)?
-            .into_iter()
-            .filter(|artifact| artifact.exists)
-            .map(|artifact| artifact.key)
-            .collect(),
-        model_manifest_hash: pipeline.report.model_manifest_hash.clone(),
-        model_file_hash: pipeline.report.model_file_hash.clone(),
-    };
-    let acceptance = validate_lab_report(&scenario, &pipeline.report, &validation_context)?;
-    fs::write(lab_run_dir.join("run_id.txt"), &pipeline.run_id)
-        .with_path(lab_run_dir.join("run_id.txt"))?;
-    let comparison = lab_run_comparison(&scenario, &pipeline.report, &acceptance, None);
+        save_json_atomic_bounded(
+            staged_lab_run_dir.join("connector_health.json"),
+            &connector_health,
+            MAX_LAB_CONNECTOR_HEALTH_BYTES,
+            "lab connector health",
+        )?;
+        save_json_atomic_bounded(
+            staged_lab_run_dir.join("report.json"),
+            &pipeline.report,
+            MAX_RUN_REPORT_BYTES,
+            "lab report",
+        )?;
+        save_json(
+            staged_lab_run_dir.join("multi_source_evidence.json"),
+            &multi_source_evidence,
+        )?;
+        save_json_atomic_bounded(
+            staged_lab_run_dir.join("comparison.json"),
+            &comparison,
+            MAX_LAB_COMPARISON_BYTES,
+            "lab run comparison",
+        )?;
+        save_json_atomic_bounded(
+            staged_lab_run_dir.join("acceptance.json"),
+            &acceptance,
+            MAX_LAB_ACCEPTANCE_BYTES,
+            "lab acceptance report",
+        )?;
 
-    save_json(lab_run_dir.join("connector_health.json"), &connector_health)?;
-    save_json(lab_run_dir.join("report.json"), &pipeline.report)?;
-    save_json(
-        lab_run_dir.join("multi_source_evidence.json"),
-        &multi_source_evidence,
-    )?;
-    save_json(lab_run_dir.join("comparison.json"), &comparison)?;
-    save_json(lab_run_dir.join("acceptance.json"), &acceptance)?;
-
-    let evidence_bundle = export_evidence_bundle(
-        &lab_run_dir,
-        &pipeline.run_id,
-        lab_run_dir.join(format!("netdiag-evidence-{}.zip", pipeline.run_id)),
-        &[],
-    )?;
-    save_json(lab_run_dir.join("evidence_bundle.json"), &evidence_bundle)?;
-    update_lab_run_index(
-        &options.artifacts,
-        LabRunIndexEntry {
+        let archive_name = format!("netdiag-evidence-{}.zip", pipeline.run_id);
+        let evidence_bundle = export_evidence_bundle_from_staged_directory(
+            &staged_lab_run_dir,
+            &published_lab_run_dir,
+            &pipeline.run_id,
+            &staged_lab_run_dir.join(&archive_name),
+            &published_lab_run_dir.join(archive_name),
+            EvidenceContext::Lab,
+            &[],
+        )?;
+        save_json_atomic_bounded(
+            staged_lab_run_dir.join("evidence_bundle.json"),
+            &evidence_bundle,
+            MAX_EVIDENCE_BUNDLE_MANIFEST_BYTES,
+            "evidence bundle manifest",
+        )?;
+        let published_pipeline_run_dir = run_dir(&published_lab_run_dir, &pipeline.run_id)?;
+        let index_entry = LabRunIndexEntry {
             run_id: pipeline.run_id.clone(),
             scenario_id: scenario.id.clone(),
             scenario_name: scenario.name.clone(),
             created_at,
-            lab_run_dir: stored_lab_index_path(&options.artifacts, &lab_run_dir),
-            pipeline_run_dir: stored_lab_index_path(&options.artifacts, &pipeline.run_dir),
+            lab_run_dir: stored_lab_index_path(&options.artifacts, &published_lab_run_dir)?,
+            pipeline_run_dir: stored_lab_index_path(
+                &options.artifacts,
+                &published_pipeline_run_dir,
+            )?,
             acceptance_path: stored_lab_index_path(
                 &options.artifacts,
-                &lab_run_dir.join("acceptance.json"),
-            ),
+                &published_lab_run_dir.join("acceptance.json"),
+            )?,
             comparison_path: stored_lab_index_path(
                 &options.artifacts,
-                &lab_run_dir.join("comparison.json"),
-            ),
-            scenario_path: stored_lab_index_path(&options.artifacts, &scenario_copy),
+                &published_lab_run_dir.join("comparison.json"),
+            )?,
+            scenario_path: stored_lab_index_path(
+                &options.artifacts,
+                &published_lab_run_dir.join("scenario.yaml"),
+            )?,
             passed: acceptance.passed,
-        },
+        };
+        let result = LabRunResult {
+            schema: "netdiag-lab-run/v1".to_string(),
+            scenario_id: scenario.id,
+            scenario_name: scenario.name,
+            run_id: pipeline.run_id,
+            lab_run_dir: published_lab_run_dir.display().to_string(),
+            pipeline_run_dir: published_pipeline_run_dir.display().to_string(),
+            acceptance,
+            comparison,
+            evidence_bundle,
+        };
+        Ok((result, index_entry))
+    })();
+    let ((result, _), _) = finish_root_bound_staged_directory(
+        capability,
+        staged,
+        operation,
+        |owned, (_, index_entry), _| update_lab_run_index_owned(owned, index_entry.clone()),
     )?;
+    Ok(result)
+}
 
-    Ok(LabRunResult {
-        schema: "netdiag-lab-run/v1".to_string(),
-        scenario_id: scenario.id,
-        scenario_name: scenario.name,
-        run_id: pipeline.run_id,
-        lab_run_dir: lab_run_dir.display().to_string(),
-        pipeline_run_dir: pipeline.run_dir.display().to_string(),
-        acceptance,
-        comparison,
-        evidence_bundle,
-    })
+fn persist_lab_run_id(staged: &mut StagedAtomicDirectory, run_id: &str) -> Result<()> {
+    if run_id.len() > MAX_RUN_ID_FILE_BYTES {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "lab run id exceeds the {MAX_RUN_ID_FILE_BYTES}-byte persistence limit"
+        )));
+    }
+    staged
+        .write_file("run_id.txt", "txt", |file, path| {
+            file.write_all(run_id.as_bytes()).with_path(path)
+        })
+        .map(drop)
 }
 
 pub fn run_lab_batch(scenarios: &[PathBuf], options: LabRunOptions) -> Result<LabBatchReport> {
-    let mut results = Vec::new();
+    run_lab_batch_with_bearer_bindings(scenarios, options, &BearerEnvironmentBindings::default())
+}
+
+pub fn run_lab_batch_with_bearer_bindings(
+    scenarios: &[PathBuf],
+    options: LabRunOptions,
+    bindings: &BearerEnvironmentBindings,
+) -> Result<LabBatchReport> {
+    ensure_run_directory_publication_supported(&options.artifacts)?;
+    let mut declared = BTreeSet::new();
+    let mut snapshots = Vec::with_capacity(scenarios.len());
     for scenario_path in scenarios {
-        let scenario_id = load_lab_scenario(scenario_path)
-            .ok()
-            .map(|scenario| scenario.id);
-        match run_lab_scenario(
-            scenario_path,
-            LabRunOptions {
-                artifacts: options.artifacts.clone(),
-            },
-        ) {
+        let snapshot = load_lab_scenario_snapshot(scenario_path);
+        if let Ok(snapshot) = &snapshot {
+            declared.extend(bearer::declarations(snapshot.scenario())?);
+        }
+        snapshots.push(snapshot);
+    }
+    let declarations = declared.into_iter().collect::<Vec<_>>();
+    let resolved_tokens = bindings.resolve_all(&declarations)?;
+    let mut authorization = LabArtifactRootAuthorization::Unclaimed;
+    let mut results = Vec::new();
+    for (scenario_path, snapshot) in scenarios.iter().zip(snapshots) {
+        let (scenario_id, run_result) = match snapshot {
+            Ok(snapshot) => {
+                let scenario_id = Some(snapshot.scenario().id.clone());
+                let result = prepare_lab_inputs(scenario_path, snapshot, &resolved_tokens)
+                    .and_then(|prepared| {
+                        let capability = authorization.claim(&options.artifacts)?;
+                        run_prepared_lab_scenario(
+                            prepared,
+                            LabRunOptions {
+                                artifacts: options.artifacts.clone(),
+                            },
+                            capability,
+                        )
+                    });
+                (scenario_id, result)
+            }
+            Err(error) => (None, Err(error)),
+        };
+        match run_result {
             Ok(result) => results.push(LabBatchScenarioResult {
                 scenario_path: scenario_path.display().to_string(),
                 scenario_id: Some(result.scenario_id.clone()),
@@ -1211,189 +1407,8 @@ pub fn run_lab_batch(scenarios: &[PathBuf], options: LabRunOptions) -> Result<La
     })
 }
 
-pub fn summarize_lab_runs(artifact_root: impl AsRef<Path>) -> Result<LabSummaryReport> {
-    let artifact_root = artifact_root.as_ref();
-    let index = read_lab_run_index(artifact_root)?.unwrap_or(LabRunIndex {
-        schema: "netdiag-lab-run-index/v1".to_string(),
-        generated_at: Utc::now(),
-        runs: Vec::new(),
-    });
-    let mut by_label = BTreeMap::<String, LabSummaryAccumulator>::new();
-    let mut by_scenario = BTreeMap::<String, LabSummaryAccumulator>::new();
-    let mut scenario_names = BTreeMap::<String, String>::new();
-    let mut quality = BTreeMap::<String, usize>::new();
-    let mut diagnosis_statuses = BTreeMap::<String, usize>::new();
-    let mut failures = Vec::new();
-    let mut passed = 0usize;
-
-    for entry in &index.runs {
-        let acceptance_path = resolve_stored_path(artifact_root, &entry.acceptance_path);
-        let acceptance = match read_json(&acceptance_path).and_then(|value| {
-            serde_json::from_value::<LabAcceptanceReport>(value).map_err(Into::into)
-        }) {
-            Ok(acceptance) => acceptance,
-            Err(err) => {
-                failures.push(LabSummaryFailure {
-                    run_id: entry.run_id.clone(),
-                    scenario_id: entry.scenario_id.clone(),
-                    failures: vec![format!("acceptance unavailable: {err}")],
-                });
-                continue;
-            }
-        };
-        let comparison_path = resolve_stored_path(artifact_root, &entry.comparison_path);
-        let comparison = read_json(&comparison_path)
-            .and_then(|value| serde_json::from_value::<LabRunComparison>(value).map_err(Into::into))
-            .ok();
-        if acceptance.passed {
-            passed += 1;
-        } else {
-            failures.push(LabSummaryFailure {
-                run_id: entry.run_id.clone(),
-                scenario_id: entry.scenario_id.clone(),
-                failures: acceptance.failures.clone(),
-            });
-        }
-        *quality
-            .entry(acceptance.quality_status.as_str().to_string())
-            .or_default() += 1;
-        *diagnosis_statuses
-            .entry(acceptance.actual_diagnosis_status.as_str().to_string())
-            .or_default() += 1;
-        let expected = acceptance
-            .expected_label
-            .map(|label| label.as_str().to_string());
-        let expected_key = expected
-            .clone()
-            .unwrap_or_else(|| format!("status:{}", acceptance.actual_diagnosis_status.as_str()));
-        let rule_correct = expected.as_ref().is_some_and(|expected| {
-            acceptance
-                .actual_rule_labels
-                .iter()
-                .any(|label| label == expected)
-        });
-        let ml_correct = expected
-            .as_ref()
-            .is_some_and(|expected| acceptance.actual_ml_top == *expected);
-        let rule_ml_agreement = comparison
-            .as_ref()
-            .map(|comparison| comparison.rule_ml_agreement)
-            .unwrap_or_else(|| {
-                acceptance
-                    .actual_rule_labels
-                    .iter()
-                    .any(|label| label == &acceptance.actual_ml_top)
-            });
-        let quality_degraded = acceptance.quality_status != ConnectorHealthStatus::Ok;
-        record_summary_sample(
-            by_label.entry(expected_key).or_default(),
-            acceptance.passed,
-            rule_correct,
-            ml_correct,
-            quality_degraded,
-            !rule_ml_agreement,
-        );
-        scenario_names.insert(entry.scenario_id.clone(), entry.scenario_name.clone());
-        record_summary_sample(
-            by_scenario.entry(entry.scenario_id.clone()).or_default(),
-            acceptance.passed,
-            rule_correct,
-            ml_correct,
-            quality_degraded,
-            !rule_ml_agreement,
-        );
-    }
-
-    Ok(LabSummaryReport {
-        schema: "netdiag-lab-summary/v1".to_string(),
-        generated_at: Utc::now(),
-        artifact_root: artifact_root.display().to_string(),
-        total_runs: index.runs.len(),
-        passed,
-        failed: index.runs.len().saturating_sub(passed),
-        by_label: by_label
-            .into_iter()
-            .map(|(label, stats)| (label, stats.into_summary()))
-            .collect(),
-        by_scenario: by_scenario
-            .into_iter()
-            .map(|(scenario_id, stats)| {
-                let name = scenario_names
-                    .remove(&scenario_id)
-                    .unwrap_or_else(|| scenario_id.clone());
-                (scenario_id, stats.into_scenario_summary(name))
-            })
-            .collect(),
-        quality,
-        diagnosis_statuses,
-        failures,
-    })
-}
-
-#[derive(Debug, Clone, Default)]
-struct LabSummaryAccumulator {
-    runs: usize,
-    passed: usize,
-    rule_correct: usize,
-    ml_correct: usize,
-    quality_degraded: usize,
-    rule_ml_disagreement: usize,
-}
-
-impl LabSummaryAccumulator {
-    fn into_summary(self) -> LabSummaryLabelStats {
-        let denominator = self.runs.max(1) as f64;
-        LabSummaryLabelStats {
-            runs: self.runs,
-            passed: self.passed,
-            rule_accuracy: round4(self.rule_correct as f64 / denominator),
-            ml_accuracy: round4(self.ml_correct as f64 / denominator),
-        }
-    }
-
-    fn into_scenario_summary(self, scenario_name: String) -> LabSummaryScenarioStats {
-        let denominator = self.runs.max(1) as f64;
-        LabSummaryScenarioStats {
-            scenario_name,
-            runs: self.runs,
-            passed: self.passed,
-            failed: self.runs.saturating_sub(self.passed),
-            rule_accuracy: round4(self.rule_correct as f64 / denominator),
-            ml_accuracy: round4(self.ml_correct as f64 / denominator),
-            quality_degraded_rate: round4(self.quality_degraded as f64 / denominator),
-            rule_ml_disagreement_rate: round4(self.rule_ml_disagreement as f64 / denominator),
-        }
-    }
-}
-
-fn record_summary_sample(
-    stats: &mut LabSummaryAccumulator,
-    passed: bool,
-    rule_correct: bool,
-    ml_correct: bool,
-    quality_degraded: bool,
-    rule_ml_disagreement: bool,
-) {
-    stats.runs += 1;
-    if passed {
-        stats.passed += 1;
-    }
-    if rule_correct {
-        stats.rule_correct += 1;
-    }
-    if ml_correct {
-        stats.ml_correct += 1;
-    }
-    if quality_degraded {
-        stats.quality_degraded += 1;
-    }
-    if rule_ml_disagreement {
-        stats.rule_ml_disagreement += 1;
-    }
-}
-
 fn round4(value: f64) -> f64 {
-    (value * 10_000.0).round() / 10_000.0
+    crate::twin::round_decimal(value, 10_000.0)
 }
 
 pub fn validate_lab_run(
@@ -1403,18 +1418,19 @@ pub fn validate_lab_run(
 ) -> Result<LabAcceptanceReport> {
     let input_root = artifact_root.as_ref();
     let resolution = resolve_lab_run_artifact_root(input_root, run_id)?;
+    let indexed_scenario_path = resolution
+        .index_entry
+        .as_ref()
+        .map(|entry| resolve_stored_path(input_root, &entry.scenario_path))
+        .transpose()?;
+    let default_scenario_path = resolution.artifact_root.join("scenario.yaml");
+    let discovered_scenario_path = path_status(&default_scenario_path)?
+        .exists()
+        .then_some(default_scenario_path);
     let scenario_path = scenario_path
         .map(Path::to_path_buf)
-        .or_else(|| {
-            resolution
-                .index_entry
-                .as_ref()
-                .map(|entry| resolve_stored_path(input_root, &entry.scenario_path))
-        })
-        .or_else(|| {
-            let candidate = resolution.artifact_root.join("scenario.yaml");
-            candidate.exists().then_some(candidate)
-        })
+        .or(indexed_scenario_path)
+        .or(discovered_scenario_path)
         .ok_or_else(|| {
             NetdiagError::InvalidTrace(format!(
                 "lab scenario path is required because run {run_id} has no indexed scenario"
@@ -1422,9 +1438,7 @@ pub fn validate_lab_run(
         })?;
     let scenario = load_lab_scenario(&scenario_path)?;
     let artifact_root = resolution.artifact_root;
-    let report: Report = serde_json::from_value(read_json(
-        run_dir(&artifact_root, run_id).join("report.json"),
-    )?)?;
+    let report = read_report(&artifact_root, run_id)?;
     let (model_manifest_hash, model_file_hash) = lab_model_hashes(input_root, &report)?;
     validate_lab_report(
         &scenario,
@@ -1465,8 +1479,7 @@ pub fn verify_action_with_options(
     let artifact_root = artifact_root.as_ref();
     let comparison = compare_runs(artifact_root, before_run_id, after_run_id)?;
     let before_location = crate::storage::resolve_run_location(artifact_root, before_run_id)?;
-    let before_report: Report =
-        serde_json::from_value(read_json(before_location.run_dir.join("report.json"))?)?;
+    let before_report = read_report(artifact_root, before_run_id)?;
     let predicted_what_if_effect = if let Some(policy_path) = options.policy_path.as_deref() {
         Some(read_policy_from_path(policy_path)?.impact)
     } else {
@@ -1477,10 +1490,10 @@ pub fn verify_action_with_options(
     } else {
         verification_policy_for_run(artifact_root, before_run_id)?
     };
-    let predicted_deltas_pct = predicted_delta_pct_map(predicted_what_if_effect.as_ref());
-    let observed_deltas_pct = observed_delta_pct_map(&comparison);
+    let predicted_deltas_pct = predicted_delta_pct_map(predicted_what_if_effect.as_ref())?;
+    let observed_deltas_pct = observed_delta_pct_map(&comparison)?;
     let prediction_error_pct =
-        prediction_error_pct_map(&predicted_deltas_pct, &observed_deltas_pct);
+        prediction_error_pct_map(&predicted_deltas_pct, &observed_deltas_pct)?;
     let (verdict, reasons) = action_verification_verdict(
         &comparison,
         verification_policy.as_ref(),
@@ -1513,402 +1526,75 @@ pub fn verify_action_with_options(
     Ok(verification)
 }
 
-fn record_action_verification_artifact(
-    run_dir: &Path,
-    after_run_id: &str,
-    verification: &ActionVerification,
-) -> Result<()> {
-    let file_name = format!("action_verification_{after_run_id}.json");
-    save_json(run_dir.join(&file_name), verification)?;
-    let manifest_path = run_dir.join("manifest.json");
-    if manifest_path.exists() {
-        let mut manifest: RunManifest =
-            serde_json::from_value(read_json(&manifest_path)?).map_err(NetdiagError::from)?;
-        manifest
-            .artifact_paths
-            .insert(format!("action_verification_{after_run_id}"), file_name);
-        save_json(&manifest_path, &manifest)?;
-    }
-    Ok(())
-}
-
 fn read_policy_from_path(path: &Path) -> Result<crate::models::TwinPolicyAction> {
-    let raw = fs::read_to_string(path).with_path(path)?;
-    import_policy_action(&raw, format_for_path(path))
-}
-
-fn read_verification_objective(path: &Path) -> Result<LabVerification> {
-    let raw = fs::read_to_string(path).with_path(path)?;
-    let value: serde_yaml::Value = serde_yaml::from_str(&raw)
-        .map_err(|err| NetdiagError::InvalidTrace(format!("invalid objective YAML: {err}")))?;
-    if let Ok(policy) = serde_yaml::from_value::<LabVerification>(value.clone())
-        && !policy.is_empty()
-    {
-        return Ok(policy);
-    }
-    if let Some(verification) = value.get("verification") {
-        let policy: LabVerification =
-            serde_yaml::from_value(verification.clone()).map_err(|err| {
-                NetdiagError::InvalidTrace(format!("invalid verification YAML: {err}"))
-            })?;
-        if !policy.is_empty() {
-            return Ok(policy);
-        }
-    }
-    Err(NetdiagError::InvalidTrace(format!(
-        "verification objective {} must contain objective and/or fail_if",
-        path.display()
-    )))
-}
-
-fn predicted_delta_pct_map(effect: Option<&TwinPolicyImpact>) -> BTreeMap<String, f64> {
-    let Some(effect) = effect else {
-        return BTreeMap::new();
-    };
-    BTreeMap::from([
-        (
-            "latency_p95_delta_pct".to_string(),
-            normalize_impact_to_pct(effect.latency_delta_pct),
-        ),
-        (
-            "packet_loss_delta_pct".to_string(),
-            normalize_impact_to_pct(effect.loss_delta_pct),
-        ),
-        (
-            "throughput_delta_pct".to_string(),
-            normalize_impact_to_pct(effect.throughput_delta_pct),
-        ),
-    ])
-}
-
-fn normalize_impact_to_pct(value: f64) -> f64 {
-    let pct = if value.abs() <= 1.0 {
-        value * 100.0
-    } else {
-        value
-    };
-    round4(pct)
-}
-
-fn observed_delta_pct_map(comparison: &RunComparison) -> BTreeMap<String, f64> {
-    [
-        ("latency_p95_delta_pct", comparison.latency_p95_delta_pct),
-        ("packet_loss_delta_pct", comparison.loss_delta_pct),
-        ("throughput_delta_pct", comparison.throughput_delta_pct),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| value.map(|value| (key.to_string(), round4(value))))
-    .collect()
-}
-
-fn prediction_error_pct_map(
-    predicted: &BTreeMap<String, f64>,
-    observed: &BTreeMap<String, f64>,
-) -> BTreeMap<String, f64> {
-    predicted
-        .iter()
-        .filter_map(|(key, predicted)| {
-            observed
-                .get(key)
-                .map(|observed| (key.clone(), round4(observed - predicted)))
-        })
-        .collect()
-}
-
-fn predicted_action_effect(
-    report: &Report,
-    recommendation_id: Option<&str>,
-) -> Result<Option<TwinPolicyImpact>> {
-    let requested_action_id = if let Some(recommendation_id) = recommendation_id {
-        let recommendation = report
-            .recommendations
-            .iter()
-            .find(|recommendation| recommendation.recommendation_id == recommendation_id)
-            .ok_or_else(|| NetdiagError::UnknownRecommendation(recommendation_id.to_string()))?;
-        let Some(action_id) = recommendation.what_if_action_id.as_deref() else {
-            return Ok(None);
-        };
-        Some(action_id)
-    } else {
-        None
-    };
-    Ok(report
-        .what_if
-        .as_ref()
-        .filter(|what_if| {
-            requested_action_id
-                .map(|action_id| action_id == what_if.action_id)
-                .unwrap_or(true)
-        })
-        .map(what_if_effect))
-}
-
-fn what_if_effect(what_if: &crate::models::WhatIfResult) -> TwinPolicyImpact {
-    what_if
-        .policy_action
-        .as_ref()
-        .map(|action| action.impact)
-        .unwrap_or_else(|| TwinPolicyImpact {
-            latency_delta_pct: what_if.delta.get("latency_pct").copied().unwrap_or(0.0),
-            loss_delta_pct: what_if.delta.get("loss_pct").copied().unwrap_or(0.0),
-            throughput_delta_pct: what_if.delta.get("throughput_pct").copied().unwrap_or(0.0),
-        })
+    load_policy_action_file(path)
 }
 
 fn verification_policy_for_run(
     artifact_root: &Path,
     before_run_id: &str,
 ) -> Result<Option<LabVerification>> {
-    let Ok(resolution) = resolve_lab_run_artifact_root(artifact_root, before_run_id) else {
-        return Ok(None);
+    let resolution = match resolve_lab_run_artifact_root(artifact_root, before_run_id) {
+        Ok(resolution) => resolution,
+        Err(error) => match run_has_non_lab_context(artifact_root, before_run_id) {
+            Ok(true) => return Ok(None),
+            Ok(false) => return Err(error),
+            Err(context_resolution) => {
+                return Err(NetdiagError::LabContextResolution {
+                    run_id: before_run_id.to_string(),
+                    lab_resolution: Box::new(error),
+                    context_resolution: Box::new(context_resolution),
+                });
+            }
+        },
     };
-    let scenario_path = resolution
+    let indexed_scenario_path = resolution
         .index_entry
         .as_ref()
         .map(|entry| resolve_stored_path(artifact_root, &entry.scenario_path))
-        .or_else(|| {
-            let candidate = resolution.artifact_root.join("scenario.yaml");
-            candidate.exists().then_some(candidate)
-        });
+        .transpose()?;
+    let scenario_path = if indexed_scenario_path.is_some() {
+        indexed_scenario_path
+    } else {
+        let candidate = resolution.artifact_root.join("scenario.yaml");
+        regular_file_exists(&candidate, "lab scenario")?.then_some(candidate)
+    };
     let Some(scenario_path) = scenario_path else {
-        return Ok(None);
+        if resolution.index_entry.is_none() && resolution.artifact_root == artifact_root {
+            return Ok(None);
+        }
+        if run_has_non_lab_context(artifact_root, before_run_id)? {
+            return Ok(None);
+        }
+        return Err(NetdiagError::InvalidTrace(format!(
+            "lab run {before_run_id} is missing its scenario verification policy"
+        )));
     };
     let scenario = load_lab_scenario(scenario_path)?;
     Ok((!scenario.verification.is_empty()).then_some(scenario.verification))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MetricComparator {
-    Lt,
-    Le,
-    Eq,
-    Ge,
-    Gt,
+fn run_has_non_lab_context(artifact_root: &Path, run_id: &str) -> Result<bool> {
+    let location = crate::storage::resolve_run_location(artifact_root, run_id)?;
+    let Some(run_context) = location.lab_run_dir else {
+        return Ok(true);
+    };
+    let pilot_manifest = run_context.join("pilot.yaml");
+    regular_file_exists(&pilot_manifest, "pilot run marker")
 }
 
-#[derive(Debug, Clone, Copy)]
-struct MetricCondition {
-    comparator: MetricComparator,
-    threshold: f64,
-}
-
-fn parse_metric_condition(expr: &str) -> std::result::Result<MetricCondition, String> {
-    let expr = expr.trim();
-    for (prefix, comparator) in [
-        ("<=", MetricComparator::Le),
-        (">=", MetricComparator::Ge),
-        ("==", MetricComparator::Eq),
-        ("<", MetricComparator::Lt),
-        (">", MetricComparator::Gt),
-    ] {
-        if let Some(value) = expr.strip_prefix(prefix) {
-            let threshold = value.trim().parse::<f64>().map_err(|err| {
-                format!("invalid verification condition `{expr}` threshold: {err}")
-            })?;
-            return Ok(MetricCondition {
-                comparator,
-                threshold,
-            });
-        }
-    }
-    Err(format!(
-        "invalid verification condition `{expr}`; expected one of <=, >=, ==, <, >"
-    ))
-}
-
-fn metric_delta(comparison: &RunComparison, metric: &str) -> Option<f64> {
-    match metric {
-        "latency_p95_delta_pct" | "latency_delta_pct" => comparison.latency_p95_delta_pct,
-        "packet_loss_delta_pct" | "loss_delta_pct" => comparison.loss_delta_pct,
-        "throughput_delta_pct" => comparison.throughput_delta_pct,
-        _ => None,
-    }
-}
-
-fn condition_matches(value: f64, condition: MetricCondition) -> bool {
-    match condition.comparator {
-        MetricComparator::Lt => value < condition.threshold,
-        MetricComparator::Le => value <= condition.threshold,
-        MetricComparator::Eq => (value - condition.threshold).abs() <= f64::EPSILON,
-        MetricComparator::Ge => value >= condition.threshold,
-        MetricComparator::Gt => value > condition.threshold,
-    }
-}
-
-fn action_verification_verdict(
-    comparison: &RunComparison,
-    policy: Option<&LabVerification>,
-    predicted_deltas_pct: &BTreeMap<String, f64>,
-    observed_deltas_pct: &BTreeMap<String, f64>,
-) -> (ActionVerificationVerdict, Vec<String>) {
-    let mut reasons = Vec::new();
-    if comparison.right.quality_status > comparison.left.quality_status {
-        reasons.push(format!(
-            "connector quality degraded from {} to {}",
-            comparison.left.quality_status, comparison.right.quality_status
-        ));
-    }
-    for change in &comparison.measurement_quality_changes {
-        if metric_quality_rank(change.right_quality) > metric_quality_rank(change.left_quality) {
-            reasons.push(format!(
-                "{} quality degraded from {} to {}",
-                change.field,
-                change.left_quality.as_str(),
-                change.right_quality.as_str()
-            ));
-        }
-    }
-    if !reasons.is_empty() {
-        return (ActionVerificationVerdict::Inconclusive, reasons);
-    }
-
-    if let Some(policy) = policy
-        && !policy.is_empty()
-    {
-        for (metric, expr) in &policy.fail_if {
-            let condition = match parse_metric_condition(expr) {
-                Ok(condition) => condition,
-                Err(err) => return (ActionVerificationVerdict::Inconclusive, vec![err]),
-            };
-            let Some(value) = metric_delta(comparison, metric) else {
-                return (
-                    ActionVerificationVerdict::Inconclusive,
-                    vec![format!("verification fail_if metric {metric} is missing")],
-                );
-            };
-            if condition_matches(value, condition) {
-                return (
-                    ActionVerificationVerdict::NotVerified,
-                    vec![format!(
-                        "verification fail_if matched: {metric}={value:.4} {expr}"
-                    )],
-                );
-            }
-        }
-
-        if !policy.objective.is_empty() {
-            for (metric, expr) in &policy.objective {
-                let condition = match parse_metric_condition(expr) {
-                    Ok(condition) => condition,
-                    Err(err) => return (ActionVerificationVerdict::Inconclusive, vec![err]),
-                };
-                let Some(value) = metric_delta(comparison, metric) else {
-                    return (
-                        ActionVerificationVerdict::Inconclusive,
-                        vec![format!("verification objective metric {metric} is missing")],
-                    );
-                };
-                if !condition_matches(value, condition) {
-                    return (
-                        ActionVerificationVerdict::NotVerified,
-                        vec![format!(
-                            "verification objective was not met: {metric}={value:.4} expected {expr}"
-                        )],
-                    );
-                }
-            }
-            return (
-                ActionVerificationVerdict::Verified,
-                vec![
-                    "observed before/after telemetry met the scenario verification objective"
-                        .to_string(),
-                ],
-            );
-        }
-    }
-
-    let has_metric = comparison.latency_p95_delta_pct.is_some()
-        || comparison.loss_delta_pct.is_some()
-        || comparison.throughput_delta_pct.is_some();
-    if !has_metric {
-        reasons.push("required before/after metrics are missing".to_string());
-        return (ActionVerificationVerdict::Inconclusive, reasons);
-    }
-
-    let mut tradeoff_failures = Vec::new();
-    if comparison
-        .latency_p95_delta_pct
-        .is_some_and(|delta| delta > 5.0)
-    {
-        tradeoff_failures.push(format!(
-            "latency_p95_delta_pct regressed by {:.2}%",
-            comparison.latency_p95_delta_pct.unwrap_or_default()
-        ));
-    }
-    if comparison.loss_delta_pct.is_some_and(|delta| delta > 5.0) {
-        tradeoff_failures.push(format!(
-            "packet_loss_delta_pct regressed by {:.2}%",
-            comparison.loss_delta_pct.unwrap_or_default()
-        ));
-    }
-    if comparison
-        .throughput_delta_pct
-        .is_some_and(|delta| delta < -5.0)
-    {
-        tradeoff_failures.push(format!(
-            "throughput_delta_pct regressed by {:.2}%",
-            comparison.throughput_delta_pct.unwrap_or_default()
-        ));
-    }
-    for (metric, predicted) in predicted_deltas_pct {
-        if predicted_improves_metric(metric, *predicted)
-            && observed_deltas_pct
-                .get(metric)
-                .is_some_and(|observed| observed_degrades_metric(metric, *observed))
-        {
-            tradeoff_failures.push(format!(
-                "{metric} moved opposite the predicted improvement (predicted {predicted:.2}%, observed {:.2}%)",
-                observed_deltas_pct.get(metric).copied().unwrap_or_default()
-            ));
-        }
-    }
-    if !tradeoff_failures.is_empty() {
-        return (ActionVerificationVerdict::NotVerified, tradeoff_failures);
-    }
-
-    if comparison
-        .latency_p95_delta_pct
-        .is_some_and(|delta| delta <= -5.0)
-        || comparison.loss_delta_pct.is_some_and(|delta| delta <= -5.0)
-        || comparison
-            .throughput_delta_pct
-            .is_some_and(|delta| delta >= 5.0)
-    {
-        reasons.push(
-            "observed before/after telemetry improved by at least 5% without quality degradation"
-                .to_string(),
-        );
-        return (ActionVerificationVerdict::Verified, reasons);
-    }
-
-    reasons.push(
-        "observed before/after telemetry did not meet the 5% improvement threshold".to_string(),
-    );
-    (ActionVerificationVerdict::NotVerified, reasons)
-}
-
-fn predicted_improves_metric(metric: &str, delta: f64) -> bool {
-    match metric {
-        "latency_p95_delta_pct" | "packet_loss_delta_pct" => delta <= -5.0,
-        "throughput_delta_pct" => delta >= 5.0,
-        _ => false,
-    }
-}
-
-fn observed_degrades_metric(metric: &str, delta: f64) -> bool {
-    match metric {
-        "latency_p95_delta_pct" | "packet_loss_delta_pct" => delta > 5.0,
-        "throughput_delta_pct" => delta < -5.0,
-        _ => false,
-    }
-}
-
-fn metric_quality_rank(quality: MetricQuality) -> u8 {
-    match quality {
-        MetricQuality::Measured => 0,
-        MetricQuality::Estimated => 1,
-        MetricQuality::Fallback => 2,
-        MetricQuality::Missing => 3,
+fn regular_file_exists(path: &Path, kind: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => Err(NetdiagError::InvalidTrace(format!(
+            "{kind} is not a regular file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(NetdiagError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -1917,72 +1603,16 @@ fn lab_model_hashes(
     report: &Report,
 ) -> Result<(Option<String>, Option<String>)> {
     let model_dir = artifact_root.join("model");
-    let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
-    let model_path = model_dir.join(MODEL_FILE_NAME);
-    let manifest_hash = if manifest_path.exists() {
-        Some(sha256_file(&manifest_path)?)
-    } else {
-        report.model_manifest_hash.clone()
-    };
-    let model_file_hash = if model_path.exists() {
-        Some(sha256_file(&model_path)?)
-    } else {
-        report.model_file_hash.clone()
-    };
-    Ok((manifest_hash, model_file_hash))
-}
-
-pub(crate) fn sync_lab_review_artifacts(
-    location: &RunLocation,
-    recommendations: &[Recommendation],
-) -> Result<()> {
-    let Some(lab_run_dir) = location.lab_run_dir.as_deref() else {
-        return Ok(());
-    };
-    let report_path = lab_run_dir.join("report.json");
-    if !report_path.exists() {
-        return Ok(());
+    match load_existing_model_bundle_snapshot_if_present(&model_dir)? {
+        Some(snapshot) => Ok((
+            Some(snapshot.model_manifest_hash_sha256),
+            Some(snapshot.model_file_hash_sha256),
+        )),
+        None => Ok((
+            report.model_manifest_hash.clone(),
+            report.model_file_hash.clone(),
+        )),
     }
-
-    let mut report: Report = serde_json::from_value(read_json(&report_path)?)?;
-    report.recommendations = recommendations.to_vec();
-    report.hil_summary = HilReviewSummary::from_recommendations(recommendations);
-    save_json(&report_path, &report)?;
-
-    let scenario_path = lab_run_dir.join("scenario.yaml");
-    let scenario = load_lab_scenario(&scenario_path)?;
-    let model_root = location
-        .lab_index_root
-        .as_deref()
-        .unwrap_or(location.artifact_root.as_path());
-    let (model_manifest_hash, model_file_hash) = lab_model_hashes(model_root, &report)?;
-    let acceptance = validate_lab_report(
-        &scenario,
-        &report,
-        &LabValidationContext {
-            connector_health: read_lab_connector_health(lab_run_dir, &report.run_id)?,
-            artifact_keys: lab_artifact_keys(lab_run_dir, &report.run_id)?,
-            model_manifest_hash,
-            model_file_hash,
-        },
-    )?;
-    let comparison = lab_run_comparison(&scenario, &report, &acceptance, None);
-    save_json(lab_run_dir.join("acceptance.json"), &acceptance)?;
-    save_json(lab_run_dir.join("comparison.json"), &comparison)?;
-
-    let evidence_bundle = export_evidence_bundle(
-        lab_run_dir,
-        &report.run_id,
-        lab_run_dir.join(format!("netdiag-evidence-{}.zip", report.run_id)),
-        &[],
-    )?;
-    save_json(lab_run_dir.join("evidence_bundle.json"), &evidence_bundle)?;
-
-    if let Some(index_root) = location.lab_index_root.as_deref() {
-        update_lab_run_index_passed(index_root, &report.run_id, acceptance.passed)?;
-    }
-
-    Ok(())
 }
 
 fn read_lab_connector_health(
@@ -1990,8 +1620,12 @@ fn read_lab_connector_health(
     run_id: &str,
 ) -> Result<Vec<ConnectorHealthSnapshot>> {
     let top_level = artifact_root.join("connector_health.json");
-    if top_level.exists() {
-        return serde_json::from_value(read_json(top_level)?).map_err(NetdiagError::from);
+    if let Some(health) = read_optional_stable_json_bounded(
+        &top_level,
+        MAX_LAB_CONNECTOR_HEALTH_BYTES,
+        "lab connector health",
+    )? {
+        return Ok(health);
     }
     Ok(read_connector_health(artifact_root, run_id)?
         .into_iter()
@@ -1999,7 +1633,7 @@ fn read_lab_connector_health(
 }
 
 fn lab_artifact_keys(artifact_root: &Path, run_id: &str) -> Result<Vec<String>> {
-    let mut keys = run_artifacts(artifact_root, run_id)?
+    let mut keys = run_artifacts_allow_pending(artifact_root, run_id)?
         .into_iter()
         .filter(|artifact| artifact.exists)
         .map(|artifact| artifact.key)
@@ -2010,68 +1644,17 @@ fn lab_artifact_keys(artifact_root: &Path, run_id: &str) -> Result<Vec<String>> 
         ("multi_source_evidence", "multi_source_evidence.json"),
         ("lab_connector_health", "connector_health.json"),
     ] {
-        if artifact_root.join(file_name).exists() && !keys.iter().any(|existing| existing == key) {
+        if path_status(&artifact_root.join(file_name))?.exists()
+            && !keys.iter().any(|existing| existing == key)
+        {
             keys.push(key.to_string());
         }
     }
     Ok(keys)
 }
 
-fn update_lab_run_index(artifact_root: &Path, entry: LabRunIndexEntry) -> Result<()> {
-    let index_path = artifact_root.join("lab_run_index.json");
-    let mut index = if index_path.exists() {
-        serde_json::from_value::<LabRunIndex>(read_json(&index_path)?)?
-    } else {
-        LabRunIndex {
-            schema: "netdiag-lab-run-index/v1".to_string(),
-            generated_at: Utc::now(),
-            runs: Vec::new(),
-        }
-    };
-    index.schema = "netdiag-lab-run-index/v1".to_string();
-    index.generated_at = Utc::now();
-    index
-        .runs
-        .retain(|existing| existing.run_id != entry.run_id);
-    index.runs.insert(0, entry);
-    index.runs.truncate(200);
-    save_json(index_path, &index)?;
-    Ok(())
-}
-
-fn update_lab_run_index_passed(artifact_root: &Path, run_id: &str, passed: bool) -> Result<()> {
-    let index_path = artifact_root.join("lab_run_index.json");
-    if !index_path.exists() {
-        return Ok(());
-    }
-    let mut index = serde_json::from_value::<LabRunIndex>(read_json(&index_path)?)?;
-    if let Some(entry) = index.runs.iter_mut().find(|entry| entry.run_id == run_id) {
-        entry.passed = passed;
-        index.generated_at = Utc::now();
-        save_json(index_path, &index)?;
-    }
-    Ok(())
-}
-
-fn stored_lab_index_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-}
-
-fn read_lab_run_index(artifact_root: &Path) -> Result<Option<LabRunIndex>> {
-    let index_path = artifact_root.join("lab_run_index.json");
-    if !index_path.exists() {
-        return Ok(None);
-    }
-    serde_json::from_value(read_json(index_path)?)
-        .map(Some)
-        .map_err(NetdiagError::from)
-}
-
 fn resolve_lab_run_artifact_root(artifact_root: &Path, run_id: &str) -> Result<LabRunResolution> {
-    if run_dir(artifact_root, run_id).join("report.json").exists() {
+    if path_status(&run_dir(artifact_root, run_id)?.join("report.json"))?.exists() {
         return Ok(LabRunResolution {
             artifact_root: artifact_root.to_path_buf(),
             index_entry: None,
@@ -2080,8 +1663,8 @@ fn resolve_lab_run_artifact_root(artifact_root: &Path, run_id: &str) -> Result<L
     if let Some(index) = read_lab_run_index(artifact_root)?
         && let Some(entry) = index.runs.into_iter().find(|entry| entry.run_id == run_id)
     {
-        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir);
-        if run_dir(&lab_run_dir, run_id).join("report.json").exists() {
+        let lab_run_dir = resolve_stored_path(artifact_root, &entry.lab_run_dir)?;
+        if path_status(&run_dir(&lab_run_dir, run_id)?.join("report.json"))?.exists() {
             return Ok(LabRunResolution {
                 artifact_root: lab_run_dir,
                 index_entry: Some(entry),
@@ -2101,29 +1684,46 @@ fn resolve_lab_run_artifact_root(artifact_root: &Path, run_id: &str) -> Result<L
 
 fn scan_lab_run_dir(artifact_root: &Path, run_id: &str) -> Result<Option<PathBuf>> {
     let lab_runs_dir = artifact_root.join("lab-runs");
-    if !lab_runs_dir.exists() {
-        return Ok(None);
+    match path_status(&lab_runs_dir)? {
+        PathStatus::Missing => return Ok(None),
+        PathStatus::Directory => {}
+        _ => {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "lab runs path is not a regular directory: {}",
+                lab_runs_dir.display()
+            )));
+        }
     }
     for scenario in fs::read_dir(&lab_runs_dir).with_path(&lab_runs_dir)? {
         let scenario = scenario.with_path(&lab_runs_dir)?;
         let scenario_path = scenario.path();
-        if !scenario_path.is_dir() {
+        if !optional_lab_discovery_directory(&scenario_path, "lab scenario directory")? {
             continue;
         }
         for run in fs::read_dir(&scenario_path).with_path(&scenario_path)? {
             let run = run.with_path(&scenario_path)?;
             let candidate = run.path();
-            if candidate
-                .join("runs")
-                .join(run_id)
-                .join("report.json")
-                .exists()
-            {
+            if !optional_lab_discovery_directory(&candidate, "lab run directory")? {
+                continue;
+            }
+            let report_path = candidate.join("runs").join(run_id).join("report.json");
+            if path_status(&report_path)?.exists() {
                 return Ok(Some(candidate));
             }
         }
     }
     Ok(None)
+}
+
+fn optional_lab_discovery_directory(path: &Path, kind: &str) -> Result<bool> {
+    match path_status(path)? {
+        PathStatus::Missing | PathStatus::RegularFile => Ok(false),
+        PathStatus::Directory => Ok(true),
+        PathStatus::Other => Err(NetdiagError::InvalidTrace(format!(
+            "{kind} is not a regular directory: {}",
+            path.display()
+        ))),
+    }
 }
 
 pub fn validate_lab_report(
@@ -2308,22 +1908,29 @@ pub fn validate_lab_report(
             ));
         }
     }
-    let quality_status = context
+    let quality_status = match context
         .connector_health
         .iter()
         .map(|health| health.status)
         .max()
-        .unwrap_or(ConnectorHealthStatus::Ok);
-    if !context.connector_health.is_empty()
-        && !scenario
-            .acceptance
-            .allowed_connector_status
-            .contains(&quality_status)
     {
-        failures.push(format!(
-            "connector health status {quality_status} is not allowed"
-        ));
-    }
+        None => {
+            failures.push("connector health evidence is missing".to_string());
+            ConnectorHealthStatus::Error
+        }
+        Some(quality_status)
+            if !scenario
+                .acceptance
+                .allowed_connector_status
+                .contains(&quality_status) =>
+        {
+            failures.push(format!(
+                "connector health status {quality_status} is not allowed"
+            ));
+            quality_status
+        }
+        Some(quality_status) => quality_status,
+    };
     if scenario.acceptance.require_what_if_improvement {
         match &report.what_if {
             Some(what_if) => validate_what_if_improvement(what_if, &mut failures),
@@ -2406,40 +2013,65 @@ fn validate_what_if_improvement(what_if: &crate::models::WhatIfResult, failures:
     }
 }
 
+fn load_lab_sources_bounded(
+    scenario: &LabScenario,
+    scenario_dir: &Path,
+    resolved_tokens: &ResolvedBearerTokens,
+) -> Result<Vec<LoadedLabSource>> {
+    let mut retained = LabRetainedResourceBudget::default();
+    let mut loaded_sources = Vec::with_capacity(scenario.data_sources.len());
+    for source in &scenario.data_sources {
+        let loaded = load_lab_source(source, scenario, scenario_dir, resolved_tokens)?;
+        let source_name = source_label(source);
+        if loaded.loaded.resource_usage.records != loaded.loaded.ingest.schema.rows {
+            return Err(NetdiagError::Connector(format!(
+                "lab source {source_name} reported {} retained records but produced {} canonical rows",
+                loaded.loaded.resource_usage.records, loaded.loaded.ingest.schema.rows
+            )));
+        }
+        retained.reserve(&source_name, loaded.loaded.resource_usage)?;
+        loaded_sources.push(loaded);
+    }
+    Ok(loaded_sources)
+}
+
 fn load_lab_source(
     source: &LabDataSource,
     scenario: &LabScenario,
     scenario_dir: &Path,
+    resolved_tokens: &ResolvedBearerTokens,
 ) -> Result<LoadedLabSource> {
     let loaded = match source.kind {
         LabDataSourceKind::TraceFile => load_trace_file_source(source, scenario_dir)?,
-        LabDataSourceKind::HttpJson => load_http_json(&HttpJsonConfig {
-            endpoint: source.endpoint.clone(),
-            bearer_token: std::env::var("NETDIAG_API_TOKEN").ok(),
-            timeout: Duration::from_secs(scenario.collection.timeout_secs),
-        })?,
-        LabDataSourceKind::PrometheusQuery => {
-            load_prometheus_query_range(&PrometheusQueryRangeConfig {
+        LabDataSourceKind::HttpJson => load_http_json(
+            &HttpJsonConfig {
+                endpoint: source.endpoint.clone(),
+                timeout: Duration::from_secs(scenario.collection.timeout_secs),
+            },
+            bearer::token_for_source(source, resolved_tokens)?,
+        )?,
+        LabDataSourceKind::PrometheusQuery => load_prometheus_query_range(
+            &PrometheusQueryRangeConfig {
                 base_url: source.endpoint.clone(),
-                bearer_token: std::env::var("NETDIAG_API_TOKEN").ok(),
                 timeout: Duration::from_secs(scenario.collection.timeout_secs),
                 lookback_seconds: scenario.collection.lookback_secs,
                 step_seconds: scenario.collection.step_secs,
                 queries: lab_mapping(source, scenario_dir)?,
                 sample: scenario.id.clone(),
-            })?
-        }
-        LabDataSourceKind::PrometheusMetrics => {
-            load_prometheus_exposition(&PrometheusExpositionConfig {
+            },
+            bearer::token_for_source(source, resolved_tokens)?,
+        )?,
+        LabDataSourceKind::PrometheusMetrics => load_prometheus_exposition(
+            &PrometheusExpositionConfig {
                 endpoint: source.endpoint.clone(),
-                bearer_token: std::env::var("NETDIAG_API_TOKEN").ok(),
                 timeout: Duration::from_secs(scenario.collection.timeout_secs),
                 metrics: lab_mapping(source, scenario_dir)?,
                 sample: scenario.id.clone(),
-            })?
-        }
+            },
+            bearer::token_for_source(source, resolved_tokens)?,
+        )?,
         LabDataSourceKind::NativePcap => load_native_pcap(&NativePcapConfig {
-            source: native_pcap_source(&source.endpoint, scenario_dir),
+            source: native_pcap_source(&source.endpoint, scenario_dir)?,
             timeout: Duration::from_secs(scenario.collection.timeout_secs),
             packet_limit: scenario.collection.packet_limit,
             sample: scenario.id.clone(),
@@ -2453,7 +2085,7 @@ fn load_lab_source(
         LabDataSourceKind::SystemCounters => load_system_counters(&SystemCountersConfig {
             interface: (!source.endpoint.trim().is_empty() && source.endpoint.trim() != "all")
                 .then(|| source.endpoint.trim().to_string()),
-            interval: Duration::from_secs(scenario.collection.interval_secs.clamp(1, 10)),
+            interval: Duration::from_secs(scenario.collection.interval_secs),
             sample: scenario.id.clone(),
         })?,
     };
@@ -2461,7 +2093,7 @@ fn load_lab_source(
         .name
         .clone()
         .unwrap_or_else(|| source.kind.as_str().to_string());
-    let health = connector_health_from_ingest(
+    let health = ConnectorHealthSnapshot::from_ingest(
         source.kind.as_str(),
         &profile_name,
         &loaded.sample,
@@ -2479,15 +2111,20 @@ fn load_trace_file_source(
     scenario_dir: &Path,
 ) -> Result<ConnectorLoadResult> {
     let path = resolve_path(scenario_dir, &source.endpoint);
-    let ingest = ingest_trace(&path)?;
+    let trace = ingest_trace_with_usage(&path)?;
+    let records = trace.ingest.schema.rows;
     Ok(ConnectorLoadResult {
-        sample: ingest.schema.sample.clone(),
-        ingest,
+        sample: trace.ingest.schema.sample.clone(),
+        ingest: trace.ingest,
         provenance: BTreeMap::from([
             ("kind".to_string(), "trace-file".to_string()),
             ("path".to_string(), path.display().to_string()),
         ]),
         payload: None,
+        resource_usage: ConnectorResourceUsage {
+            input_bytes: trace.input_bytes,
+            records,
+        },
     })
 }
 
@@ -2500,11 +2137,11 @@ fn build_what_if_request(what_if: &LabWhatIf, base_dir: &Path) -> Result<WhatIfR
 
 fn load_lab_topology(what_if: &LabWhatIf, base_dir: &Path) -> Result<crate::models::TopologyModel> {
     let topology_ref = resolve_path(base_dir, &what_if.topology);
-    if topology_ref.exists() {
-        let raw = fs::read_to_string(&topology_ref).with_path(&topology_ref)?;
-        import_topology(&raw, format_for_path(&topology_ref))
-    } else {
-        topology_model(&what_if.topology)
+    match path_status(&topology_ref)? {
+        PathStatus::Missing => topology_model(&what_if.topology),
+        PathStatus::RegularFile | PathStatus::Directory | PathStatus::Other => {
+            load_topology_file(&topology_ref)
+        }
     }
 }
 
@@ -2513,23 +2150,12 @@ fn load_lab_policy(
     base_dir: &Path,
 ) -> Result<crate::models::TwinPolicyAction> {
     let policy_ref = resolve_path(base_dir, &what_if.policy);
-    if policy_ref.exists() {
-        let raw = fs::read_to_string(&policy_ref).with_path(&policy_ref)?;
-        import_policy_action(&raw, format_for_path(&policy_ref))
-    } else {
-        policy_action(&what_if.policy)
+    match path_status(&policy_ref)? {
+        PathStatus::Missing => policy_action(&what_if.policy),
+        PathStatus::RegularFile | PathStatus::Directory | PathStatus::Other => {
+            load_policy_action_file(&policy_ref)
+        }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SourceSignalMetrics {
-    latency_mean: f64,
-    packet_loss_rate: f64,
-    retransmission_rate: f64,
-    throughput_mbps: f64,
-    dns_failure_events: f64,
-    tls_failure_events: f64,
-    quic_blocked_ratio: f64,
 }
 
 fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<CorroborationSignal> {
@@ -2542,7 +2168,10 @@ fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<Corr
         let Some(metrics) = source_signal_metrics(&source.loaded.ingest) else {
             continue;
         };
-        if metrics.latency_mean > 120.0 && metrics.throughput_mbps < 35.0 {
+        if metrics_are_trustworthy(&source.loaded.ingest, &["latency_ms", "throughput_mbps"])
+            && metrics.latency_mean > 120.0
+            && metrics.throughput_mbps < 35.0
+        {
             signals.push(support_signal(
                 &source_kind,
                 "latency high and throughput low",
@@ -2550,7 +2179,9 @@ fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<Corr
                 0.05,
             ));
         }
-        if metrics.dns_failure_events > 0.0 {
+        if metric_is_trustworthy(&source.loaded.ingest, "dns_failure_events")
+            && metrics.dns_failure_events > 0.0
+        {
             signals.push(support_signal(
                 &source_kind,
                 "dns failure counter is non-zero",
@@ -2558,7 +2189,9 @@ fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<Corr
                 0.05,
             ));
         }
-        if metrics.tls_failure_events > 0.0 {
+        if metric_is_trustworthy(&source.loaded.ingest, "tls_failure_events")
+            && metrics.tls_failure_events > 0.0
+        {
             signals.push(support_signal(
                 &source_kind,
                 "tls failure counter is non-zero",
@@ -2566,7 +2199,10 @@ fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<Corr
                 0.05,
             ));
         }
-        if source.source.kind != LabDataSourceKind::NativePcap && metrics.quic_blocked_ratio > 0.5 {
+        if source.source.kind != LabDataSourceKind::NativePcap
+            && metric_is_trustworthy(&source.loaded.ingest, "quic_blocked_ratio")
+            && metrics.quic_blocked_ratio > 0.5
+        {
             signals.push(support_signal(
                 &source_kind,
                 "QUIC blocked ratio is elevated",
@@ -2574,7 +2210,12 @@ fn collect_corroboration_signals(loaded_sources: &[LoadedLabSource]) -> Vec<Corr
                 0.05,
             ));
         }
-        if metrics.packet_loss_rate > 1.0 && metrics.retransmission_rate > 1.0 {
+        if metrics_are_trustworthy(
+            &source.loaded.ingest,
+            &["packet_loss_rate", "retransmission_rate"],
+        ) && metrics.packet_loss_rate > 1.0
+            && metrics.retransmission_rate > 1.0
+        {
             signals.push(support_signal(
                 &source_kind,
                 "loss and retransmission counters are elevated",
@@ -2595,7 +2236,9 @@ fn collect_pcap_corroboration_signals(
     signals: &mut Vec<CorroborationSignal>,
 ) {
     let source_kind = source.health.source_kind.as_str();
-    if metrics.retransmission_rate > 1.0 {
+    if metric_is_trustworthy(&source.loaded.ingest, "retransmission_rate")
+        && metrics.retransmission_rate > 1.0
+    {
         signals.push(support_signal(
             source_kind,
             "TCP retransmission hint observed in pcap",
@@ -2647,31 +2290,6 @@ fn collect_pcap_corroboration_signals(
             -0.03,
         ));
     }
-}
-
-fn source_signal_metrics(ingest: &IngestResult) -> Option<SourceSignalMetrics> {
-    let count = ingest.records.len() as f64;
-    if count == 0.0 {
-        return None;
-    }
-    let mut metrics = SourceSignalMetrics::default();
-    for record in &ingest.records {
-        metrics.latency_mean += record.latency_ms;
-        metrics.packet_loss_rate += record.packet_loss_rate;
-        metrics.retransmission_rate += record.retransmission_rate;
-        metrics.throughput_mbps += record.throughput_mbps;
-        metrics.dns_failure_events += record.dns_failure_events;
-        metrics.tls_failure_events += record.tls_failure_events;
-        metrics.quic_blocked_ratio += record.quic_blocked_ratio;
-    }
-    metrics.latency_mean /= count;
-    metrics.packet_loss_rate /= count;
-    metrics.retransmission_rate /= count;
-    metrics.throughput_mbps /= count;
-    metrics.dns_failure_events /= count;
-    metrics.tls_failure_events /= count;
-    metrics.quic_blocked_ratio /= count;
-    Some(metrics)
 }
 
 fn support_signal(
@@ -3076,20 +2694,22 @@ fn lab_mapping(source: &LabDataSource, scenario_dir: &Path) -> Result<BTreeMap<S
         return Ok(default_prometheus_mapping());
     };
     let path = resolve_path(scenario_dir, mapping);
-    let raw = fs::read_to_string(&path).with_path(&path)?;
-    serde_json::from_str(&raw).map_err(NetdiagError::from)
+    load_prometheus_mapping_file(path)
 }
 
-fn native_pcap_source(endpoint: &str, scenario_dir: &Path) -> NativePcapSource {
+fn native_pcap_source(endpoint: &str, scenario_dir: &Path) -> Result<NativePcapSource> {
     let trimmed = endpoint.trim();
     if let Some(interface) = trimmed.strip_prefix("iface:") {
-        return NativePcapSource::Interface(interface.trim().to_string());
+        return Ok(NativePcapSource::Interface(interface.trim().to_string()));
     }
     let path = resolve_path(scenario_dir, trimmed);
-    if path.is_file() {
-        NativePcapSource::File(path)
-    } else {
-        NativePcapSource::Interface(trimmed.to_string())
+    match path_status(&path)? {
+        PathStatus::RegularFile => Ok(NativePcapSource::File(path)),
+        PathStatus::Missing => Ok(NativePcapSource::Interface(trimmed.to_string())),
+        _ => Err(NetdiagError::InvalidTrace(format!(
+            "native pcap source is neither a regular file nor an explicit iface: value: {}",
+            path.display()
+        ))),
     }
 }
 
@@ -3102,19 +2722,6 @@ fn resolve_path(base_dir: &Path, value: &str) -> PathBuf {
     }
 }
 
-fn format_for_path(path: &Path) -> TopologyFormat {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "yaml" | "yml" => TopologyFormat::Yaml,
-        _ => TopologyFormat::Json,
-    }
-}
-
 fn lab_timestamp(timestamp: DateTime<Utc>) -> String {
     format!(
         "{}-{}",
@@ -3123,64 +2730,14 @@ fn lab_timestamp(timestamp: DateTime<Utc>) -> String {
     )
 }
 
-fn default_lookback_secs() -> i64 {
-    300
-}
-
-fn default_step_secs() -> u64 {
-    15
-}
-
-fn default_packet_limit() -> usize {
-    5000
-}
-
-fn default_timeout_secs() -> u64 {
-    20
-}
-
-fn default_interval_secs() -> u64 {
-    1
-}
-
-fn default_min_rule_confidence() -> f64 {
-    0.75
-}
-
-fn default_min_ml_probability() -> f64 {
-    0.70
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_allowed_connector_status() -> Vec<ConnectorHealthStatus> {
-    vec![ConnectorHealthStatus::Ok, ConnectorHealthStatus::Degraded]
-}
-
-fn default_allowed_diagnosis_statuses() -> Vec<DiagnosisStatus> {
-    vec![DiagnosisStatus::Known]
-}
-
-fn default_required_artifacts() -> Vec<String> {
-    vec![
-        "manifest".to_string(),
-        "report".to_string(),
-        "telemetry_summary".to_string(),
-        "diagnosis_events".to_string(),
-        "ml_result".to_string(),
-        "recommendations".to_string(),
-        "connector_health".to_string(),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AtomicPublishPhase;
     use crate::models::{
-        DistributionStats, MlResult, ModelManifest, OverallTelemetry, Prediction, RunHistoryEntry,
-        ThroughputStats, UncertaintyAssessment, WhatIfResult,
+        DistributionStats, EvidenceRecord, MlResult, ModelManifest, OverallTelemetry, Prediction,
+        RunHistoryEntry, Severity, ThroughputStats, TimeWindow, UncertaintyAssessment,
+        WhatIfResult,
     };
     use crate::report::{Report, RootCause, RuleMlComparison};
     use std::collections::BTreeSet;
@@ -3188,6 +2745,47 @@ mod tests {
     use std::sync::Mutex;
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    mod metric_quality;
+
+    #[test]
+    fn http_endpoint_validation_never_echoes_credentials() {
+        let secret = "opaque-lab-endpoint-secret";
+        for endpoint in [
+            format!("https://operator:{secret}@example.test/metrics"),
+            format!("https://invalid host/?access_token={secret}"),
+        ] {
+            let error = validate_http_endpoint(&endpoint).expect_err("unsafe endpoint must fail");
+            assert!(!error.to_string().contains(secret), "{error}");
+        }
+    }
+
+    #[test]
+    fn filesystem_entries_do_not_fall_back_to_named_what_if_presets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let topology_entry = temp.path().join("mesh");
+        let policy_entry = temp.path().join("reroute_path_b");
+        fs::create_dir(&topology_entry).expect("topology directory");
+        fs::create_dir(&policy_entry).expect("policy directory");
+        let request = LabWhatIf {
+            topology: "mesh".to_string(),
+            policy: "reroute_path_b".to_string(),
+        };
+
+        let topology_error = load_lab_topology(&request, temp.path())
+            .expect_err("an existing non-file topology must not fall back to a preset");
+        assert!(
+            topology_error.to_string().contains("mesh"),
+            "{topology_error}"
+        );
+
+        let policy_error = load_lab_policy(&request, temp.path())
+            .expect_err("an existing non-file policy must not fall back to a preset");
+        assert!(
+            policy_error.to_string().contains("reroute_path_b"),
+            "{policy_error}"
+        );
+    }
 
     fn scenario(expected: FaultLabel, require_what_if_improvement: bool) -> LabScenario {
         LabScenario {
@@ -3201,6 +2799,7 @@ mod tests {
                 role: LabDataSourceRole::Primary,
                 kind: LabDataSourceKind::TraceFile,
                 endpoint: "trace.csv".to_string(),
+                bearer_token_env: None,
                 mapping: None,
             }],
             collection: LabCollection::default(),
@@ -3223,6 +2822,138 @@ mod tests {
             },
             verification: LabVerification::default(),
         }
+    }
+
+    #[test]
+    fn lab_scenario_rejects_unbounded_collection_values() {
+        let mut invalid = scenario(FaultLabel::Normal, false);
+        invalid.collection.timeout_secs = 0;
+        assert!(validate_lab_scenario(&invalid).is_err());
+
+        let mut invalid = scenario(FaultLabel::Normal, false);
+        invalid.collection.lookback_secs = 86_401;
+        assert!(validate_lab_scenario(&invalid).is_err());
+
+        let mut invalid = scenario(FaultLabel::Normal, false);
+        invalid.collection.step_secs = 301;
+        invalid.collection.lookback_secs = 300;
+        assert!(validate_lab_scenario(&invalid).is_err());
+
+        let mut invalid = scenario(FaultLabel::Normal, false);
+        invalid.collection.packet_limit = crate::MAX_PCAP_PACKET_LIMIT + 1;
+        assert!(validate_lab_scenario(&invalid).is_err());
+
+        let mut invalid = scenario(FaultLabel::Normal, false);
+        invalid.collection.interval_secs = 11;
+        assert!(validate_lab_scenario(&invalid).is_err());
+    }
+
+    #[test]
+    fn lab_retained_resource_budget_enforces_source_and_scenario_limits_atomically() {
+        let mut budget = LabRetainedResourceBudget::default();
+        for (index, records) in [100_000, 100_000, 50_000, 0].into_iter().enumerate() {
+            budget
+                .reserve(
+                    &format!("source-{index}"),
+                    ConnectorResourceUsage {
+                        input_bytes: MAX_SOURCE_INPUT_BYTES,
+                        records,
+                    },
+                )
+                .expect("exact aggregate limit");
+        }
+        assert_eq!(
+            budget,
+            LabRetainedResourceBudget {
+                input_bytes: MAX_SCENARIO_RETAINED_BYTES,
+                records: MAX_SCENARIO_RECORDS,
+            }
+        );
+
+        let unchanged = LabRetainedResourceBudget {
+            input_bytes: budget.input_bytes,
+            records: budget.records,
+        };
+        let byte_error = budget
+            .reserve(
+                "one-byte-too-many",
+                ConnectorResourceUsage {
+                    input_bytes: 1,
+                    records: 0,
+                },
+            )
+            .expect_err("scenario byte limit");
+        assert!(byte_error.to_string().contains("scenario limit"));
+        assert_eq!(budget, unchanged, "failed reserve must not mutate budget");
+
+        let mut row_budget = LabRetainedResourceBudget::default();
+        for records in [100_000, 100_000, 50_000] {
+            row_budget
+                .reserve(
+                    "row-source",
+                    ConnectorResourceUsage {
+                        input_bytes: 0,
+                        records,
+                    },
+                )
+                .expect("exact scenario row limit");
+        }
+        let row_error = row_budget
+            .reserve(
+                "one-row-too-many",
+                ConnectorResourceUsage {
+                    input_bytes: 0,
+                    records: 1,
+                },
+            )
+            .expect_err("scenario row limit");
+        assert!(row_error.to_string().contains("record count"));
+        assert_eq!(row_budget.records, MAX_SCENARIO_RECORDS);
+
+        let mut source_budget = LabRetainedResourceBudget::default();
+        let source_error = source_budget
+            .reserve(
+                "oversized-source",
+                ConnectorResourceUsage {
+                    input_bytes: MAX_SOURCE_INPUT_BYTES + 1,
+                    records: 1,
+                },
+            )
+            .expect_err("per-source byte limit");
+        assert!(source_error.to_string().contains("source limit"));
+        assert_eq!(source_budget, LabRetainedResourceBudget::default());
+    }
+
+    #[test]
+    fn lab_source_validation_precedes_model_and_run_directory_side_effects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let scenario_path = temp.path().join("scenario.yaml");
+        let artifacts = temp.path().join("artifacts");
+        let mut missing_source = scenario(FaultLabel::Normal, false);
+        missing_source.id = "missing-source-budget-check".to_string();
+        missing_source.data_sources[0].endpoint = "missing.csv".to_string();
+        std::fs::write(
+            &scenario_path,
+            serde_yaml::to_string(&missing_source).expect("scenario YAML"),
+        )
+        .expect("scenario");
+
+        let error = run_lab_scenario(
+            &scenario_path,
+            LabRunOptions {
+                artifacts: artifacts.clone(),
+            },
+        )
+        .expect_err("missing trace must fail before model inspection");
+
+        assert!(
+            matches!(error, NetdiagError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+            "{error}"
+        );
+        assert!(
+            !artifacts.exists(),
+            "source validation must not create artifact, model, or run directories"
+        );
     }
 
     fn report(
@@ -3267,6 +2998,23 @@ mod tests {
         }
     }
 
+    fn save_verification_run(root: &Path, run_id: &str, report: &Report) {
+        let run_dir = root.join("runs").join(run_id);
+        fs::create_dir_all(&run_dir).expect("run directory");
+        save_json(run_dir.join("report.json"), report).expect("run report");
+        save_json(
+            run_dir.join("manifest.json"),
+            &RunManifest {
+                run_id: run_id.to_string(),
+                sample: "action-verification-fixture".to_string(),
+                created_at: Utc::now(),
+                trace_rows: 1,
+                artifact_paths: BTreeMap::from([("report".to_string(), "report.json".to_string())]),
+            },
+        )
+        .expect("run manifest");
+    }
+
     fn root(label: FaultLabel, confidence: f64) -> RootCause {
         RootCause {
             symptom: label.as_str().to_string(),
@@ -3282,7 +3030,7 @@ mod tests {
 
     fn model_manifest(synthetic_fallback: bool, dataset_hash: Option<&str>) -> ModelManifest {
         ModelManifest {
-            schema_version: "netdiag-model-manifest/v1".to_string(),
+            schema_version: "netdiag-model-manifest/v2".to_string(),
             model_name: "test".to_string(),
             model_kind: "test".to_string(),
             created_at: Utc::now(),
@@ -3295,6 +3043,7 @@ mod tests {
             dataset_id: None,
             dataset_manifest_hash_sha256: None,
             model_file: "rust_logistic_model.json".to_string(),
+            model_file_hash_sha256: "a".repeat(64),
             feature_names: Vec::new(),
             labels: FaultLabel::ALL
                 .iter()
@@ -3391,14 +3140,18 @@ mod tests {
         run_id: &str,
         expected_label: Option<FaultLabel>,
         status: DiagnosisStatus,
-        ml: MlResult,
+        mut ml: MlResult,
         rule_ml_agreement: bool,
     ) {
+        let identity = calibration_fixture_model_identity(artifact_root);
+        ml.model_manifest_hash = Some(identity.model_manifest_hash_sha256.clone());
+        ml.model_file_hash = Some(identity.model_file_hash_sha256.clone());
         let lab_run_dir = artifact_root
             .join("lab-runs")
             .join(scenario_id)
             .join(run_id);
-        std::fs::create_dir_all(run_dir(&lab_run_dir, run_id)).expect("lab run dir");
+        let pipeline_run_dir = run_dir(&lab_run_dir, run_id).expect("valid run id");
+        std::fs::create_dir_all(&pipeline_run_dir).expect("lab run dir");
         let acceptance = LabAcceptanceReport {
             schema: "netdiag-lab-acceptance/v1".to_string(),
             scenario_id: scenario_id.to_string(),
@@ -3409,9 +3162,9 @@ mod tests {
             actual_ml_probability: ml.uncertainty.max_probability,
             actual_diagnosis_status: status,
             synthetic_model: false,
-            model_dataset_hash: None,
-            model_manifest_hash: Some("manifest".to_string()),
-            model_file_hash: Some("file".to_string()),
+            model_dataset_hash: Some(identity.dataset_hash_sha256),
+            model_manifest_hash: Some(identity.model_manifest_hash_sha256),
+            model_file_hash: Some(identity.model_file_hash_sha256),
             quality_status: ConnectorHealthStatus::Ok,
             passed: true,
             failures: Vec::new(),
@@ -3430,7 +3183,14 @@ mod tests {
             previous_run_comparison: None,
         };
         save_json(lab_run_dir.join("comparison.json"), &comparison).expect("comparison");
-        save_json(run_dir(&lab_run_dir, run_id).join("ml_result.json"), &ml).expect("ml result");
+        save_json(pipeline_run_dir.join("ml_result.json"), &ml).expect("ml result");
+        if let Some(label) = expected_label {
+            save_json(
+                pipeline_run_dir.join("diagnosis_events.json"),
+                &vec![calibration_diagnosis_event(run_id, label)],
+            )
+            .expect("diagnosis events");
+        }
         update_lab_run_index(
             artifact_root,
             LabRunIndexEntry {
@@ -3438,27 +3198,131 @@ mod tests {
                 scenario_id: scenario_id.to_string(),
                 scenario_name: scenario_id.to_string(),
                 created_at: Utc::now(),
-                lab_run_dir: stored_lab_index_path(artifact_root, &lab_run_dir),
-                pipeline_run_dir: stored_lab_index_path(
-                    artifact_root,
-                    &run_dir(&lab_run_dir, run_id),
-                ),
+                lab_run_dir: stored_lab_index_path(artifact_root, &lab_run_dir)
+                    .expect("lab run path"),
+                pipeline_run_dir: stored_lab_index_path(artifact_root, &pipeline_run_dir)
+                    .expect("pipeline run path"),
                 acceptance_path: stored_lab_index_path(
                     artifact_root,
                     &lab_run_dir.join("acceptance.json"),
-                ),
+                )
+                .expect("acceptance path"),
                 comparison_path: stored_lab_index_path(
                     artifact_root,
                     &lab_run_dir.join("comparison.json"),
-                ),
+                )
+                .expect("comparison path"),
                 scenario_path: stored_lab_index_path(
                     artifact_root,
                     &lab_run_dir.join("scenario.yaml"),
-                ),
+                )
+                .expect("scenario path"),
                 passed: true,
             },
         )
         .expect("index");
+    }
+
+    #[derive(Debug, Clone)]
+    struct CalibrationFixtureModelIdentity {
+        dataset_hash_sha256: String,
+        model_manifest_hash_sha256: String,
+        model_file_hash_sha256: String,
+    }
+
+    fn calibration_fixture_model_identity(artifact_root: &Path) -> CalibrationFixtureModelIdentity {
+        let model_dir = artifact_root.join("model");
+        let snapshot =
+            crate::ml::load_existing_model_bundle_snapshot(&model_dir).expect("model snapshot");
+        CalibrationFixtureModelIdentity {
+            dataset_hash_sha256: snapshot
+                .manifest
+                .dataset_hash_sha256
+                .clone()
+                .expect("calibration fixture model dataset hash"),
+            model_manifest_hash_sha256: snapshot.model_manifest_hash_sha256,
+            model_file_hash_sha256: snapshot.model_file_hash_sha256,
+        }
+    }
+
+    fn calibration_acceptance_path(
+        artifact_root: &Path,
+        scenario_id: &str,
+        run_id: &str,
+    ) -> PathBuf {
+        artifact_root
+            .join("lab-runs")
+            .join(scenario_id)
+            .join(run_id)
+            .join("acceptance.json")
+    }
+
+    fn calibration_events_path(artifact_root: &Path, scenario_id: &str, run_id: &str) -> PathBuf {
+        run_dir(
+            artifact_root
+                .join("lab-runs")
+                .join(scenario_id)
+                .join(run_id),
+            run_id,
+        )
+        .expect("valid run id")
+        .join("diagnosis_events.json")
+    }
+
+    fn calibration_diagnosis_event(run_id: &str, label: FaultLabel) -> DiagnosisEvent {
+        let now = Utc::now();
+        DiagnosisEvent {
+            event_id: format!("calibration-{run_id}-{}", label.as_str()),
+            evidence: EvidenceRecord {
+                run_id: run_id.to_string(),
+                method: "test".to_string(),
+                symptom: label,
+                severity: Severity::Low,
+                confidence: 0.95,
+                window: TimeWindow {
+                    start_ts: now,
+                    end_ts: now,
+                    bucket: "test".to_string(),
+                },
+                supporting_metrics: Vec::new(),
+                raw_evidence_refs: Vec::new(),
+                counter_evidence: Vec::new(),
+                recommendation_need_approval: true,
+                hil_state: Default::default(),
+                why: "calibration fixture".to_string(),
+            },
+            source: "test".to_string(),
+            model_probability: None,
+        }
+    }
+
+    fn write_lab_grade_calibration_samples(artifact_root: &Path) {
+        for (idx, label) in FaultLabel::ALL.iter().enumerate() {
+            let run_id = format!("known-run-{idx}");
+            write_lab_calibration_sample(
+                artifact_root,
+                label.as_str(),
+                &run_id,
+                Some(*label),
+                DiagnosisStatus::Known,
+                calibration_ml_result(&run_id, DiagnosisStatus::Known, 0.82, 0.18, 0.42, 2.0),
+            );
+        }
+        write_lab_calibration_sample(
+            artifact_root,
+            "ood",
+            "ood-run",
+            None,
+            DiagnosisStatus::OutOfDistribution,
+            calibration_ml_result(
+                "ood-run",
+                DiagnosisStatus::OutOfDistribution,
+                0.90,
+                0.30,
+                0.20,
+                10.0,
+            ),
+        );
     }
 
     fn run_comparison(
@@ -3564,7 +3428,7 @@ mod tests {
     }
 
     fn provision_test_model(artifacts: &Path) {
-        std::fs::create_dir_all(artifacts).expect("artifacts dir");
+        crate::storage::ensure_artifact_root_owned(artifacts).expect("owned artifacts dir");
         let dataset_path = artifacts.join("training.jsonl");
         let mut dataset = std::fs::File::create(&dataset_path).expect("training dataset");
         for name in [
@@ -3592,6 +3456,51 @@ mod tests {
             .expect("train lab test model");
     }
 
+    fn healthy_connector_health() -> Vec<ConnectorHealthSnapshot> {
+        vec![ConnectorHealthSnapshot {
+            status: ConnectorHealthStatus::Ok,
+            source_kind: "trace-file".to_string(),
+            profile_name: "primary".to_string(),
+            sample: "test".to_string(),
+            rows: 1,
+            warning_count: 0,
+            missing_metrics: Vec::new(),
+            quality: Default::default(),
+            captured_at: Utc::now(),
+        }]
+    }
+
+    fn healthy_validation_context() -> LabValidationContext {
+        LabValidationContext {
+            connector_health: healthy_connector_health(),
+            ..LabValidationContext::default()
+        }
+    }
+
+    #[test]
+    fn validate_lab_report_rejects_missing_connector_health_evidence() {
+        let scenario = scenario(FaultLabel::Normal, false);
+        let report = report(
+            "run-normal",
+            vec![root(FaultLabel::Normal, 0.95)],
+            FaultLabel::Normal,
+            None,
+        );
+
+        let acceptance = validate_lab_report(&scenario, &report, &LabValidationContext::default())
+            .expect("structured acceptance failure");
+
+        assert!(!acceptance.passed);
+        assert!(
+            acceptance
+                .failures
+                .iter()
+                .any(|failure| failure == "connector health evidence is missing"),
+            "{:?}",
+            acceptance.failures
+        );
+    }
+
     #[test]
     fn validate_lab_report_accepts_normal_rule_label() {
         let scenario = scenario(FaultLabel::Normal, false);
@@ -3606,7 +3515,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: Vec::new(),
                 model_manifest_hash: None,
                 model_file_hash: None,
@@ -3633,7 +3542,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: Vec::new(),
                 model_manifest_hash: None,
                 model_file_hash: None,
@@ -3668,7 +3577,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: Vec::new(),
                 model_manifest_hash: None,
                 model_file_hash: None,
@@ -3699,7 +3608,7 @@ mod tests {
             None,
         );
 
-        let acceptance = validate_lab_report(&scenario, &report, &LabValidationContext::default())
+        let acceptance = validate_lab_report(&scenario, &report, &healthy_validation_context())
             .expect("acceptance");
         assert!(acceptance.passed, "{:?}", acceptance.failures);
         assert_eq!(
@@ -3713,7 +3622,7 @@ mod tests {
 
         let mut wrong = scenario;
         wrong.acceptance.required_model_file_hash = Some("wrong-file-hash".to_string());
-        let acceptance = validate_lab_report(&wrong, &report, &LabValidationContext::default())
+        let acceptance = validate_lab_report(&wrong, &report, &healthy_validation_context())
             .expect("acceptance");
         assert!(!acceptance.passed);
         assert!(
@@ -3767,7 +3676,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: Vec::new(),
                 model_manifest_hash: None,
                 model_file_hash: None,
@@ -3802,7 +3711,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: default_required_artifacts(),
                 model_manifest_hash: Some("manifest-test-hash".to_string()),
                 model_file_hash: Some("file-test-hash".to_string()),
@@ -3840,7 +3749,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: default_required_artifacts(),
                 model_manifest_hash: Some("manifest-test-hash".to_string()),
                 model_file_hash: Some("file-test-hash".to_string()),
@@ -3870,7 +3779,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: default_required_artifacts(),
                 model_manifest_hash: Some("manifest-test-hash".to_string()),
                 model_file_hash: Some("file-test-hash".to_string()),
@@ -3899,7 +3808,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: default_required_artifacts(),
                 model_manifest_hash: Some("manifest-test-hash".to_string()),
                 model_file_hash: Some("file-test-hash".to_string()),
@@ -4081,18 +3990,61 @@ mod tests {
             loss_delta_pct: -0.06,
             throughput_delta_pct: 0.12,
         };
-        let predicted = predicted_delta_pct_map(Some(&effect));
+        let predicted = predicted_delta_pct_map(Some(&effect)).expect("predicted deltas");
         let observed = observed_delta_pct_map(&run_comparison(
             Some(-14.0),
             Some(-4.0),
             Some(10.0),
             ConnectorHealthStatus::Ok,
-        ));
-        let error = prediction_error_pct_map(&predicted, &observed);
+        ))
+        .expect("observed deltas");
+        let error = prediction_error_pct_map(&predicted, &observed).expect("prediction errors");
 
         assert_eq!(predicted["latency_p95_delta_pct"], -18.0);
         assert_eq!(error["latency_p95_delta_pct"], 4.0);
         assert_eq!(error["throughput_delta_pct"], -2.0);
+    }
+
+    #[test]
+    fn verify_action_rejects_incomplete_legacy_prediction_before_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let before = report(
+            "before",
+            Vec::new(),
+            FaultLabel::Normal,
+            Some(WhatIfResult {
+                action_id: "action-1".to_string(),
+                action_notes: String::new(),
+                policy_action: None,
+                topology: "fixture".to_string(),
+                topology_snapshot: None,
+                modified_topology_snapshot: None,
+                baseline: BTreeMap::new(),
+                proposed: BTreeMap::new(),
+                delta: BTreeMap::from([
+                    ("latency_pct".to_string(), -5.0),
+                    ("loss_pct".to_string(), -1.0),
+                ]),
+            }),
+        );
+        let after = report("after", Vec::new(), FaultLabel::Normal, None);
+        save_verification_run(temp.path(), "before", &before);
+        save_verification_run(temp.path(), "after", &after);
+
+        let error = verify_action(temp.path(), "before", "after", None)
+            .expect_err("missing prediction delta must fail before publication");
+
+        assert!(error.to_string().contains("throughput_pct"), "{error}");
+        let run_dir = temp.path().join("runs").join("before");
+        assert!(!run_dir.join("action_verification_after.json").exists());
+        let manifest: RunManifest =
+            serde_json::from_value(read_json(run_dir.join("manifest.json")).expect("manifest"))
+                .expect("manifest shape");
+        assert!(
+            !manifest
+                .artifact_paths
+                .contains_key("action_verification_after")
+        );
     }
 
     #[test]
@@ -4148,32 +4100,8 @@ mod tests {
     fn lab_calibration_updates_model_manifest_thresholds_from_accepted_runs() {
         let temp = tempfile::tempdir().expect("tempdir");
         provision_test_model(temp.path());
-        for (idx, label) in FaultLabel::ALL.iter().enumerate() {
-            let run_id = format!("known-run-{idx}");
-            write_lab_calibration_sample(
-                temp.path(),
-                label.as_str(),
-                &run_id,
-                Some(*label),
-                DiagnosisStatus::Known,
-                calibration_ml_result(&run_id, DiagnosisStatus::Known, 0.82, 0.18, 0.42, 2.0),
-            );
-        }
-        write_lab_calibration_sample(
-            temp.path(),
-            "ood",
-            "ood-run",
-            None,
-            DiagnosisStatus::OutOfDistribution,
-            calibration_ml_result(
-                "ood-run",
-                DiagnosisStatus::OutOfDistribution,
-                0.90,
-                0.30,
-                0.20,
-                10.0,
-            ),
-        );
+        let source_identity = calibration_fixture_model_identity(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
 
         let report = calibrate_lab_uncertainty(temp.path(), false).expect("calibration");
 
@@ -4192,21 +4120,52 @@ mod tests {
                 .accepted_known_runs,
             1
         );
-        assert!(report.model_manifest_hash_sha256.is_some());
-        assert!(report.model_file_hash_sha256.is_some());
-        assert!(report.dataset_hash_sha256.is_some());
+        assert_eq!(
+            report.source_model_manifest_hash_sha256,
+            source_identity.model_manifest_hash_sha256
+        );
+        assert_eq!(
+            report.model_file_hash_sha256.as_deref(),
+            Some(source_identity.model_file_hash_sha256.as_str())
+        );
+        assert_eq!(
+            report.dataset_hash_sha256.as_deref(),
+            Some(source_identity.dataset_hash_sha256.as_str())
+        );
+        let final_snapshot =
+            crate::ml::load_existing_model_bundle_snapshot(&temp.path().join("model"))
+                .expect("final model snapshot");
+        let final_manifest_hash = final_snapshot.model_manifest_hash_sha256.clone();
+        assert_eq!(
+            report.model_manifest_hash_sha256.as_deref(),
+            Some(final_manifest_hash.as_str())
+        );
         assert!(report.calibrated_thresholds.max_feature_distance > 2.0);
         assert!(report.calibrated_thresholds.max_feature_distance < 10.0);
         let persisted: LabCalibrationReport = serde_json::from_value(
             read_json(temp.path().join("lab_calibration_report.json")).expect("report"),
         )
         .expect("calibration report");
-        assert_eq!(persisted.schema, "netdiag-lab-calibration/v1");
+        assert_eq!(persisted.schema, "netdiag-lab-calibration/v2");
         assert!(persisted.applied);
-        let manifest: ModelManifest = serde_json::from_value(
-            read_json(temp.path().join("model").join(MODEL_MANIFEST_FILE_NAME)).expect("manifest"),
-        )
-        .expect("manifest json");
+        assert_eq!(
+            persisted.source_model_manifest_hash_sha256,
+            report.source_model_manifest_hash_sha256
+        );
+        assert_eq!(
+            persisted.model_manifest_hash_sha256.as_deref(),
+            Some(final_manifest_hash.as_str())
+        );
+        let mut legacy_value = serde_json::to_value(&persisted).expect("legacy report value");
+        legacy_value
+            .as_object_mut()
+            .expect("report object")
+            .remove("source_model_manifest_hash_sha256");
+        assert!(
+            serde_json::from_value::<LabCalibrationReport>(legacy_value).is_err(),
+            "v2 reports must fail closed without the source model identity"
+        );
+        let manifest = final_snapshot.manifest;
         assert_eq!(
             manifest
                 .uncertainty_thresholds
@@ -4214,6 +4173,180 @@ mod tests {
                 .max_feature_distance,
             report.calibrated_thresholds.max_feature_distance
         );
+    }
+
+    #[test]
+    fn lab_calibration_rejects_missing_indexed_model_identity_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        let acceptance_path =
+            calibration_acceptance_path(temp.path(), FaultLabel::Normal.as_str(), "known-run-0");
+        let original: LabAcceptanceReport =
+            serde_json::from_value(read_json(&acceptance_path).expect("acceptance"))
+                .expect("acceptance json");
+
+        for field in [
+            "model_dataset_hash",
+            "model_manifest_hash",
+            "model_file_hash",
+        ] {
+            let mut acceptance = original.clone();
+            match field {
+                "model_dataset_hash" => acceptance.model_dataset_hash = None,
+                "model_manifest_hash" => acceptance.model_manifest_hash = None,
+                "model_file_hash" => acceptance.model_file_hash = None,
+                _ => unreachable!("covered identity fields"),
+            }
+            save_json(&acceptance_path, &acceptance).expect("mutated acceptance");
+
+            let err = calibrate_lab_uncertainty(temp.path(), false)
+                .expect_err("missing indexed model identity must fail calibration");
+            assert!(err.to_string().contains("known-run-0"), "{field}: {err}");
+            assert!(err.to_string().contains(field), "{field}: {err}");
+            assert!(err.to_string().contains("missing"), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn lab_calibration_rejects_mismatched_indexed_model_identity_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        let acceptance_path =
+            calibration_acceptance_path(temp.path(), FaultLabel::Normal.as_str(), "known-run-0");
+        let original: LabAcceptanceReport =
+            serde_json::from_value(read_json(&acceptance_path).expect("acceptance"))
+                .expect("acceptance json");
+
+        for field in [
+            "model_dataset_hash",
+            "model_manifest_hash",
+            "model_file_hash",
+        ] {
+            let mut acceptance = original.clone();
+            match field {
+                "model_dataset_hash" => {
+                    acceptance.model_dataset_hash = Some("stale-dataset".to_string())
+                }
+                "model_manifest_hash" => {
+                    acceptance.model_manifest_hash = Some("stale-manifest".to_string())
+                }
+                "model_file_hash" => acceptance.model_file_hash = Some("stale-model".to_string()),
+                _ => unreachable!("covered identity fields"),
+            }
+            save_json(&acceptance_path, &acceptance).expect("mutated acceptance");
+
+            let err = calibrate_lab_uncertainty(temp.path(), false)
+                .expect_err("mismatched indexed model identity must fail calibration");
+            assert!(err.to_string().contains("known-run-0"), "{field}: {err}");
+            assert!(err.to_string().contains(field), "{field}: {err}");
+            assert!(err.to_string().contains("mismatch"), "{field}: {err}");
+        }
+    }
+
+    #[test]
+    fn lab_calibration_fails_when_indexed_ml_result_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        std::fs::remove_file(
+            temp.path()
+                .join("lab-runs")
+                .join(FaultLabel::Normal.as_str())
+                .join("known-run-0")
+                .join("runs")
+                .join("known-run-0")
+                .join("ml_result.json"),
+        )
+        .expect("remove ml result");
+
+        let err = calibrate_lab_uncertainty(temp.path(), false)
+            .expect_err("missing indexed ml_result.json must fail calibration");
+
+        assert!(err.to_string().contains("ml_result.json"), "{err}");
+    }
+
+    #[test]
+    fn lab_calibration_fails_when_indexed_comparison_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        std::fs::remove_file(
+            temp.path()
+                .join("lab-runs")
+                .join(FaultLabel::Normal.as_str())
+                .join("known-run-0")
+                .join("comparison.json"),
+        )
+        .expect("remove comparison");
+
+        let err = calibrate_lab_uncertainty(temp.path(), false)
+            .expect_err("missing indexed comparison.json must fail calibration");
+
+        assert!(err.to_string().contains("comparison.json"), "{err}");
+    }
+
+    #[test]
+    fn lab_calibration_fails_when_accepted_known_diagnosis_events_are_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        std::fs::remove_file(
+            temp.path()
+                .join("lab-runs")
+                .join(FaultLabel::Normal.as_str())
+                .join("known-run-0")
+                .join("runs")
+                .join("known-run-0")
+                .join("diagnosis_events.json"),
+        )
+        .expect("remove diagnosis events");
+
+        let err = calibrate_lab_uncertainty(temp.path(), false)
+            .expect_err("missing accepted known diagnosis_events.json must fail calibration");
+
+        assert!(err.to_string().contains("diagnosis_events.json"), "{err}");
+        assert!(err.to_string().contains("accepted known"), "{err}");
+    }
+
+    #[test]
+    fn lab_calibration_fails_when_accepted_known_diagnosis_events_are_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        let events_path =
+            calibration_events_path(temp.path(), FaultLabel::Normal.as_str(), "known-run-0");
+        save_json(&events_path, &Vec::<DiagnosisEvent>::new()).expect("empty diagnosis events");
+
+        let err = calibrate_lab_uncertainty(temp.path(), false)
+            .expect_err("empty accepted known diagnosis events must fail calibration");
+
+        assert!(err.to_string().contains("diagnosis_events.json"), "{err}");
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn lab_calibration_fails_when_diagnosis_events_omit_expected_label() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        write_lab_grade_calibration_samples(temp.path());
+        let events_path =
+            calibration_events_path(temp.path(), FaultLabel::Normal.as_str(), "known-run-0");
+        save_json(
+            &events_path,
+            &vec![calibration_diagnosis_event(
+                "known-run-0",
+                FaultLabel::Congestion,
+            )],
+        )
+        .expect("wrong-label diagnosis events");
+
+        let err = calibrate_lab_uncertainty(temp.path(), false)
+            .expect_err("accepted known diagnosis events must contain expected label");
+
+        assert!(err.to_string().contains("diagnosis_events.json"), "{err}");
+        assert!(err.to_string().contains("expected label normal"), "{err}");
     }
 
     #[test]
@@ -4267,6 +4400,12 @@ mod tests {
                 .iter()
                 .any(|hotspot| hotspot.scenario_id == "false-positive" && hotspot.rate == 1.0)
         );
+        assert!(
+            report
+                .rule_ml_disagreement_hotspots
+                .iter()
+                .all(|hotspot| hotspot.scenario_id != "false-negative")
+        );
     }
 
     #[test]
@@ -4283,7 +4422,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: Vec::new(),
                 model_manifest_hash: None,
                 model_file_hash: None,
@@ -4320,7 +4459,7 @@ mod tests {
             &scenario,
             &report,
             &LabValidationContext {
-                connector_health: Vec::new(),
+                connector_health: healthy_connector_health(),
                 artifact_keys: Vec::new(),
                 model_manifest_hash: None,
                 model_file_hash: None,
@@ -4356,6 +4495,28 @@ mod tests {
         )
         .expect("lab run");
 
+        assert!(!result.lab_run_dir.contains(".staged-"));
+        assert!(!result.pipeline_run_dir.contains(".staged-"));
+        assert!(!result.evidence_bundle.output.contains(".staged-"));
+        assert!(
+            result
+                .evidence_bundle
+                .files
+                .iter()
+                .all(|file| !file.source_path.contains(".staged-"))
+        );
+        let scenario_parent = temp.path().join("lab-runs/lab-congestion-001");
+        assert!(
+            std::fs::read_dir(&scenario_parent)
+                .expect("scenario run parent")
+                .all(|entry| !entry
+                    .expect("scenario run entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')),
+            "successful lab run leaked a hidden stage"
+        );
+
         assert!(
             temp.path().join("lab_run_index.json").exists(),
             "lab_run_index.json missing"
@@ -4385,7 +4546,7 @@ mod tests {
         assert!(
             temp.path()
                 .join("model")
-                .join(crate::ml::MODEL_MANIFEST_FILE_NAME)
+                .join(crate::ml::MODEL_CURRENT_FILE_NAME)
                 .exists(),
             "lab run should use the shared artifact model directory"
         );
@@ -4414,10 +4575,11 @@ mod tests {
 
         let extra_path = temp.path().join("operator-note.txt");
         std::fs::write(&extra_path, "review note").expect("extra file");
-        let explicit_bundle = export_evidence_bundle(
+        let explicit_bundle = export_evidence_bundle_with_context(
             PathBuf::from(&result.lab_run_dir),
             &result.run_id,
             temp.path().join("explicit-extra.zip"),
+            EvidenceContext::Lab,
             &[crate::evidence_bundle::EvidenceBundleExtraFile {
                 key: "operator_note".to_string(),
                 path: extra_path,
@@ -4441,7 +4603,48 @@ mod tests {
             .iter()
             .find(|recommendation| recommendation.diagnosis_symptom == Some(FaultLabel::Congestion))
             .expect("diagnosis recommendation");
-        crate::storage::review_recommendation(
+        crate::hil_review::fail_before_publishing("lab_evidence_manifest");
+        let interrupted = crate::hil_review::review_recommendation(
+            temp.path(),
+            &result.run_id,
+            &recommendation.recommendation_id,
+            HilState::Accepted,
+            "confirmed lab label",
+            "tester",
+            Some(FaultLabel::Congestion),
+        )
+        .expect_err("injected lab review interruption");
+        assert!(
+            interrupted
+                .to_string()
+                .contains("injected HIL transaction failure"),
+            "{interrupted}"
+        );
+        let pending_read = crate::storage::read_report(temp.path(), &result.run_id)
+            .expect_err("pending lab review must fail closed");
+        assert!(pending_read.to_string().contains("pending HIL transaction"));
+        let pending_validation = validate_lab_run(temp.path(), &result.run_id, None)
+            .expect_err("lab validation must reject a pending review transaction");
+        assert!(
+            pending_validation
+                .to_string()
+                .contains("pending HIL transaction")
+        );
+        let pending_index = read_lab_run_index(temp.path())
+            .expect_err("lab index reads must reject a pending review transaction");
+        assert!(
+            pending_index
+                .to_string()
+                .contains("pending HIL transaction")
+        );
+        let pending_summary = summarize_lab_runs(temp.path())
+            .expect_err("lab summaries must reject a pending review transaction");
+        assert!(
+            pending_summary
+                .to_string()
+                .contains("pending HIL transaction")
+        );
+        crate::hil_review::review_recommendation(
             temp.path(),
             &result.run_id,
             &recommendation.recommendation_id,
@@ -4482,6 +4685,107 @@ mod tests {
     }
 
     #[test]
+    fn lab_first_then_standard_diagnosis_uses_one_owned_artifact_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        let scenario_path = repo_root().join("examples/scenarios/lab-congestion-001.yaml");
+
+        run_lab_scenario(
+            scenario_path,
+            LabRunOptions {
+                artifacts: temp.path().to_path_buf(),
+            },
+        )
+        .expect("lab run");
+        let standard = crate::diagnose_file(
+            repo_root().join("data/samples/normal.csv"),
+            temp.path(),
+            None,
+        )
+        .expect("standard diagnosis after lab run");
+
+        let expected_runs = std::fs::canonicalize(temp.path())
+            .expect("canonical artifact root")
+            .join("runs");
+        assert!(
+            standard.run_dir.starts_with(&expected_runs),
+            "{} is outside {}",
+            standard.run_dir.display(),
+            expected_runs.display()
+        );
+        assert!(temp.path().join(".netdiag-artifact-root.json").is_file());
+    }
+
+    #[test]
+    fn lab_index_failure_reports_published_and_preserves_final_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        provision_test_model(temp.path());
+        let scenario_path = repo_root()
+            .join("examples")
+            .join("scenarios")
+            .join("lab-congestion-001.yaml");
+        let index_path = temp.path().join("lab_run_index.json");
+        std::fs::create_dir(&index_path).expect("invalid index target fixture");
+        let canonical_index_path =
+            std::fs::canonicalize(&index_path).expect("canonical invalid index fixture");
+
+        let error = run_lab_scenario(
+            &scenario_path,
+            LabRunOptions {
+                artifacts: temp.path().to_path_buf(),
+            },
+        )
+        .expect_err("invalid index target must fail");
+
+        let NetdiagError::AtomicPublish {
+            path,
+            phase,
+            source,
+        } = error
+        else {
+            panic!("expected typed lab publication failure");
+        };
+        assert_eq!(phase, AtomicPublishPhase::Published);
+        assert!(path.is_dir(), "published lab run must be retained");
+        assert!(!path.display().to_string().contains(".staged-"));
+        assert!(matches!(
+            source.as_ref(),
+            NetdiagError::Io {
+                path,
+                source: io_source,
+            } if path == &canonical_index_path
+                && io_source.kind() == std::io::ErrorKind::InvalidInput
+                && io_source.to_string().contains("not a regular file")
+        ));
+        assert!(
+            index_path.is_dir(),
+            "invalid index target must be preserved"
+        );
+        let manifest: EvidenceBundleManifest = serde_json::from_value(
+            read_json(path.join("evidence_bundle.json")).expect("evidence manifest"),
+        )
+        .expect("evidence manifest shape");
+        assert!(!manifest.output.contains(".staged-"));
+        assert!(
+            manifest
+                .files
+                .iter()
+                .all(|file| !file.source_path.contains(".staged-"))
+        );
+        let parent = path.parent().expect("lab scenario parent");
+        assert!(
+            std::fs::read_dir(parent)
+                .expect("lab scenario entries")
+                .all(|entry| !entry
+                    .expect("lab scenario entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')),
+            "published index failure leaked a hidden stage"
+        );
+    }
+
+    #[test]
     fn lab_run_fails_fast_when_shared_model_is_missing() {
         let temp = tempfile::tempdir().expect("tempdir");
         let scenario_path = repo_root()
@@ -4497,9 +4801,73 @@ mod tests {
         )
         .expect_err("missing model should fail before lab run creation");
 
-        assert!(err.to_string().contains("model file"), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("model bundle is missing")
+                && message.contains("current.json")
+                && message.contains("complete legacy pair")
+                && message.contains("train or explicitly rebuild"),
+            "{err}"
+        );
         assert!(!temp.path().join("model").exists());
         assert!(!temp.path().join("lab-runs").exists());
+    }
+
+    #[test]
+    fn lab_run_executes_and_archives_one_scenario_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifacts = temp.path().join("artifacts");
+        provision_test_model(&artifacts);
+        let scenario_path = temp.path().join("scenario.yaml");
+        let mut generation_a = scenario(FaultLabel::Normal, false);
+        generation_a.id = "scenario-generation-a".to_string();
+        generation_a.name = "Scenario generation A".to_string();
+        generation_a.data_sources[0].endpoint = repo_root()
+            .join("data")
+            .join("samples")
+            .join("normal.csv")
+            .display()
+            .to_string();
+        generation_a.acceptance.allow_synthetic_model = true;
+        let bytes_a = serde_yaml::to_string(&generation_a)
+            .expect("serialize generation A")
+            .into_bytes();
+        std::fs::write(&scenario_path, &bytes_a).expect("write generation A");
+        let snapshot =
+            load_lab_scenario_snapshot(&scenario_path).expect("load generation A snapshot");
+
+        let mut generation_b = generation_a.clone();
+        generation_b.id = "scenario-generation-b".to_string();
+        generation_b.name = "Scenario generation B".to_string();
+        generation_b.data_sources[0].endpoint = "missing-generation-b.csv".to_string();
+        let bytes_b = serde_yaml::to_string(&generation_b)
+            .expect("serialize generation B")
+            .into_bytes();
+        std::fs::write(&scenario_path, &bytes_b).expect("replace source with generation B");
+
+        let prepared =
+            prepare_lab_inputs(&scenario_path, snapshot, &ResolvedBearerTokens::default())
+                .expect("prepare generation A inputs");
+        let capability = prepare_artifact_root(&artifacts).expect("artifact capability");
+        let result = run_prepared_lab_scenario(
+            prepared,
+            LabRunOptions {
+                artifacts: artifacts.clone(),
+            },
+            &capability,
+        )
+        .expect("run loaded generation A");
+
+        assert_eq!(result.scenario_id, "scenario-generation-a");
+        assert_eq!(
+            std::fs::read(PathBuf::from(&result.lab_run_dir).join("scenario.yaml"))
+                .expect("archived scenario"),
+            bytes_a
+        );
+        assert_eq!(
+            std::fs::read(&scenario_path).expect("current source generation"),
+            bytes_b
+        );
     }
 
     #[test]
@@ -4658,108 +5026,6 @@ acceptance:
     }
 
     #[test]
-    fn static_preflight_parses_trace_file_schema() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let bad_trace = temp.path().join("bad.csv");
-        std::fs::write(&bad_trace, "timestamp,latency_ms\nnot-a-time,10\n").expect("bad trace");
-        let scenario_path = temp.path().join("scenario.yaml");
-        std::fs::write(
-            &scenario_path,
-            format!(
-                r#"schema: netdiag-lab-scenario/v1
-id: lab-bad-trace-preflight
-name: Bad trace preflight
-expected_label: normal
-data_sources:
-  - role: primary
-    kind: trace-file
-    endpoint: "{}"
-"#,
-                bad_trace.display()
-            ),
-        )
-        .expect("scenario");
-
-        let report = preflight_lab_scenario(
-            &scenario_path,
-            LabPreflightOptions {
-                artifacts: temp.path().join("artifacts"),
-                mode: LabPreflightMode::Static,
-            },
-        )
-        .expect("preflight report");
-
-        assert!(!report.passed);
-        assert!(
-            report.checks.iter().any(|check| {
-                check.name == "primary source reachable"
-                    && check.status == LabPreflightCheckStatus::Failed
-            }),
-            "{:?}",
-            report.checks
-        );
-    }
-
-    #[test]
-    fn static_preflight_fails_bad_corroborating_trace_file_schema() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let good_trace = temp.path().join("good.csv");
-        std::fs::write(
-            &good_trace,
-            "timestamp,latency_ms,packet_loss_rate,retransmission_rate,throughput_mbps\n2026-04-30T12:00:00Z,10,0,0,100\n",
-        )
-        .expect("good trace");
-        let bad_trace = temp.path().join("bad.csv");
-        std::fs::write(
-            &bad_trace,
-            "timestamp,latency_ms,packet_loss_rate,retransmission_rate,throughput_mbps\n2026-04-30T12:00:00Z,-1,0,0,100\n",
-        )
-        .expect("bad trace");
-        let scenario_path = temp.path().join("scenario.yaml");
-        std::fs::write(
-            &scenario_path,
-            format!(
-                r#"schema: netdiag-lab-scenario/v1
-id: lab-bad-corroborating-trace-preflight
-name: Bad corroborating trace preflight
-expected_label: normal
-data_sources:
-  - role: primary
-    kind: trace-file
-    endpoint: "{}"
-  - name: corroborating
-    role: corroborating
-    kind: trace-file
-    endpoint: "{}"
-"#,
-                good_trace.display(),
-                bad_trace.display()
-            ),
-        )
-        .expect("scenario");
-
-        let report = preflight_lab_scenario(
-            &scenario_path,
-            LabPreflightOptions {
-                artifacts: temp.path().join("artifacts"),
-                mode: LabPreflightMode::Static,
-            },
-        )
-        .expect("preflight report");
-
-        assert!(!report.passed);
-        assert!(
-            report.checks.iter().any(|check| {
-                check.name == "corroborating reachable"
-                    && check.required
-                    && check.status == LabPreflightCheckStatus::Failed
-            }),
-            "{:?}",
-            report.checks
-        );
-    }
-
-    #[test]
     fn lab_batch_and_summary_use_lab_index() {
         let temp = tempfile::tempdir().expect("tempdir");
         provision_test_model(temp.path());
@@ -4788,5 +5054,36 @@ data_sources:
             summary.by_scenario["lab-congestion-001"].rule_ml_disagreement_rate,
             0.0
         );
+
+        let lab_run_dir = PathBuf::from(
+            batch.results[0]
+                .lab_run_dir
+                .as_deref()
+                .expect("lab run directory"),
+        );
+        std::fs::write(lab_run_dir.join("comparison.json"), b"{")
+            .expect("corrupt comparison fixture");
+        let summary = summarize_lab_runs(temp.path()).expect("summary with corrupt comparison");
+        assert_eq!(
+            (summary.total_runs, summary.passed, summary.failed),
+            (1, 0, 1)
+        );
+        assert!(summary.by_label.is_empty());
+        assert!(summary.by_scenario.is_empty());
+        assert!(summary.quality.is_empty());
+        assert!(summary.diagnosis_statuses.is_empty());
+        assert_eq!(summary.failures.len(), 1);
+        assert!(summary.failures[0].failures[0].contains("comparison unavailable"));
     }
 }
+
+#[cfg(test)]
+mod config_input_tests;
+#[cfg(test)]
+mod index_update_tests;
+#[cfg(test)]
+mod preflight_tests;
+#[cfg(test)]
+mod run_preparation_tests;
+#[cfg(test)]
+mod verification_policy_tests;

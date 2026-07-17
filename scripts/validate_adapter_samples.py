@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import argparse
-import subprocess
+import json
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from adapter_process import (
+    parse_json_strict,
+    run_json,
+    trusted_rust_ingest_validator,
+    validate_rust_ingest,
+)
+from adapter_quality import validate_declared_measurement_quality
+from schema_validation import bounded_validation_errors
 
 try:
     from jsonschema import Draft202012Validator, FormatChecker
@@ -28,8 +36,25 @@ def main() -> int:
         action="store_true",
         help="skip Rust ingest validation and only validate JSON schema",
     )
+    parser.add_argument(
+        "--rust-validator",
+        type=Path,
+        help="trusted absolute netdiag-cli path built for ingest validation",
+    )
     args = parser.parse_args()
-    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    if args.schema_only and args.rust_validator is not None:
+        parser.error("--rust-validator cannot be used with --schema-only")
+    if not args.schema_only and args.rust_validator is None:
+        parser.error("--rust-validator is required unless --schema-only is used")
+    rust_validator: Path | None = None
+    if args.rust_validator is not None:
+        try:
+            rust_validator = trusted_rust_ingest_validator(args.rust_validator, ROOT)
+        except RuntimeError as error:
+            parser.error(str(error))
+    schema = parse_json_strict(
+        SCHEMA_PATH.read_text(encoding="utf-8"), source="adapter payload schema"
+    )
     validator = Draft202012Validator(schema, format_checker=FormatChecker())
     assert_schema_keyword_coverage()
     failed = False
@@ -39,6 +64,7 @@ def main() -> int:
         for name, adapter_path in discover_adapters():
             try:
                 payload = emit_sample(adapter_path)
+                validate_declared_measurement_quality(payload)
             except RuntimeError as error:
                 print(f"{name}: {error}", file=sys.stderr)
                 failed = True
@@ -52,11 +78,13 @@ def main() -> int:
                     print(f"  - {error}", file=sys.stderr)
                 continue
 
-            if not args.schema_only:
+            if rust_validator is not None:
                 sample_path = tmp_dir / f"{name}.json"
-                sample_path.write_text(json.dumps(payload), encoding="utf-8")
+                sample_path.write_text(
+                    json.dumps(payload, allow_nan=False), encoding="utf-8"
+                )
                 try:
-                    validate_rust_ingest(sample_path)
+                    validate_rust_ingest(rust_validator, sample_path, ROOT)
                 except RuntimeError as error:
                     failed = True
                     print(f"{name}: Rust ingest validation failed", file=sys.stderr)
@@ -79,52 +107,11 @@ def discover_adapters() -> list[tuple[str, Path]]:
 
 
 def emit_sample(adapter_path: Path) -> Any:
-    completed = subprocess.run(
-        [sys.executable, str(adapter_path), "--emit-sample"],
-        cwd=adapter_path.parent,
-        check=False,
-        text=True,
-        capture_output=True,
-    )
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        raise RuntimeError(f"--emit-sample exited {completed.returncode}: {stderr}")
-
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"--emit-sample did not emit JSON: {error}") from error
-
-
-def validate_rust_ingest(sample_path: Path) -> None:
-    completed = subprocess.run(
-        [
-            "cargo",
-            "run",
-            "--quiet",
-            "-p",
-            "netdiag-cli",
-            "--",
-            "validate-trace",
-            str(sample_path),
-        ],
-        cwd=ROOT,
-        check=False,
-        text=True,
-        capture_output=True,
-    )
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        stdout = completed.stdout.strip()
-        detail = stderr or stdout or f"exit code {completed.returncode}"
-        raise RuntimeError(detail)
+    return run_json(adapter_path, ["--emit-sample"])
 
 
 def validation_errors(validator: Draft202012Validator, instance: Any) -> list[str]:
-    return [
-        f"{error.json_path}: {error.message}"
-        for error in sorted(validator.iter_errors(instance), key=lambda item: item.json_path)
-    ]
+    return bounded_validation_errors(validator.iter_errors(instance))
 
 
 def assert_schema_keyword_coverage() -> None:

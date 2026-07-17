@@ -1,57 +1,71 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Release tag to publish, for example v0.5.2. Required when dispatching from a branch."
-        required: false
-        type: string
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  macos:
-    runs-on: macos-14
+  release_preflight:
+    name: Validate release provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+      release_dmg_filename: ${{ steps.release.outputs.release_dmg_filename }}
+      release_artifact_name: ${{ steps.release.outputs.release_artifact_name }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
-      - name: Silence Git default branch hint
-        run: git config --global init.defaultBranch main
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
-      - name: Validate release tag
-        env:
-          RELEASE_TAG_INPUT: ${{ inputs.release_tag || '' }}
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Validate release tag and main binding
+        id: release
         run: |
           set -euo pipefail
-          release_tag="$RELEASE_TAG_INPUT"
-          if [[ -z "$release_tag" ]]; then
-            if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
-              echo "release workflow must run from a tag, or workflow_dispatch must provide release_tag" >&2
-              exit 2
-            fi
-            release_tag="$GITHUB_REF_NAME"
+          if [[ "$GITHUB_EVENT_NAME" != "push" || "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "release workflow accepts tag push events only" >&2
+            exit 2
           fi
+          release_tag="$GITHUB_REF_NAME"
 
           if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
             echo "release tag must be a v-prefixed SemVer tag, got: $release_tag" >&2
             exit 2
           fi
 
+          git fetch --force origin "refs/heads/main:refs/remotes/origin/main"
           git fetch --force --tags origin "refs/tags/$release_tag:refs/tags/$release_tag"
+          tag_object_type="$(git cat-file -t "$release_tag")"
+          if [[ "$tag_object_type" != "tag" ]]; then
+            echo "release tag must be annotated, got Git object type: $tag_object_type" >&2
+            exit 2
+          fi
+
           tag_sha="$(git rev-list -n 1 "$release_tag")"
           head_sha="$(git rev-parse HEAD)"
+          main_sha="$(git rev-parse refs/remotes/origin/main)"
           if [[ "$tag_sha" != "$head_sha" ]]; then
             echo "checked-out HEAD ($head_sha) does not match $release_tag ($tag_sha)" >&2
+            exit 2
+          fi
+          if [[ "$tag_sha" != "$main_sha" ]]; then
+            echo "release tag must point to the exact origin/main commit: tag=$tag_sha main=$main_sha" >&2
             exit 2
           fi
 
@@ -63,103 +77,351 @@ jobs:
           fi
 
           dmg_filename="NetDiag-Twin-$release_version.dmg"
+          artifact_name="netdiag-release-$release_version"
           {
-            printf 'RELEASE_TAG=%s\n' "$release_tag"
-            printf 'RELEASE_VERSION=%s\n' "$release_version"
-            printf 'RELEASE_DMG_FILENAME=%s\n' "$dmg_filename"
-            printf 'RELEASE_DMG_PATH=target/release/%s\n' "$dmg_filename"
-          } >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install strict Rust quality tools
+            printf 'release_tag=%s\n' "$release_tag"
+            printf 'release_version=%s\n' "$release_version"
+            printf 'release_sha=%s\n' "$tag_sha"
+            printf 'release_dmg_filename=%s\n' "$dmg_filename"
+            printf 'release_artifact_name=%s\n' "$artifact_name"
+          } >> "$GITHUB_OUTPUT"
+      - name: Require successful CI for the exact main commit
         env:
-          CARGO_DENY_VERSION: "0.19.6"
-          CARGO_LLVM_COV_VERSION: "0.8.7"
-          CARGO_MACHETE_VERSION: "0.9.2"
-          CARGO_NEXTEST_VERSION: "0.9.136"
-        run: |
-          rustup component add llvm-tools-preview
-          cargo install cargo-binstall --locked --quiet
-          cargo binstall --locked -y --log-level error \
-            cargo-nextest@$CARGO_NEXTEST_VERSION \
-            cargo-llvm-cov@$CARGO_LLVM_COV_VERSION \
-            cargo-deny@$CARGO_DENY_VERSION \
-            cargo-machete@$CARGO_MACHETE_VERSION
-      - name: Validate secrets
-        run: |
-          test -n "${{ secrets.CODESIGN_IDENTITY }}" || (echo "missing CODESIGN_IDENTITY" && exit 2)
-          test -n "${{ secrets.NETDIAG_CODESIGN_P12_BASE64 }}" || (echo "missing NETDIAG_CODESIGN_P12_BASE64" && exit 2)
-          test -n "${{ secrets.NETDIAG_CODESIGN_P12_PASSWORD }}" || (echo "missing NETDIAG_CODESIGN_P12_PASSWORD" && exit 2)
-          test -n "${{ secrets.NETDIAG_SPARKLE_PUBLIC_KEY }}" || (echo "missing NETDIAG_SPARKLE_PUBLIC_KEY" && exit 2)
-          test -n "${{ secrets.SPARKLE_PRIVATE_KEY }}" || (echo "missing SPARKLE_PRIVATE_KEY" && exit 2)
-          test -n "${{ secrets.NETDIAG_NOTARY_PROFILE }}" || (echo "missing NETDIAG_NOTARY_PROFILE" && exit 2)
-          test -n "${{ secrets.NETDIAG_NOTARY_KEY_P8_BASE64 }}" || (echo "missing NETDIAG_NOTARY_KEY_P8_BASE64" && exit 2)
-          test -n "${{ secrets.NETDIAG_NOTARY_KEY_ID }}" || (echo "missing NETDIAG_NOTARY_KEY_ID" && exit 2)
-          test -n "${{ secrets.NETDIAG_NOTARY_ISSUER }}" || (echo "missing NETDIAG_NOTARY_ISSUER" && exit 2)
-          test -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" || (echo "missing HOMEBREW_TAP_TOKEN" && exit 2)
-      - name: Strict Rust quality gate
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
         run: |
           set -euo pipefail
-          python3 -m venv .venv-jsonschema
-          .venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
-          scripts/check_rust_quality.sh strict
-          RUSTFLAGS="-D warnings" cargo build --release -p netdiag-app
-      - name: Script static checks
-        run: |
-          set -euo pipefail
-          bash -n scripts/*.sh
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            brew install shellcheck
+          run_count="$(
+            gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+              -f branch=main \
+              -f event=push \
+              -f head_sha="$RELEASE_SHA" \
+              -f status=success \
+              -f per_page=10 \
+              --jq '.total_count'
+          )"
+          if [[ ! "$run_count" =~ ^[0-9]+$ ]] || (( run_count < 1 )); then
+            echo "release blocked: no successful main CI run exists for exact SHA $RELEASE_SHA" >&2
+            exit 2
           fi
-          shellcheck scripts/*.sh
-      - name: Performance budget
-        run: scripts/check_perf_budget.sh
+          gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$RELEASE_SHA" \
+            -f status=success \
+            -f per_page=1 \
+            --jq '"validated CI run: " + .workflow_runs[0].html_url'
+      - name: Require release attestation verification support
+        run: |
+          set -euo pipefail
+          gh release verify --help >/dev/null
+          gh release verify-asset --help >/dev/null
+      - name: Refuse to rebuild an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          graphql_query="query(\$owner: String!, \$name: String!, \$tag: String!) { repository(owner: \$owner, name: \$name) { release(tagName: \$tag) { id } } }"
+          existing_release_id="$(
+            gh api graphql \
+              -F owner="$owner" \
+              -F name="$repository" \
+              -F tag="$RELEASE_TAG" \
+              -f query="$graphql_query" \
+              --jq '.data.repository.release.id // ""'
+          )"
+          if [[ -n "$existing_release_id" ]]; then
+            echo "release $RELEASE_TAG already exists; rerun only failed jobs from its original workflow run" >&2
+            exit 2
+          fi
+      - name: Require protected release environments
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api_version="2026-03-10"
+          for environment in release-signing release-publication release-homebrew github-pages; do
+            environment_json="$(
+              gh api \
+                --header "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/environments/$environment"
+            )"
+            if [[ "$(jq -r '.can_admins_bypass' <<< "$environment_json")" != "false" ]]; then
+              echo "release environment allows administrator bypass: $environment" >&2
+              exit 2
+            fi
+            if [[ "$(jq -r '.deployment_branch_policy.custom_branch_policies' <<< "$environment_json")" != "true" ]]; then
+              echo "release environment must use selected branch and tag policies: $environment" >&2
+              exit 2
+            fi
+            protected_reviewers="$(
+              jq '[
+                .protection_rules[]
+                | select(
+                    .type == "required_reviewers"
+                    and .prevent_self_review == true
+                    and (.reviewers | length) > 0
+                  )
+              ] | length' <<< "$environment_json"
+            )"
+            if [[ "$protected_reviewers" != "1" ]]; then
+              echo "release environment must require review and prevent self-review: $environment" >&2
+              exit 2
+            fi
+
+            policies_json="$(
+              gh api \
+                --header "X-GitHub-Api-Version: $api_version" \
+                "repos/$GITHUB_REPOSITORY/environments/$environment/deployment-branch-policies?per_page=100"
+            )"
+            policy_contract="$(
+              jq -r '
+                .total_count == 1
+                and ([.branch_policies[] | select(.type == "tag" and .name == "v*")] | length) == 1
+              ' <<< "$policies_json"
+            )"
+            if [[ "$policy_contract" != "true" ]]; then
+              echo "release environment must allow only the v* tag policy: $environment" >&2
+              exit 2
+            fi
+          done
+
+  platform_security:
+    name: Native platform release gate
+    needs: release_preflight
+    uses: ./.github/workflows/platform-security.yml
+    with:
+      checkout_ref: ${{ needs.release_preflight.outputs.release_sha }}
+
+  macos_compile:
+    name: Compile sealed macOS release binary
+    needs: release_preflight
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      RELEASE_SHA: ${{ needs.release_preflight.outputs.release_sha }}
+      UNSIGNED_ARTIFACT_NAME: netdiag-unsigned-${{ needs.release_preflight.outputs.release_version }}
+    steps:
+      - name: Silence Git default branch hint
+        run: git config --global init.defaultBranch main
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.release_preflight.outputs.release_sha }}
+      - name: Verify immutable compile checkout
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$RELEASE_SHA" ]] || (echo "compile checkout mismatch: expected=$RELEASE_SHA actual=$actual_sha" >&2 && exit 2)
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
+      - name: Build and seal unsigned release binary
+        run: |
+          set -euo pipefail
+          RUSTFLAGS="-D warnings" cargo build --locked --release -p netdiag-app
+          test -f target/release/netdiag-app && test ! -L target/release/netdiag-app
+          unsigned_dir="target/release-unsigned"
+          rm -rf "$unsigned_dir"
+          mkdir -p "$unsigned_dir"
+          cp -- target/release/netdiag-app "$unsigned_dir/netdiag-app"
+          chmod 0755 "$unsigned_dir/netdiag-app"
+          (cd "$unsigned_dir" && shasum -a 256 netdiag-app > SHA256SUMS)
+          (cd "$unsigned_dir" && shasum -a 256 -c SHA256SUMS)
+          git diff --exit-code
+      - name: Upload sealed unsigned binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.UNSIGNED_ARTIFACT_NAME }}
+          path: target/release-unsigned/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  macos_build:
+    name: Sign and verify macOS release
+    needs: [release_preflight, platform_security, macos_compile]
+    runs-on: macos-14
+    timeout-minutes: 90
+    environment:
+      name: release-signing
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      release_tag: ${{ steps.release.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+      release_dmg_filename: ${{ steps.release.outputs.release_dmg_filename }}
+      release_artifact_name: ${{ steps.release.outputs.release_artifact_name }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      RELEASE_TAG: ${{ needs.release_preflight.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.release_preflight.outputs.release_version }}
+      RELEASE_SHA: ${{ needs.release_preflight.outputs.release_sha }}
+      RELEASE_DMG_FILENAME: ${{ needs.release_preflight.outputs.release_dmg_filename }}
+      RELEASE_DMG_PATH: target/release/${{ needs.release_preflight.outputs.release_dmg_filename }}
+      RELEASE_ARTIFACT_NAME: ${{ needs.release_preflight.outputs.release_artifact_name }}
+      UNSIGNED_ARTIFACT_NAME: netdiag-unsigned-${{ needs.release_preflight.outputs.release_version }}
+    steps:
+      - name: Silence Git default branch hint
+        run: git config --global init.defaultBranch main
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.release_preflight.outputs.release_sha }}
+      - name: Verify immutable release checkout
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$RELEASE_SHA" ]] || (echo "release checkout mismatch: expected=$RELEASE_SHA actual=$actual_sha" >&2 && exit 2)
+      - name: Download sealed unsigned binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.UNSIGNED_ARTIFACT_NAME }}
+          path: target/release-unsigned
+      - name: Verify and stage sealed unsigned binary
+        run: |
+          set -euo pipefail
+          unsigned_dir="target/release-unsigned"
+          entry_count="$(find "$unsigned_dir" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')"
+          [[ "$entry_count" == "2" ]] || (echo "unsigned release artifact contains unexpected entries" >&2 && exit 2)
+          test -f "$unsigned_dir/netdiag-app" && test ! -L "$unsigned_dir/netdiag-app"
+          test -f "$unsigned_dir/SHA256SUMS" && test ! -L "$unsigned_dir/SHA256SUMS"
+          checksum_line="$(cat "$unsigned_dir/SHA256SUMS")"
+          if [[ ! "$checksum_line" =~ ^([0-9a-f]{64})[[:space:]][[:space:]]netdiag-app$ ]]; then
+            echo "unsigned release checksum manifest is malformed" >&2
+            exit 2
+          fi
+          expected_binary_sha256="${BASH_REMATCH[1]}"
+          actual_binary_sha256="$(shasum -a 256 "$unsigned_dir/netdiag-app" | awk '{print $1}')"
+          [[ "$actual_binary_sha256" == "$expected_binary_sha256" ]] || (echo "unsigned release binary checksum mismatch" >&2 && exit 2)
+          mkdir -p target/release
+          cp -- "$unsigned_dir/netdiag-app" target/release/netdiag-app
+          chmod 0755 target/release/netdiag-app
+          staged_binary_sha256="$(shasum -a 256 target/release/netdiag-app | awk '{print $1}')"
+          [[ "$staged_binary_sha256" == "$expected_binary_sha256" ]] || (echo "staged release binary checksum mismatch" >&2 && exit 2)
+          printf 'NETDIAG_EXPECTED_BINARY_SHA256=%s\n' "$expected_binary_sha256" >> "$GITHUB_ENV"
+          git diff --exit-code
+      - name: Export validated release metadata
+        id: release
+        run: |
+          set -euo pipefail
+          {
+            printf 'release_tag=%s\n' "$RELEASE_TAG"
+            printf 'release_version=%s\n' "$RELEASE_VERSION"
+            printf 'release_sha=%s\n' "$RELEASE_SHA"
+            printf 'release_dmg_filename=%s\n' "$RELEASE_DMG_FILENAME"
+            printf 'release_artifact_name=%s\n' "$RELEASE_ARTIFACT_NAME"
+          } >> "$GITHUB_OUTPUT"
       - name: Prepare signing keychain
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain_path="$RUNNER_TEMP/netdiag-signing.keychain-db"
+          keychain_password_path="$RUNNER_TEMP/netdiag-signing-keychain-password"
+          codesign_p12_path="$RUNNER_TEMP/codesign.p12"
+          notary_key_path="$RUNNER_TEMP/AuthKey.p8"
+          keychain_password="$(uuidgen)"
+          printf '%s' "$keychain_password" > "$keychain_password_path"
+          chmod 0600 "$keychain_password_path"
+          {
+            printf 'NETDIAG_SIGNING_KEYCHAIN=%s\n' "$keychain_path"
+            printf 'NETDIAG_SIGNING_KEYCHAIN_PASSWORD_PATH=%s\n' "$keychain_password_path"
+            printf 'NETDIAG_NOTARY_KEYCHAIN=%s\n' "$keychain_path"
+            printf 'NETDIAG_CODESIGN_P12_PATH=%s\n' "$codesign_p12_path"
+            printf 'NETDIAG_NOTARY_KEY_PATH=%s\n' "$notary_key_path"
+          } >> "$GITHUB_ENV"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 3600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+      - name: Import code-signing identity
         env:
           CODESIGN_P12_BASE64: ${{ secrets.NETDIAG_CODESIGN_P12_BASE64 }}
           CODESIGN_P12_PASSWORD: ${{ secrets.NETDIAG_CODESIGN_P12_PASSWORD }}
-          NOTARY_KEY_P8_BASE64: ${{ secrets.NETDIAG_NOTARY_KEY_P8_BASE64 }}
-          NOTARY_KEY_ID: ${{ secrets.NETDIAG_NOTARY_KEY_ID }}
-          NOTARY_ISSUER: ${{ secrets.NETDIAG_NOTARY_ISSUER }}
-          NOTARY_PROFILE: ${{ secrets.NETDIAG_NOTARY_PROFILE }}
         run: |
           set -euo pipefail
-          KEYCHAIN_PATH="$RUNNER_TEMP/netdiag-signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychains -d user -s "$KEYCHAIN_PATH"
-
-          printf '%s' "$CODESIGN_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/codesign.p12"
-          security import "$RUNNER_TEMP/codesign.p12" \
-            -k "$KEYCHAIN_PATH" \
+          umask 077
+          codesign_p12_path="$NETDIAG_CODESIGN_P12_PATH"
+          keychain_path="$NETDIAG_SIGNING_KEYCHAIN"
+          keychain_password="$(< "$NETDIAG_SIGNING_KEYCHAIN_PASSWORD_PATH")"
+          missing=()
+          [[ -n "$CODESIGN_P12_BASE64" ]] || missing+=(NETDIAG_CODESIGN_P12_BASE64)
+          [[ -n "$CODESIGN_P12_PASSWORD" ]] || missing+=(NETDIAG_CODESIGN_P12_PASSWORD)
+          if (( ${#missing[@]} > 0 )); then
+            printf 'missing required release-signing secret: %s\n' "${missing[@]}" >&2
+            exit 2
+          fi
+          printf '%s' "$CODESIGN_P12_BASE64" | base64 --decode > "$codesign_p12_path"
+          security import "$codesign_p12_path" \
+            -k "$keychain_path" \
             -P "$CODESIGN_P12_PASSWORD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/productsign \
-            -T /usr/bin/xcrun
+            -T /usr/bin/codesign
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
             -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            "$KEYCHAIN_PATH"
-
-          printf '%s' "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+            -k "$keychain_password" \
+            "$keychain_path"
+          rm -f -- "$codesign_p12_path"
+      - name: Store notarization credentials
+        env:
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NETDIAG_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ vars.NETDIAG_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ vars.NETDIAG_NOTARY_ISSUER }}
+          NOTARY_PROFILE: ${{ vars.NETDIAG_NOTARY_PROFILE }}
+        run: |
+          set -euo pipefail
+          umask 077
+          notary_key_path="$NETDIAG_NOTARY_KEY_PATH"
+          keychain_path="$NETDIAG_NOTARY_KEYCHAIN"
+          missing=()
+          [[ -n "$NOTARY_KEY_P8_BASE64" ]] || missing+=(NETDIAG_NOTARY_KEY_P8_BASE64)
+          [[ -n "$NOTARY_KEY_ID" ]] || missing+=(NETDIAG_NOTARY_KEY_ID)
+          [[ -n "$NOTARY_ISSUER" ]] || missing+=(NETDIAG_NOTARY_ISSUER)
+          [[ -n "$NOTARY_PROFILE" ]] || missing+=(NETDIAG_NOTARY_PROFILE)
+          if (( ${#missing[@]} > 0 )); then
+            printf 'missing required release-signing setting: %s\n' "${missing[@]}" >&2
+            exit 2
+          fi
+          printf '%s' "$NOTARY_KEY_P8_BASE64" | base64 --decode > "$notary_key_path"
           xcrun notarytool store-credentials "$NOTARY_PROFILE" \
-            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key "$notary_key_path" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER" \
-            --keychain "$KEYCHAIN_PATH" \
+            --keychain "$keychain_path" \
             --validate
-
-          echo "NETDIAG_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          echo "NETDIAG_NOTARY_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          rm -f -- "$notary_key_path" "$NETDIAG_SIGNING_KEYCHAIN_PASSWORD_PATH"
       - name: Build DMG
         env:
-          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
-          NETDIAG_SPARKLE_PUBLIC_KEY: ${{ secrets.NETDIAG_SPARKLE_PUBLIC_KEY }}
-          NETDIAG_NOTARY_PROFILE: ${{ secrets.NETDIAG_NOTARY_PROFILE }}
+          CODESIGN_IDENTITY: ${{ vars.CODESIGN_IDENTITY }}
+          NETDIAG_SPARKLE_PUBLIC_KEY: ${{ vars.NETDIAG_SPARKLE_PUBLIC_KEY }}
+          NETDIAG_NOTARY_PROFILE: ${{ vars.NETDIAG_NOTARY_PROFILE }}
           NETDIAG_NOTARIZE: "1"
-        run: scripts/package_macos_app.sh release
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "$CODESIGN_IDENTITY" ]] || missing+=(CODESIGN_IDENTITY)
+          [[ -n "$NETDIAG_SPARKLE_PUBLIC_KEY" ]] || missing+=(NETDIAG_SPARKLE_PUBLIC_KEY)
+          [[ -n "$NETDIAG_NOTARY_PROFILE" ]] || missing+=(NETDIAG_NOTARY_PROFILE)
+          if (( ${#missing[@]} > 0 )); then
+            printf 'missing required release-signing setting: %s\n' "${missing[@]}" >&2
+            exit 2
+          fi
+          scripts/package_macos_app.sh release --no-build
       - name: Validate notarized DMG
         run: |
           set -euo pipefail
@@ -183,12 +445,22 @@ jobs:
           mount_dir="$RUNNER_TEMP/netdiag-dmg"
           rm -rf "$mount_dir"
           mkdir -p "$mount_dir"
-          cleanup() {
-            hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
+          mount_attached=0
+          cleanup_mount() {
+            local status="$?"
+            trap - EXIT
+            if [[ "$mount_attached" == "1" ]] && ! hdiutil detach "$mount_dir" -quiet; then
+              echo "failed to detach validated DMG mount: $mount_dir" >&2
+              if [[ "$status" == "0" ]]; then
+                status=1
+              fi
+            fi
+            exit "$status"
           }
-          trap cleanup EXIT
+          trap cleanup_mount EXIT
 
           hdiutil attach "$dmg_path" -mountpoint "$mount_dir" -nobrowse -readonly
+          mount_attached=1
           app_path="$mount_dir/NetDiag Twin.app"
           if [[ ! -d "$app_path" ]]; then
             app_path="$(find "$mount_dir" -maxdepth 2 -type d -name 'NetDiag Twin.app' -print -quit)"
@@ -197,18 +469,44 @@ jobs:
 
           codesign --verify --deep --strict --verbose=2 "$app_path"
           spctl --assess --type execute --verbose=4 "$app_path"
+      - name: Remove signing material
+        if: always()
+        run: |
+          set -euo pipefail
+          cleanup_failed=0
+          codesign_p12_path="${NETDIAG_CODESIGN_P12_PATH:-$RUNNER_TEMP/codesign.p12}"
+          notary_key_path="${NETDIAG_NOTARY_KEY_PATH:-$RUNNER_TEMP/AuthKey.p8}"
+          keychain_password_path="${NETDIAG_SIGNING_KEYCHAIN_PASSWORD_PATH:-$RUNNER_TEMP/netdiag-signing-keychain-password}"
+          signing_keychain="${NETDIAG_SIGNING_KEYCHAIN:-$RUNNER_TEMP/netdiag-signing.keychain-db}"
+          for secret_file in "$codesign_p12_path" "$notary_key_path" "$keychain_password_path"; do
+            if [[ -n "$secret_file" && -e "$secret_file" ]] && ! rm -f -- "$secret_file"; then
+              echo "failed to remove signing material: $secret_file" >&2
+              cleanup_failed=1
+            fi
+          done
+          if [[ -e "$signing_keychain" ]]; then
+            if ! security delete-keychain "$signing_keychain"; then
+              echo "failed to delete temporary signing keychain" >&2
+              cleanup_failed=1
+            fi
+          fi
+          exit "$cleanup_failed"
       - name: Generate appcast
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+          if [[ -z "$SPARKLE_PRIVATE_KEY" ]]; then
+            echo "missing required release-signing secret: SPARKLE_PRIVATE_KEY" >&2
+            exit 2
+          fi
           appcast_tool="target/sparkle-2.7.1/bin/generate_appcast"
           test -x "$appcast_tool" || (echo "missing Sparkle generate_appcast tool at $appcast_tool" >&2 && exit 2)
 
           rm -f target/release/appcast.xml
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$appcast_tool" \
             --ed-key-file - \
-            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/" \
+            --download-url-prefix "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/" \
             target/release
       - name: Validate Sparkle appcast
         run: |
@@ -290,89 +588,466 @@ jobs:
           if not minimum_system_version:
               fail("appcast item is missing sparkle:minimumSystemVersion")
           PY
+      - name: Prepare verified release artifact
+        run: |
+          set -euo pipefail
+          publish_dir="target/release-publish"
+          rm -rf "$publish_dir"
+          mkdir -p "$publish_dir"
+          cp -- "$RELEASE_DMG_PATH" "$publish_dir/$RELEASE_DMG_FILENAME"
+          cp -- target/release/appcast.xml "$publish_dir/appcast.xml"
+          (
+            cd "$publish_dir"
+            shasum -a 256 "$RELEASE_DMG_FILENAME" appcast.xml > SHA256SUMS
+            shasum -a 256 -c SHA256SUMS
+          )
+      - name: Upload verified release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: target/release-publish/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  publish_release:
+    name: Publish GitHub Release
+    needs: macos_build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release-publication
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RELEASE_TAG: ${{ needs.macos_build.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.macos_build.outputs.release_version }}
+      RELEASE_SHA: ${{ needs.macos_build.outputs.release_sha }}
+      RELEASE_DMG_FILENAME: ${{ needs.macos_build.outputs.release_dmg_filename }}
+      RELEASE_ARTIFACT_NAME: ${{ needs.macos_build.outputs.release_artifact_name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ env.RELEASE_SHA }}
+      - name: Verify release provenance before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          main_relation="$(gh api "repos/$GITHUB_REPOSITORY/compare/$RELEASE_SHA...main" --jq '[.status, .merge_base_commit.sha] | @tsv')"
+          IFS=$'\t' read -r main_status merge_base_sha <<< "$main_relation"
+          tag_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          tag_object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          [[ "$tag_type" == "tag" ]] || (echo "release tag is no longer annotated" >&2 && exit 2)
+          tag_target_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq '.object.type')"
+          tag_target_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq '.object.sha')"
+          [[ "$tag_target_type" == "commit" ]] || (echo "release tag no longer targets a commit" >&2 && exit 2)
+          [[ "$main_status" == "identical" || "$main_status" == "ahead" ]] || (echo "origin/main no longer contains the release commit: status=$main_status" >&2 && exit 2)
+          [[ "$merge_base_sha" == "$RELEASE_SHA" ]] || (echo "origin/main merge base no longer matches the release commit" >&2 && exit 2)
+          [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || (echo "release tag moved before publication: expected=$RELEASE_SHA actual=$tag_target_sha" >&2 && exit 2)
+      - name: Download verified release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: target/release
+      - name: Verify release artifact
+        run: |
+          set -euo pipefail
+          test -f "target/release/$RELEASE_DMG_FILENAME"
+          test -f target/release/appcast.xml
+          test -f target/release/SHA256SUMS
+          file_count="$(find target/release -type f | wc -l | tr -d ' ')"
+          [[ "$file_count" == "3" ]] || (echo "release artifact contains unexpected files" >&2 && exit 2)
+          (cd target/release && sha256sum -c SHA256SUMS)
+      - name: Refuse existing release immediately before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          graphql_query="query(\$owner: String!, \$name: String!, \$tag: String!) { repository(owner: \$owner, name: \$name) { release(tagName: \$tag) { id } } }"
+          existing_release_id="$(
+            gh api graphql \
+              -F owner="$owner" \
+              -F name="$repository" \
+              -F tag="$RELEASE_TAG" \
+              -f query="$graphql_query" \
+              --jq '.data.repository.release.id // ""'
+          )"
+          if [[ -n "$existing_release_id" ]]; then
+            echo "release $RELEASE_TAG appeared during the build; refusing to overwrite it" >&2
+            exit 2
+          fi
+      - name: Validate fixed release notes
+        run: |
+          set -euo pipefail
+          notes_file=".github/release-notes/$RELEASE_TAG.md"
+          if [[ ! -f "$notes_file" || -L "$notes_file" ]]; then
+            echo "fixed release notes are missing or unsafe" >&2
+            exit 2
+          fi
+          notes_bytes="$(wc -c < "$notes_file" | tr -d ' ')"
+          if [[ ! "$notes_bytes" =~ ^[0-9]+$ ]] \
+            || (( notes_bytes == 0 || notes_bytes > 65536 )); then
+            echo "fixed release notes must contain 1..65536 bytes" >&2
+            exit 2
+          fi
+          expected_heading="# NetDiag Twin $RELEASE_VERSION"
+          [[ "$(head -n 1 "$notes_file")" == "$expected_heading" ]] \
+            || (echo "fixed release notes heading does not match the release version" >&2 && exit 2)
+      - name: Publish GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq 'select(.object.type == "tag") | .object.sha')"
+          [[ -n "$tag_object_sha" ]] || (echo "release tag is no longer annotated immediately before publication" >&2 && exit 2)
+          tag_target_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq 'select(.object.type == "commit") | .object.sha')"
+          [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || (echo "release tag moved immediately before publication: expected=$RELEASE_SHA actual=$tag_target_sha" >&2 && exit 2)
+          notes_file=".github/release-notes/$RELEASE_TAG.md"
+          gh release create "$RELEASE_TAG" \
+            "target/release/$RELEASE_DMG_FILENAME" \
+            target/release/appcast.xml \
+            target/release/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes-file "$notes_file"
+
+  verify_release:
+    name: Verify published GitHub Release
+    needs: [macos_build, publish_release]
+    if: ${{ always() && !cancelled() && needs.macos_build.result == 'success' && (needs.publish_release.result == 'success' || needs.publish_release.result == 'failure') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      attestations: read
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RELEASE_TAG: ${{ needs.macos_build.outputs.release_tag }}
+      RELEASE_SHA: ${{ needs.macos_build.outputs.release_sha }}
+      RELEASE_DMG_FILENAME: ${{ needs.macos_build.outputs.release_dmg_filename }}
+      RELEASE_ARTIFACT_NAME: ${{ needs.macos_build.outputs.release_artifact_name }}
+      SOURCE_DIR: target/release-source
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          path: ${{ env.SOURCE_DIR }}
+          persist-credentials: false
+          ref: ${{ env.RELEASE_SHA }}
+      - name: Download verified build artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: target/release
+      - name: Verify build artifact
+        run: |
+          set -euo pipefail
+          file_count="$(find target/release -type f | wc -l | tr -d ' ')"
+          [[ "$file_count" == "3" ]] || (echo "release artifact contains unexpected files" >&2 && exit 2)
+          (cd target/release && sha256sum -c SHA256SUMS)
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" == "$RELEASE_SHA" ]] \
+            || (echo "release source checkout is not immutable" >&2 && exit 2)
+          release_contract="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isImmutable,isDraft,isPrerelease --jq '[.tagName, (.isImmutable | tostring), (.isDraft | tostring), (.isPrerelease | tostring)] | @tsv')"
+          IFS=$'\t' read -r published_tag is_immutable is_draft is_prerelease <<< "$release_contract"
+          [[ "$published_tag" == "$RELEASE_TAG" ]] || (echo "published release tag mismatch" >&2 && exit 2)
+          [[ "$is_immutable" == "true" ]] || (echo "published release is not immutable" >&2 && exit 2)
+          [[ "$is_draft" == "false" ]] || (echo "published release is still a draft" >&2 && exit 2)
+          [[ "$is_prerelease" == "false" ]] || (echo "published release is unexpectedly a prerelease" >&2 && exit 2)
+          gh release verify "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY"
+
+          release_json="$RUNNER_TEMP/published-release.json"
+          published_notes="$RUNNER_TEMP/published-release-notes.md"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          jq -erj '.body' "$release_json" > "$published_notes"
+          cmp -- "$SOURCE_DIR/.github/release-notes/$RELEASE_TAG.md" "$published_notes"
+
+          expected_assets="$(printf '%s\n' "$RELEASE_DMG_FILENAME" SHA256SUMS appcast.xml | sort)"
+          actual_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          [[ "$actual_assets" == "$expected_assets" ]] || (echo "published release asset set is not exact" >&2 && exit 2)
+
+          published_dir="$RUNNER_TEMP/published-release"
+          rm -rf "$published_dir"
+          mkdir -p "$published_dir"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$published_dir" \
+            --pattern "$RELEASE_DMG_FILENAME" \
+            --pattern appcast.xml \
+            --pattern SHA256SUMS
+          file_count="$(find "$published_dir" -type f | wc -l | tr -d ' ')"
+          [[ "$file_count" == "3" ]] || (echo "published release contains unexpected downloaded assets" >&2 && exit 2)
+          (cd "$published_dir" && sha256sum -c SHA256SUMS)
+          gh release verify-asset "$RELEASE_TAG" "$published_dir/$RELEASE_DMG_FILENAME" --repo "$GITHUB_REPOSITORY"
+          gh release verify-asset "$RELEASE_TAG" "$published_dir/appcast.xml" --repo "$GITHUB_REPOSITORY"
+          gh release verify-asset "$RELEASE_TAG" "$published_dir/SHA256SUMS" --repo "$GITHUB_REPOSITORY"
+          cmp -- "target/release/$RELEASE_DMG_FILENAME" "$published_dir/$RELEASE_DMG_FILENAME"
+          cmp -- target/release/appcast.xml "$published_dir/appcast.xml"
+          cmp -- target/release/SHA256SUMS "$published_dir/SHA256SUMS"
+      - name: Verify release provenance after publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          main_relation="$(gh api "repos/$GITHUB_REPOSITORY/compare/$RELEASE_SHA...main" --jq '[.status, .merge_base_commit.sha] | @tsv')"
+          IFS=$'\t' read -r main_status merge_base_sha <<< "$main_relation"
+          tag_object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq 'select(.object.type == "tag") | .object.sha')"
+          [[ -n "$tag_object_sha" ]] || (echo "release tag is no longer annotated" >&2 && exit 2)
+          tag_target_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq 'select(.object.type == "commit") | .object.sha')"
+          [[ "$main_status" == "identical" || "$main_status" == "ahead" ]] || (echo "origin/main no longer contains the release commit after publication: status=$main_status" >&2 && exit 2)
+          [[ "$merge_base_sha" == "$RELEASE_SHA" ]] || (echo "origin/main merge base changed during publication" >&2 && exit 2)
+          [[ "$tag_target_sha" == "$RELEASE_SHA" ]] || (echo "release tag moved during publication: expected=$RELEASE_SHA actual=$tag_target_sha" >&2 && exit 2)
+
+  publish_pages:
+    name: Publish and validate Sparkle appcast
+    needs: [macos_build, verify_release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RELEASE_TAG: ${{ needs.macos_build.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.macos_build.outputs.release_version }}
+      RELEASE_DMG_FILENAME: ${{ needs.macos_build.outputs.release_dmg_filename }}
+      RELEASE_ARTIFACT_NAME: ${{ needs.macos_build.outputs.release_artifact_name }}
+    steps:
+      - name: Download verified release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: target/release
+      - name: Verify release artifact
+        run: (cd target/release && sha256sum -c SHA256SUMS)
       - name: Prepare Pages artifact
         run: |
           set -euo pipefail
           rm -rf target/pages
           mkdir -p target/pages
           cp target/release/appcast.xml target/pages/appcast.xml
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-          fail_on_unmatched_files: true
-          files: |
-            target/release/NetDiag-Twin-*.dmg
-            target/release/appcast.xml
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: target/pages
       - name: Deploy appcast to Pages
-        uses: actions/deploy-pages@v5
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
       - name: Validate published appcast
         run: |
           set -euo pipefail
           appcast_url="https://billlza.github.io/netdiag-twin/appcast.xml"
-          dmg_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${RELEASE_DMG_FILENAME}"
-          curl -fsSL --retry 5 --retry-delay 3 "$appcast_url" -o "$RUNNER_TEMP/appcast.xml"
-          grep -F "$RELEASE_VERSION" "$RUNNER_TEMP/appcast.xml" >/dev/null
-          grep -F "$dmg_url" "$RUNNER_TEMP/appcast.xml" >/dev/null
+          dmg_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$RELEASE_DMG_FILENAME"
+          published_appcast="$RUNNER_TEMP/published-appcast.xml"
+          matched=0
+          for attempt in $(seq 1 30); do
+            cache_buster="${RELEASE_TAG#v}-$attempt-$(date +%s)"
+            if curl -fsSL --retry 2 --retry-delay 2 \
+              "$appcast_url?release=$cache_buster" \
+              -o "$published_appcast" \
+              && cmp -s -- target/release/appcast.xml "$published_appcast"; then
+              matched=1
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$matched" != "1" ]]; then
+            echo "published Pages appcast did not converge to the verified release bytes" >&2
+            if [[ -f "$published_appcast" ]]; then
+              sha256sum target/release/appcast.xml "$published_appcast" >&2
+            fi
+            exit 2
+          fi
+          cmp -- target/release/appcast.xml "$published_appcast"
           curl -fsIL --retry 5 --retry-delay 3 "$dmg_url" >/dev/null
-      - name: Checkout Homebrew tap
-        uses: actions/checkout@v6
+
+  homebrew_audit:
+    name: Audit fixed Homebrew cask
+    needs: [macos_build, verify_release]
+    runs-on: macos-14
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      tap_parent_sha: ${{ steps.audit.outputs.tap_parent_sha }}
+      cask_sha256: ${{ steps.audit.outputs.cask_sha256 }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RELEASE_SHA: ${{ needs.macos_build.outputs.release_sha }}
+      RELEASE_VERSION: ${{ needs.macos_build.outputs.release_version }}
+      RELEASE_DMG_FILENAME: ${{ needs.macos_build.outputs.release_dmg_filename }}
+      RELEASE_ARTIFACT_NAME: ${{ needs.macos_build.outputs.release_artifact_name }}
+      SOURCE_DIR: target/release-source
+      TAP_DIR: target/homebrew-tap
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          path: ${{ env.SOURCE_DIR }}
+          persist-credentials: false
+          ref: ${{ env.RELEASE_SHA }}
+      - name: Download verified release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: target/release
+      - name: Verify release artifact
+        run: (cd target/release && shasum -a 256 -c SHA256SUMS)
+      - name: Checkout Homebrew tap without credentials
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: billlza/homebrew-netdiag-twin
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: target/homebrew-tap
-      - name: Publish Homebrew cask
-        env:
-          TAP_DIR: target/homebrew-tap
+          ref: main
+          path: ${{ env.TAP_DIR }}
+          persist-credentials: false
+      - name: Build and audit fixed cask without publication credentials
+        id: audit
         run: |
           set -euo pipefail
-          dmg_sha256="$(shasum -a 256 "$RELEASE_DMG_PATH" | awk '{print $1}')"
-          tap_dir_abs="$(cd "$TAP_DIR" && pwd)"
-          cask_file="$tap_dir_abs/Casks/netdiag-twin.rb"
-          tap_branch="$(git -C "$tap_dir_abs" rev-parse --abbrev-ref HEAD)"
-          if [[ "$tap_branch" == "HEAD" ]]; then
-            tap_branch="$(git -C "$tap_dir_abs" remote show origin | awk '/HEAD branch/ {print $NF}')"
-            git -C "$tap_dir_abs" checkout "$tap_branch"
-          fi
-
-          mkdir -p "$(dirname "$cask_file")"
-          cat > "$cask_file" <<RUBY
-          cask "netdiag-twin" do
-            version "$RELEASE_VERSION"
-            sha256 "$dmg_sha256"
-
-            url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v#{version}/NetDiag-Twin-#{version}.dmg"
-            name "NetDiag Twin"
-            desc "Network diagnostics workstation"
-            homepage "https://github.com/${GITHUB_REPOSITORY}"
-
-            depends_on macos: ">= :ventura"
-
-            app "NetDiag Twin.app"
-          end
-          RUBY
-
+          [[ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" == "$RELEASE_SHA" ]] \
+            || (echo "release source checkout is not immutable" >&2 && exit 2)
+          tap_parent_sha="$(git -C "$TAP_DIR" rev-parse HEAD)"
+          [[ "$tap_parent_sha" =~ ^[0-9a-f]{40}$ ]] || (echo "Homebrew tap parent is invalid" >&2 && exit 2)
+          dmg_sha256="$(shasum -a 256 "target/release/$RELEASE_DMG_FILENAME" | awk '{print $1}')"
+          [[ "$dmg_sha256" =~ ^[0-9a-f]{64}$ ]] || (echo "release DMG digest is invalid" >&2 && exit 2)
+          cask_file="$TAP_DIR/Casks/netdiag-twin.rb"
+          [[ -d "$TAP_DIR/Casks" && ! -L "$TAP_DIR/Casks" ]] \
+            || (echo "Homebrew tap Casks path must be a real directory" >&2 && exit 2)
+          bash "$SOURCE_DIR/scripts/render_homebrew_cask.sh" \
+            "$RELEASE_VERSION" "$dmg_sha256" "$cask_file"
           ruby -c "$cask_file"
-
-          git -C "$tap_dir_abs" config user.name "github-actions[bot]"
-          git -C "$tap_dir_abs" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C "$tap_dir_abs" add Casks/netdiag-twin.rb
-          if git -C "$tap_dir_abs" diff --cached --quiet; then
-            tap_changed=0
-            echo "Homebrew tap already up to date"
-          else
-            tap_changed=1
-            git -C "$tap_dir_abs" commit -m "Update NetDiag Twin to ${RELEASE_TAG}"
+          if brew tap | grep -Fqx billlza/netdiag-twin; then
+            brew untap billlza/netdiag-twin
           fi
-
-          brew untap billlza/netdiag-twin >/dev/null 2>&1 || true
-          brew tap --custom-remote billlza/netdiag-twin "$tap_dir_abs"
+          brew tap --custom-remote billlza/netdiag-twin "$(cd "$TAP_DIR" && pwd)"
           brew audit --cask --strict --tap billlza/netdiag-twin netdiag-twin
+          {
+            printf 'tap_parent_sha=%s\n' "$tap_parent_sha"
+            printf 'cask_sha256=%s\n' "$(shasum -a 256 "$cask_file" | awk '{print $1}')"
+          } >> "$GITHUB_OUTPUT"
 
-          if [[ "$tap_changed" == "1" ]]; then
-            git -C "$tap_dir_abs" push origin "HEAD:$tap_branch"
+  publish_homebrew:
+    name: Publish fixed Homebrew cask
+    needs: [macos_build, verify_release, homebrew_audit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release-homebrew
+    permissions:
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      RELEASE_TAG: ${{ needs.macos_build.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.macos_build.outputs.release_version }}
+      RELEASE_SHA: ${{ needs.macos_build.outputs.release_sha }}
+      RELEASE_DMG_FILENAME: ${{ needs.macos_build.outputs.release_dmg_filename }}
+      RELEASE_ARTIFACT_NAME: ${{ needs.macos_build.outputs.release_artifact_name }}
+      SOURCE_DIR: target/release-source
+      TAP_BRANCH: main
+      TAP_PARENT_SHA: ${{ needs.homebrew_audit.outputs.tap_parent_sha }}
+      AUDITED_CASK_SHA256: ${{ needs.homebrew_audit.outputs.cask_sha256 }}
+      TAP_DIR: target/homebrew-tap
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 1
+          path: ${{ env.SOURCE_DIR }}
+          persist-credentials: false
+          ref: ${{ env.RELEASE_SHA }}
+      - name: Download verified release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: target/release
+      - name: Verify release artifact
+        run: (cd target/release && sha256sum -c SHA256SUMS)
+      - name: Rebuild audited cask on a fresh runner
+        id: prepare
+        run: |
+          set -euo pipefail
+          [[ "$(git -C "$SOURCE_DIR" rev-parse HEAD)" == "$RELEASE_SHA" ]] \
+            || (echo "release source checkout is not immutable" >&2 && exit 2)
+          [[ "$TAP_PARENT_SHA" =~ ^[0-9a-f]{40}$ ]] || (echo "audited Homebrew parent is invalid" >&2 && exit 2)
+          [[ "$AUDITED_CASK_SHA256" =~ ^[0-9a-f]{64}$ ]] || (echo "audited cask digest is invalid" >&2 && exit 2)
+          tap_url="https://github.com/billlza/homebrew-netdiag-twin.git"
+          remote_sha="$(git ls-remote --exit-code "$tap_url" "refs/heads/$TAP_BRANCH" | awk 'NR == 1 {print $1}')"
+          [[ "$remote_sha" == "$TAP_PARENT_SHA" ]] || (echo "Homebrew tap changed after audit" >&2 && exit 2)
+          git clone --quiet --filter=blob:none --no-checkout --branch "$TAP_BRANCH" "$tap_url" "$TAP_DIR"
+          [[ "$(git -C "$TAP_DIR" rev-parse HEAD)" == "$TAP_PARENT_SHA" ]] || (echo "Homebrew tap clone is not audit-bound" >&2 && exit 2)
+
+          dmg_sha256="$(sha256sum "target/release/$RELEASE_DMG_FILENAME" | awk '{print $1}')"
+          [[ "$dmg_sha256" =~ ^[0-9a-f]{64}$ ]] || (echo "release DMG digest is invalid" >&2 && exit 2)
+          candidate="$RUNNER_TEMP/netdiag-twin.rb"
+          bash "$SOURCE_DIR/scripts/render_homebrew_cask.sh" \
+            "$RELEASE_VERSION" "$dmg_sha256" "$candidate"
+          [[ "$(sha256sum "$candidate" | awk '{print $1}')" == "$AUDITED_CASK_SHA256" ]] \
+            || (echo "fresh cask bytes do not match the audited cask" >&2 && exit 2)
+
+          git -C "$TAP_DIR" read-tree "$TAP_PARENT_SHA"
+          candidate_blob="$(git -C "$TAP_DIR" hash-object -w "$candidate")"
+          [[ "$candidate_blob" =~ ^[0-9a-f]{40}$ ]] || (echo "candidate cask blob is invalid" >&2 && exit 2)
+          git -C "$TAP_DIR" update-index --add \
+            --cacheinfo "100644,$candidate_blob,Casks/netdiag-twin.rb"
+          staged_blob="$(git -C "$TAP_DIR" rev-parse :Casks/netdiag-twin.rb)"
+          [[ "$staged_blob" == "$candidate_blob" ]] || (echo "staged cask bytes changed" >&2 && exit 2)
+          parent_tree="$(git -C "$TAP_DIR" rev-parse "$TAP_PARENT_SHA^{tree}")"
+          candidate_tree="$(git -C "$TAP_DIR" write-tree)"
+          git -C "$TAP_DIR" config user.name "NetDiag Twin Release"
+          git -C "$TAP_DIR" config user.email "release@netdiag-twin.invalid"
+          if [[ "$candidate_tree" == "$parent_tree" ]]; then
+            changed=0
+            expected_sha="$TAP_PARENT_SHA"
+          else
+            changed=1
+            expected_sha="$(
+              printf 'Release NetDiag Twin %s\n' "$RELEASE_TAG" \
+                | git -C "$TAP_DIR" commit-tree "$candidate_tree" -p "$TAP_PARENT_SHA"
+            )"
           fi
+          [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || (echo "prepared Homebrew commit is invalid" >&2 && exit 2)
+          {
+            printf 'changed=%s\n' "$changed"
+            printf 'expected_sha=%s\n' "$expected_sha"
+          } >> "$GITHUB_OUTPUT"
+      - name: Fast-forward the audited cask
+        if: steps.prepare.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$GH_TOKEN" ]] || (echo "missing required release-homebrew secret" >&2 && exit 2)
+          current_sha="$(git -C "$TAP_DIR" ls-remote --exit-code origin "refs/heads/$TAP_BRANCH" | awk 'NR == 1 {print $1}')"
+          [[ "$current_sha" == "$TAP_PARENT_SHA" ]] || (echo "Homebrew tap changed before push" >&2 && exit 2)
+          gh auth setup-git
+          git -C "$TAP_DIR" push origin \
+            "${{ steps.prepare.outputs.expected_sha }}:refs/heads/$TAP_BRANCH"
+      - name: Verify exact remote cask bytes without executing tap content
+        env:
+          EXPECTED_TAP_SHA: ${{ steps.prepare.outputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_TAP_SHA" =~ ^[0-9a-f]{40}$ ]] || (echo "expected Homebrew SHA is invalid" >&2 && exit 2)
+          tap_url="https://github.com/billlza/homebrew-netdiag-twin.git"
+          remote_sha="$(git ls-remote --exit-code "$tap_url" "refs/heads/$TAP_BRANCH" | awk 'NR == 1 {print $1}')"
+          [[ "$remote_sha" == "$EXPECTED_TAP_SHA" ]] || (echo "Homebrew remote SHA mismatch" >&2 && exit 2)
+          published="$RUNNER_TEMP/published-netdiag-twin.rb"
+          git -C "$TAP_DIR" show "$EXPECTED_TAP_SHA:Casks/netdiag-twin.rb" > "$published"
+          cmp -- "$RUNNER_TEMP/netdiag-twin.rb" "$published"

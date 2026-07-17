@@ -5,38 +5,95 @@ on:
     branches: ["main"]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  platform-security:
+    uses: ./.github/workflows/platform-security.yml
+
+  workflow-hygiene:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      ACTIONLINT_REVISION: "03d0035246f3e81f36aed592ffb4bebf33a03106" # v1.7.7
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
+      - name: Install Python quality dependencies
+        run: |
+          python3 -m venv --clear --copies .venv-jsonschema
+          .venv-jsonschema/bin/python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
+      - name: Validate shell and workflow contracts
+        run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+          go install "github.com/rhysd/actionlint/cmd/actionlint@$ACTIONLINT_REVISION"
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
+          python3 scripts/check_release_gate_hygiene.py
+          python3 scripts/check_docs_workflow_hygiene.py
+      - name: Install pinned ripgrep for runtime guards
+        run: |
+          set -euo pipefail
+          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"
+          scripts/install_pinned_ripgrep.sh "$ripgrep_root"
+          ripgrep_bin_dir="$ripgrep_root/bin"
+          printf '%s\n' "$ripgrep_bin_dir" >> "$GITHUB_PATH"
+      - name: Run Python quality guard tests
+        run: .venv-jsonschema/bin/python -W error::ResourceWarning scripts/test_quality_guards.py
+
   adapter-schema:
     runs-on: macos-14
+    timeout-minutes: 20
     env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/adapter-validator
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Silence Git default branch hint
         run: git config --global init.defaultBranch main
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
       - name: Install Python schema validator
         run: |
-          python3 -m venv .venv-jsonschema
-          .venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
+          python3 -m venv --clear --copies .venv-jsonschema
+          .venv-jsonschema/bin/python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
+      - name: Build Rust ingest validator
+        run: cargo build --locked --quiet -p netdiag-cli --bin netdiag-cli
       - name: Validate adapter samples through schema and Rust ingest
-        run: .venv-jsonschema/bin/python scripts/validate_adapter_samples.py
+        run: .venv-jsonschema/bin/python scripts/validate_adapter_samples.py --rust-validator "$CARGO_TARGET_DIR/debug/netdiag-cli"
       - name: Validate Generic Lab Kit adapter contract
-        run: .venv-jsonschema/bin/python scripts/validate_adapter_contract.py
+        run: .venv-jsonschema/bin/python scripts/validate_adapter_contract.py --rust-validator "$CARGO_TARGET_DIR/debug/netdiag-cli"
 
   rust:
     runs-on: macos-14
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Silence Git default branch hint
         run: git config --global init.defaultBranch main
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
       - name: Install Python schema validator
         run: |
-          python3 -m venv .venv-jsonschema
-          .venv-jsonschema/bin/python -m pip install 'jsonschema[format]==4.25.1'
+          python3 -m venv --clear --copies .venv-jsonschema
+          .venv-jsonschema/bin/python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
       - name: Install strict Rust quality tools
         env:
           CARGO_DENY_VERSION: "0.19.6"
@@ -44,26 +101,52 @@ jobs:
           CARGO_MACHETE_VERSION: "0.9.2"
           CARGO_NEXTEST_VERSION: "0.9.136"
         run: |
+          set -euo pipefail
           rustup component add llvm-tools-preview
-          cargo install cargo-binstall --locked --quiet
-          cargo binstall --locked -y --log-level error \
-            cargo-nextest@$CARGO_NEXTEST_VERSION \
-            cargo-llvm-cov@$CARGO_LLVM_COV_VERSION \
-            cargo-deny@$CARGO_DENY_VERSION \
-            cargo-machete@$CARGO_MACHETE_VERSION
+          cargo install cargo-nextest --version "$CARGO_NEXTEST_VERSION" --locked --quiet
+          cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --quiet
+          cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked --quiet
+          cargo install cargo-machete --version "$CARGO_MACHETE_VERSION" --locked --quiet
+      - name: Bind vendored patches to published source archives
+        run: |
+          mkdir -p target/upstream-crates
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output target/upstream-crates/argmin-0.11.0.crate \
+            https://static.crates.io/crates/argmin/argmin-0.11.0.crate
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output target/upstream-crates/wayland-scanner-0.31.10.crate \
+            https://static.crates.io/crates/wayland-scanner/wayland-scanner-0.31.10.crate
+          python3 scripts/check_patch_contract_hygiene.py --archive-dir target/upstream-crates
+      - name: Install pinned ripgrep for strict guards
+        run: |
+          set -euo pipefail
+          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"
+          scripts/install_pinned_ripgrep.sh "$ripgrep_root"
+          ripgrep_bin_dir="$ripgrep_root/bin"
+          printf '%s\n' "$ripgrep_bin_dir" >> "$GITHUB_PATH"
       - name: Strict Rust quality gate
+        id: strict_quality
         run: scripts/check_rust_quality.sh strict
       - name: Upload performance report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: perf-budget-report
           path: target/perf-budget-report.json
           if-no-files-found: ignore
-      - name: Upload benchmark report
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Upload successful benchmark report
+        if: ${{ always() && steps.strict_quality.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-report
-          path: target/benchmark-report
+          path: target/benchmark-reports
+          if-no-files-found: error
+      - name: Upload failed benchmark diagnostics
+        if: ${{ always() && steps.strict_quality.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-report-failure
+          path: |
+            target/pilot-smoke.*/benchmark-report
+            target/benchmark-reports/pilot-smoke.*
           if-no-files-found: ignore

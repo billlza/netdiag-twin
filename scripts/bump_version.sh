@@ -12,9 +12,9 @@ Updates the workspace version and versioned documentation references. Run the
 normal validation gates before tagging:
 
   cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets -- -D warnings
-  cargo test --workspace
-  RUSTFLAGS="-D warnings" cargo test --workspace
+  cargo clippy --locked --workspace --all-targets -- -D warnings
+  cargo test --locked --workspace
+  RUSTFLAGS="-D warnings" cargo test --locked --workspace
   scripts/check_perf_budget.sh
 EOF
 }
@@ -49,7 +49,7 @@ fi
 cd "$ROOT"
 
 if [[ "$ALLOW_DIRTY" != "1" ]]; then
-  if ! git diff --quiet -- . ':!Cargo.lock' || ! git diff --cached --quiet -- . ':!Cargo.lock'; then
+  if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
     echo "working tree has uncommitted changes; rerun with --allow-dirty while preparing a release branch" >&2
     exit 2
   fi
@@ -63,12 +63,19 @@ fi
 
 perl -0pi -e 's/(\[workspace\.package\][^\[]*?version = ")[^"]+(")/${1}'"$VERSION"'$2/s' Cargo.toml
 
-for file in README.md docs/getting-started.md .github/workflows/release.yml; do
+for file in \
+  README.md \
+  docs/getting-started.md \
+  docs/pilot-run-center.md \
+  docs/real-device-pilot-readiness.md \
+  docs/release-process.md \
+  .github/workflows/release.yml; do
   [[ -f "$file" ]] || continue
   perl -pi -e 's/v\Q'"$CURRENT"'\E/v'"$VERSION"'/g; s/\Q'"$CURRENT"'\E/'"$VERSION"'/g' "$file"
 done
 
 cargo check --workspace --quiet
+cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
 UPDATED="$(awk -F ' = ' '/^version =/ {gsub("\"", "", $2); print $2; exit}' Cargo.toml)"
 if [[ "$UPDATED" != "$VERSION" ]]; then

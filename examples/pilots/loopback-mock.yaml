@@ -4,6 +4,8 @@ name: Loopback mock pilot
 operator: local
 safety:
   allow_active: false
+  # Adapters are trusted executable code; endpoints must stay within this root.
+  adapter_execution_root: ../adapters
   retention_days: 7
 sources:
   - name: iperf3-sample
@@ -11,7 +13,10 @@ sources:
     endpoint: ../adapters/iperf3-http-json/adapter.py
     role: primary
     active: false
+    adapter:
+      mode: sample
     metadata:
+      adapter_contract: netdiag-adapter/v1
       stack: iperf3 + adapter sample
       purpose: CI-safe pilot smoke
 gates:

@@ -3,45 +3,78 @@ members = [
     "crates/netdiag-core",
     "crates/netdiag-cli",
     "crates/netdiag-app",
+    "crates/netdiag-platform",
+    "tools/patch-contracts/argmin",
+    "tools/patch-contracts/wayland-scanner",
+]
+exclude = [
+    "third_party/argmin-0.11.0",
+    "third_party/wayland-scanner-0.31.10",
 ]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.5.2"
+version = "0.5.3"
 rust-version = "1.95"
 
 [workspace.dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
+command-group = "5.0.1"
 csv = "1.4"
-eframe = "0.34.1"
+# Keep shared desktop features platform-neutral. Linux window backends are enabled
+# only by netdiag-app's Linux target dependency so Windows never compiles Unix APIs.
+eframe = { version = "0.34.1", default-features = false, features = ["accesskit", "default_fonts", "web_screen_reader", "wgpu"] }
 float-cmp = "0.10"
+getrandom = "0.4"
 insta = "1.47"
 linfa = { version = "0.8.1", features = ["serde"] }
 linfa-logistic = { version = "0.8.1", features = ["serde"] }
 muda = { version = "0.19.1", default-features = false }
 ndarray = { version = "0.16", features = ["serde"] }
-opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "metrics"] }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic", "metrics"] }
 pcap = "2.4.0"
 petgraph = "0.8.3"
+prost = "0.14.3"
 rand = { version = "0.10", features = ["std", "std_rng"] }
 rand_distr = "0.6"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
 rfd = "0.17.2"
+rustix = { version = "1.1", features = ["event", "fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.10"
+skrifa = "0.40"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tonic = "0.14.5"
+tower = { version = "0.5", features = ["limit"] }
 uuid = { version = "1.23", features = ["v4", "serde"] }
+winit = { version = "0.30.13", default-features = false, features = ["wayland-csd-adwaita-notitle", "wayland-dlopen"] }
+zeroize = "1.8"
 etherparse = "0.20.1"
 zip = { version = "6.0", default-features = false, features = ["deflate"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+# Remove each local patch after its documented upstream release is available.
+# Exact provenance, behavioral scope, and removal conditions live in the
+# corresponding third_party/*/PATCH.md file.
+[patch.crates-io]
+argmin = { path = "third_party/argmin-0.11.0" }
+wayland-scanner = { path = "third_party/wayland-scanner-0.31.10" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

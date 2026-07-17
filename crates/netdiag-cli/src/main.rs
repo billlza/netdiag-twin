@@ -1,11 +1,5 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use netdiag_core::connectors::{
-    HttpJsonConfig, NativePcapConfig, NativePcapSource, OtlpGrpcReceiverConfig,
-    PrometheusExpositionConfig, PrometheusQueryRangeConfig, SystemCountersConfig,
-    default_prometheus_mapping, load_http_json, load_native_pcap, load_otlp_grpc_receiver,
-    load_prometheus_exposition, load_prometheus_query_range, load_system_counters,
-};
 use netdiag_core::dataset::{
     DatasetManifestMetadata, DatasetRegisterOptions, DatasetValidationOptions, compare_datasets,
     inspect_dataset_jsonl, register_dataset_jsonl, split_dataset_jsonl, validate_dataset_jsonl,
@@ -13,37 +7,41 @@ use netdiag_core::dataset::{
 };
 use netdiag_core::diagnose_file;
 use netdiag_core::evidence_bundle::export_evidence_bundle;
+use netdiag_core::hil_review::review_recommendation;
 use netdiag_core::ingest::ingest_trace;
 use netdiag_core::lab::{
     ActionVerificationOptions, LabPreflightMode, LabPreflightOptions, LabRunOptions,
-    calibrate_lab_uncertainty, preflight_lab_scenario, run_lab_batch, run_lab_scenario,
-    summarize_lab_runs, validate_lab_run, verify_action_with_options,
+    calibrate_lab_uncertainty, preflight_lab_scenario_with_bearer_bindings,
+    run_lab_batch_with_bearer_bindings, run_lab_scenario_with_bearer_bindings, summarize_lab_runs,
+    validate_lab_run, verify_action_with_options,
 };
 use netdiag_core::ml::{
-    TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
+    MODEL_CURRENT_FILE_NAME, MODEL_MANIFEST_FILE_NAME, TrainingOptions,
+    export_feedback_training_dataset, load_existing_model_bundle_identity,
+    train_model_from_jsonl_with_options,
 };
 use netdiag_core::models::{
-    ConnectorHealthStatus, FaultLabel, HilState, RunHistoryFilter, TelemetrySummary,
+    ConnectorHealthStatus, FaultLabel, HilState, ModelManifest, RunHistoryFilter,
 };
 use netdiag_core::perf_budget::{
     build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
     run_perf_measurements_sampled, save_perf_budget,
 };
+use netdiag_core::reliability::write_text_atomic;
 use netdiag_core::storage::{
-    compare_runs, connector_health_from_ingest, list_run_history_filtered, read_json,
-    resolve_run_location, review_recommendation, run_artifacts, run_evidence, save_json,
-    write_connector_health,
+    compare_runs, list_run_history_filtered, read_report, resolve_run_location, run_artifacts,
+    run_evidence, save_json,
 };
 use netdiag_core::twin::{
-    TopologyFormat, calibrate_topology_from_runs, export_topology, import_policy_action,
-    import_topology, run_simulated_whatif, run_simulated_whatif_with_policy,
-    validate_policy_action_for_topology, validate_policy_action_shape, validate_topology_model,
+    calibrate_topology_from_runs, export_topology, validate_policy_action_for_topology,
+    validate_policy_action_shape, validate_topology_model,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::Duration;
 
 mod commands;
+use commands::bearer_bindings::CliBearerBindings;
+use commands::twin::{format_for_path, read_policy, read_topology, run_whatif, run_whatif_policy};
 
 #[derive(Debug, Parser)]
 #[command(name = "netdiag")]
@@ -61,7 +59,9 @@ enum Command {
         artifacts: PathBuf,
     },
     #[command(name = "validate-trace", hide = true)]
-    ValidateTrace { file: PathBuf },
+    ValidateTrace {
+        file: PathBuf,
+    },
     Whatif {
         run_id: String,
         topology: String,
@@ -166,38 +166,8 @@ enum Command {
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
     },
-    Collect {
-        #[arg(
-            long,
-            value_parser = [
-                "http-json",
-                "prometheus-query",
-                "prometheus-metrics",
-                "otlp-grpc",
-                "native-pcap",
-                "system-counters"
-            ]
-        )]
-        kind: String,
-        #[arg(long)]
-        endpoint: String,
-        #[arg(long, default_value_t = 8)]
-        timeout_secs: u64,
-        #[arg(long, default_value_t = 300)]
-        lookback_secs: i64,
-        #[arg(long, default_value_t = 15)]
-        step_secs: u64,
-        #[arg(long, default_value_t = 256)]
-        packet_limit: usize,
-        #[arg(long, default_value_t = 1)]
-        interval_secs: u64,
-        #[arg(long)]
-        mapping: Option<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        diagnose: bool,
-        #[arg(long, default_value = "artifacts")]
-        artifacts: PathBuf,
-    },
+    ArtifactRoot(commands::artifact_root::ArtifactRootArgs),
+    Collect(commands::collect::CollectCommand),
     Reliability {
         #[command(subcommand)]
         command: commands::reliability::ReliabilityCommand,
@@ -246,11 +216,15 @@ enum LabCommand {
         mode: CliLabPreflightMode,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+        #[command(flatten)]
+        bearer_bindings: CliBearerBindings,
     },
     Run {
         scenario: PathBuf,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+        #[command(flatten)]
+        bearer_bindings: CliBearerBindings,
     },
     Validate {
         run_id: String,
@@ -263,6 +237,8 @@ enum LabCommand {
         scenarios: Vec<PathBuf>,
         #[arg(long, default_value = "artifacts")]
         artifacts: PathBuf,
+        #[command(flatten)]
+        bearer_bindings: CliBearerBindings,
     },
     Summary {
         #[arg(long, default_value = "artifacts")]
@@ -324,9 +300,19 @@ enum DatasetCommand {
         stratified: bool,
         #[arg(long, default_value_t = 2026)]
         seed: u64,
-        #[arg(long, default_value_t = 0.2)]
+        #[arg(
+            long,
+            default_value_t = 0.2,
+            allow_hyphen_values = true,
+            value_parser = parse_dataset_split_ratio
+        )]
         validation_ratio: f64,
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(
+            long,
+            default_value_t = 0.0,
+            allow_hyphen_values = true,
+            value_parser = parse_dataset_split_ratio
+        )]
         test_ratio: f64,
     },
     Register {
@@ -352,6 +338,18 @@ enum DatasetCommand {
         left: PathBuf,
         right: PathBuf,
     },
+}
+
+fn parse_dataset_split_ratio(value: &str) -> std::result::Result<f64, String> {
+    let ratio = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid dataset split ratio {value:?}: {error}"))?;
+    if !ratio.is_finite() || !(0.0..1.0).contains(&ratio) {
+        return Err(format!(
+            "dataset split ratio must be finite and in [0, 1), got {value:?}"
+        ));
+    }
+    Ok(ratio)
 }
 
 #[derive(Debug, Subcommand)]
@@ -393,8 +391,10 @@ fn run(args: Args) -> anyhow::Result<()> {
             let ingest = ingest_trace(&file).with_context(|| {
                 format!("trace ingest validation failed for {}", file.display())
             })?;
-            let temp = tempfile::tempdir().context("failed to create validate-trace tempdir")?;
-            let pipeline = diagnose_file(&file, temp.path(), None).with_context(|| {
+            let temp = netdiag_platform::TrustedTempDirectory::create("netdiag-validate-trace-")
+                .context("failed to create validate-trace trusted temporary directory")?;
+            let pipeline_result = diagnose_file(&file, temp.path(), None);
+            let pipeline = temp.finish(pipeline_result).with_context(|| {
                 format!("trace pipeline validation failed for {}", file.display())
             })?;
             let ml_top = pipeline.report.rule_vs_ml.ml_top.clone();
@@ -499,13 +499,16 @@ fn run(args: Args) -> anyhow::Result<()> {
                 scenario,
                 mode,
                 artifacts,
+                bearer_bindings,
             } => {
-                let report = preflight_lab_scenario(
+                let bearer_bindings = bearer_bindings.build()?;
+                let report = preflight_lab_scenario_with_bearer_bindings(
                     &scenario,
                     LabPreflightOptions {
                         artifacts,
                         mode: mode.into(),
                     },
+                    &bearer_bindings,
                 )
                 .with_context(|| format!("lab preflight failed for {}", scenario.display()))?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -516,9 +519,15 @@ fn run(args: Args) -> anyhow::Result<()> {
             LabCommand::Run {
                 scenario,
                 artifacts,
+                bearer_bindings,
             } => {
-                let result = run_lab_scenario(&scenario, LabRunOptions { artifacts })
-                    .with_context(|| format!("lab run failed for {}", scenario.display()))?;
+                let bearer_bindings = bearer_bindings.build()?;
+                let result = run_lab_scenario_with_bearer_bindings(
+                    &scenario,
+                    LabRunOptions { artifacts },
+                    &bearer_bindings,
+                )
+                .with_context(|| format!("lab run failed for {}", scenario.display()))?;
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 if !result.acceptance.passed {
                     anyhow::bail!(
@@ -542,12 +551,18 @@ fn run(args: Args) -> anyhow::Result<()> {
             LabCommand::Batch {
                 scenarios,
                 artifacts,
+                bearer_bindings,
             } => {
                 if scenarios.is_empty() {
                     anyhow::bail!("lab batch requires at least one scenario");
                 }
-                let report = run_lab_batch(&scenarios, LabRunOptions { artifacts })
-                    .context("lab batch failed")?;
+                let bearer_bindings = bearer_bindings.build()?;
+                let report = run_lab_batch_with_bearer_bindings(
+                    &scenarios,
+                    LabRunOptions { artifacts },
+                    &bearer_bindings,
+                )
+                .context("lab batch failed")?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
                 if report.failed > 0 {
                     anyhow::bail!("lab batch failed for {} scenario(s)", report.failed);
@@ -705,10 +720,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&manifest)?);
         }
         Command::Export { run_id, artifacts } => {
-            let path = resolve_run_location(&artifacts, &run_id)?
-                .run_dir
-                .join("report.json");
-            let report = read_json(path)?;
+            let report = read_report(&artifacts, &run_id)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::History {
@@ -766,20 +778,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             .with_context(|| format!("training failed for {}", dataset.display()))?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "trained",
-                    "dataset": dataset,
-                    "model_dir": model_dir,
-                    "model_file": manifest.model_file,
-                    "manifest_file": "model_manifest.json",
-                    "labels": manifest.labels,
-                    "training_examples": manifest.training_examples,
-                    "dataset_hash_sha256": manifest.dataset_hash_sha256,
-                    "training_config": manifest.training_config,
-                    "training_gate": manifest.training_gate,
-                    "evaluation": manifest.evaluation,
-                    "uncertainty_thresholds": manifest.uncertainty_thresholds,
-                }))?
+                serde_json::to_string_pretty(&training_output(&dataset, &model_dir, manifest)?)?
             );
         }
         Command::Feedback { command } => match command {
@@ -830,82 +829,8 @@ fn run(args: Args) -> anyhow::Result<()> {
                 }))?
             );
         }
-        Command::Collect {
-            kind,
-            endpoint,
-            timeout_secs,
-            lookback_secs,
-            step_secs,
-            packet_limit,
-            interval_secs,
-            mapping,
-            diagnose,
-            artifacts,
-        } => {
-            let mapping = load_mapping(mapping)?;
-            let token = std::env::var("NETDIAG_API_TOKEN").ok();
-            let loaded = match kind.as_str() {
-                "http-json" => load_http_json(&HttpJsonConfig {
-                    endpoint,
-                    bearer_token: token,
-                    timeout: Duration::from_secs(timeout_secs),
-                })?,
-                "prometheus-query" => load_prometheus_query_range(&PrometheusQueryRangeConfig {
-                    base_url: endpoint,
-                    bearer_token: token,
-                    timeout: Duration::from_secs(timeout_secs),
-                    lookback_seconds: lookback_secs,
-                    step_seconds: step_secs,
-                    queries: mapping,
-                    sample: "cli_prometheus_query".to_string(),
-                })?,
-                "prometheus-metrics" => load_prometheus_exposition(&PrometheusExpositionConfig {
-                    endpoint,
-                    bearer_token: token,
-                    timeout: Duration::from_secs(timeout_secs),
-                    metrics: mapping,
-                    sample: "cli_prometheus_metrics".to_string(),
-                })?,
-                "otlp-grpc" => load_otlp_grpc_receiver(&OtlpGrpcReceiverConfig {
-                    bind_addr: endpoint,
-                    timeout: Duration::from_secs(timeout_secs),
-                    metrics: mapping,
-                    sample: "cli_otlp_grpc".to_string(),
-                })?,
-                "native-pcap" => load_native_pcap(&NativePcapConfig {
-                    source: native_pcap_source(&endpoint),
-                    timeout: Duration::from_secs(timeout_secs),
-                    packet_limit,
-                    sample: "cli_native_pcap".to_string(),
-                })?,
-                "system-counters" => load_system_counters(&SystemCountersConfig {
-                    interface: (!endpoint.trim().is_empty() && endpoint.trim() != "all")
-                        .then(|| endpoint.trim().to_string()),
-                    interval: Duration::from_secs(interval_secs.clamp(1, 10)),
-                    sample: "cli_system_counters".to_string(),
-                })?,
-                _ => unreachable!("clap restricts connector kind"),
-            };
-            let health = connector_health_from_ingest(&kind, &kind, &loaded.sample, &loaded.ingest);
-            if diagnose {
-                let mut result = netdiag_core::diagnose_ingest(
-                    loaded.ingest,
-                    &artifacts,
-                    Some(("line", "reroute_path_b")),
-                )?;
-                write_connector_health(&artifacts, &result.run_id, &health)?;
-                result.connector_health = health;
-                println!("{}", serde_json::to_string_pretty(&result.report)?);
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "health": health,
-                        "provenance": loaded.provenance,
-                    }))?
-                );
-            }
-        }
+        Command::ArtifactRoot(command) => commands::artifact_root::run(command)?,
+        Command::Collect(command) => commands::collect::run(command)?,
         Command::Reliability { command } => commands::reliability::run(command)?,
         Command::Benchmark { command } => commands::benchmark::run(command)?,
         Command::Pilot { command } => commands::pilot::run(command)?,
@@ -921,14 +846,14 @@ fn run(args: Args) -> anyhow::Result<()> {
             let measurements = run_perf_measurements_sampled(&artifacts, samples)
                 .with_context(|| format!("performance run failed in {}", artifacts.display()))?;
             if update_baseline {
-                let budget = build_perf_budget(&measurements, threshold_percent, baseline_scale);
+                let budget = build_perf_budget(&measurements, threshold_percent, baseline_scale)?;
                 save_perf_budget(&baseline, &budget).with_context(|| {
                     format!(
                         "failed to write performance baseline {}",
                         baseline.display()
                     )
                 })?;
-                let report = compare_perf_budget(measurements, &budget, threshold_percent);
+                let report = compare_perf_budget(measurements, &budget, threshold_percent)?;
                 ensure_budget_has_measurements(&report)?;
                 if let Some(output) = output {
                     save_json(&output, &report).with_context(|| {
@@ -940,7 +865,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                 let budget = load_perf_budget(&baseline).with_context(|| {
                     format!("failed to read performance baseline {}", baseline.display())
                 })?;
-                let report = compare_perf_budget(measurements, &budget, threshold_percent);
+                let report = compare_perf_budget(measurements, &budget, threshold_percent)?;
                 ensure_budget_has_measurements(&report)?;
                 if let Some(output) = output {
                     save_json(&output, &report).with_context(|| {
@@ -960,17 +885,31 @@ fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn native_pcap_source(endpoint: &str) -> NativePcapSource {
-    let trimmed = endpoint.trim();
-    if let Some(interface) = trimmed.strip_prefix("iface:") {
-        return NativePcapSource::Interface(interface.trim().to_string());
-    }
-    let path = PathBuf::from(trimmed);
-    if path.is_file() {
-        NativePcapSource::File(path)
-    } else {
-        NativePcapSource::Interface(trimmed.to_string())
-    }
+fn training_output(
+    dataset: &Path,
+    model_dir: &Path,
+    manifest: ModelManifest,
+) -> anyhow::Result<serde_json::Value> {
+    let identity = load_existing_model_bundle_identity(model_dir)
+        .context("trained model generation could not be revalidated")?;
+    Ok(serde_json::json!({
+        "status": "trained",
+        "dataset": dataset,
+        "model_dir": model_dir,
+        "model_file": manifest.model_file,
+        "manifest_file": MODEL_MANIFEST_FILE_NAME,
+        "current_descriptor": MODEL_CURRENT_FILE_NAME,
+        "generation": identity.generation,
+        "model_file_hash_sha256": identity.model_file_hash_sha256,
+        "model_manifest_hash_sha256": identity.model_manifest_hash_sha256,
+        "labels": manifest.labels,
+        "training_examples": manifest.training_examples,
+        "dataset_hash_sha256": manifest.dataset_hash_sha256,
+        "training_config": manifest.training_config,
+        "training_gate": manifest.training_gate,
+        "evaluation": manifest.evaluation,
+        "uncertainty_thresholds": manifest.uncertainty_thresholds,
+    }))
 }
 
 fn parse_quality_filter(value: Option<&str>) -> anyhow::Result<Option<ConnectorHealthStatus>> {
@@ -982,100 +921,6 @@ fn parse_quality_filter(value: Option<&str>) -> anyhow::Result<Option<ConnectorH
         .transpose()
 }
 
-fn run_whatif(
-    run_id: &str,
-    topology: &str,
-    action: &str,
-    artifacts: PathBuf,
-) -> anyhow::Result<()> {
-    let dir = resolve_run_location(&artifacts, run_id)?.run_dir;
-    let summary_path = dir.join("telemetry_summary.json");
-    let summary_value = read_json(summary_path)?;
-    let summary: TelemetrySummary = serde_json::from_value(summary_value)?;
-    let whatif = run_simulated_whatif(&summary.overall, topology, action)?;
-    let saved = save_json(dir.join(format!("whatif_{}.json", action)), &whatif)?;
-    println!("{}", serde_json::to_string_pretty(&whatif)?);
-    eprintln!("saved {}", saved.display());
-    Ok(())
-}
-
-fn run_whatif_policy(
-    run_id: &str,
-    topology: &std::path::Path,
-    policy: &std::path::Path,
-    artifacts: PathBuf,
-) -> anyhow::Result<()> {
-    let dir = resolve_run_location(&artifacts, run_id)?.run_dir;
-    let summary_path = dir.join("telemetry_summary.json");
-    let summary_value = read_json(summary_path)?;
-    let summary: TelemetrySummary = serde_json::from_value(summary_value)?;
-    let topology = read_topology(topology)?;
-    let policy = read_policy(policy)?;
-    validate_policy_action_for_topology(&policy, &topology)?;
-    let whatif = run_simulated_whatif_with_policy(&summary.overall, &topology, &policy)?;
-    let saved = save_json(dir.join(format!("whatif_{}.json", policy.id)), &whatif)?;
-    println!("{}", serde_json::to_string_pretty(&whatif)?);
-    eprintln!("saved {}", saved.display());
-    Ok(())
-}
-
-fn read_topology(path: &std::path::Path) -> anyhow::Result<netdiag_core::models::TopologyModel> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read topology {}", path.display()))?;
-    import_topology(&raw, format_for_path(path)).map_err(Into::into)
-}
-
-fn read_policy(path: &std::path::Path) -> anyhow::Result<netdiag_core::models::TwinPolicyAction> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read policy {}", path.display()))?;
-    import_policy_action(&raw, format_for_path(path)).map_err(Into::into)
-}
-
-fn format_for_path(path: &std::path::Path) -> TopologyFormat {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "yaml" | "yml" => TopologyFormat::Yaml,
-        _ => TopologyFormat::Json,
-    }
-}
-
-fn write_text_atomic(path: &std::path::Path, contents: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let tmp = path.with_extension(format!(
-        "{}tmp",
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(|ext| format!("{ext}."))
-            .unwrap_or_default()
-    ));
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to move {} to {}", tmp.display(), path.display()))?;
-    Ok(())
-}
-
-fn load_mapping(
-    path: Option<PathBuf>,
-) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-    if let Some(path) = path {
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read mapping file: {}", path.display()))?;
-        Ok(serde_json::from_str(&raw)
-            .with_context(|| format!("mapping file is not valid JSON: {}", path.display()))?)
-    } else {
-        Ok(default_prometheus_mapping())
-    }
-}
-
 #[cfg(test)]
 mod main_tests;
 
@@ -1083,8 +928,10 @@ mod main_tests;
 mod tests {
     use super::*;
     use netdiag_core::ingest::ingest_trace;
-    use netdiag_core::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, train_model_from_jsonl};
-    use netdiag_core::models::{HilState, ModelManifest};
+    use netdiag_core::ml::{
+        MODEL_CURRENT_FILE_NAME, load_existing_model_bundle_identity, train_model_from_jsonl,
+    };
+    use netdiag_core::models::HilState;
     use netdiag_core::storage::list_run_history;
     use std::fs;
     use std::io::Write;
@@ -1106,7 +953,7 @@ mod tests {
     }
 
     fn provision_test_model(artifacts: &std::path::Path) {
-        fs::create_dir_all(artifacts).expect("artifacts dir");
+        netdiag_core::storage::ensure_artifact_root_owned(artifacts).expect("owned artifacts dir");
         let dataset_path = artifacts.join("training.jsonl");
         let mut dataset = fs::File::create(&dataset_path).expect("create dataset");
         for name in [
@@ -1166,11 +1013,10 @@ mod tests {
         ]);
         run(args).expect("train command");
 
-        assert!(model_dir.join(MODEL_FILE_NAME).exists());
-        let manifest: ModelManifest = serde_json::from_slice(
-            &fs::read(model_dir.join(MODEL_MANIFEST_FILE_NAME)).expect("manifest"),
-        )
-        .expect("manifest json");
+        assert!(model_dir.join(MODEL_CURRENT_FILE_NAME).exists());
+        let manifest = load_existing_model_bundle_identity(&model_dir)
+            .expect("model identity")
+            .manifest;
         assert!(!manifest.synthetic_fallback);
         assert_eq!(manifest.training_examples, 6);
         assert!(manifest.dataset_hash_sha256.is_some());
@@ -1306,13 +1152,20 @@ mod tests {
     #[test]
     fn topology_calibrate_command_writes_calibrated_topology() {
         let temp = tempfile::tempdir().expect("tempdir");
-        diagnose_file(
-            sample("normal"),
-            temp.path(),
-            Some(("line", "reroute_path_b")),
-        )
-        .expect("diagnose");
+        let runs = temp.path().join("runs");
+        diagnose_file(sample("normal"), &runs, Some(("line", "reroute_path_b"))).expect("diagnose");
         let output = temp.path().join("calibrated-ring.yaml");
+        #[cfg(unix)]
+        let (victim, legacy_temp) = {
+            use std::os::unix::fs::symlink;
+
+            let victim = temp.path().join("victim.txt");
+            fs::write(&victim, "preserve me").expect("victim fixture");
+            symlink(&victim, &output).expect("output symlink fixture");
+            let legacy_temp = output.with_extension("yaml.tmp");
+            symlink(&victim, &legacy_temp).expect("legacy temp symlink fixture");
+            (victim, legacy_temp)
+        };
         let args = Args::parse_from([
             "netdiag",
             "topology",
@@ -1320,7 +1173,7 @@ mod tests {
             "--topology",
             path_str(&repo_file("examples/topologies/ring.yaml")),
             "--runs",
-            path_str(temp.path()),
+            path_str(&runs),
             "--output",
             path_str(&output),
         ]);
@@ -1330,6 +1183,25 @@ mod tests {
         assert!(output.exists());
         let calibrated = read_topology(&output).expect("read calibrated topology");
         assert!(calibrated.metadata.contains_key("calibrated_run_count"));
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::read_to_string(victim).expect("victim remains readable"),
+                "preserve me"
+            );
+            assert!(
+                fs::symlink_metadata(legacy_temp)
+                    .expect("legacy temp symlink remains")
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(
+                fs::symlink_metadata(output)
+                    .expect("published output metadata")
+                    .file_type()
+                    .is_file()
+            );
+        }
     }
 
     #[test]
@@ -1380,13 +1252,14 @@ mod tests {
         assert!(output_dir.join("feedback-train.jsonl").exists());
         assert!(output_dir.join("feedback-validation.jsonl").exists());
 
+        let artifacts = temp.path().join("artifacts");
         let register_args = Args::parse_from([
             "netdiag",
             "dataset",
             "register",
             path_str(&dataset_path),
             "--artifacts",
-            path_str(temp.path()),
+            path_str(&artifacts),
             "--dataset-id",
             "feedback-test",
             "--source-run",
@@ -1398,7 +1271,7 @@ mod tests {
         ]);
         run(register_args).expect("dataset register");
 
-        let registered_manifest = fs::read_dir(temp.path().join("datasets/feedback-test"))
+        let registered_manifest = fs::read_dir(artifacts.join("datasets/feedback-test"))
             .expect("registered dataset dir")
             .map(|entry| entry.expect("entry").path())
             .find(|path| {

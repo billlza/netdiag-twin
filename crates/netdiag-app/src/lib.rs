@@ -1,3 +1,5 @@
+pub mod connector_auth;
+pub mod credential_lifecycle;
 pub mod data_source;
 pub mod layout;
 pub mod secrets;

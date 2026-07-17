@@ -1,16 +1,22 @@
 use super::calibration::{CalibrationGateOptions, calibration_gates};
 use super::*;
-use crate::benchmark::{BenchmarkCheck, BenchmarkEnvironment, BenchmarkReport, BenchmarkSection};
+use crate::benchmark::{
+    BENCHMARK_SCHEMA, BenchmarkCheck, BenchmarkEnvironment, BenchmarkReport, BenchmarkSection,
+};
 use crate::lab::{
     LabCalibrationDistribution, LabCalibrationHotspot, LabCalibrationLabelStats,
     LabCalibrationOodStats, LabCalibrationReport,
 };
-use crate::ml::{TrainingOptions, train_model_from_jsonl_with_options};
-use crate::models::{
-    ConnectorHealthStatus, FaultLabel, LabelMetrics, ModelEvaluation, ModelTrainingGate,
-    ModelUncertaintyThresholds,
+use crate::ml::{
+    MODEL_FILE_NAME, MODEL_MANIFEST_SCHEMA, MODEL_PROMOTION_GATE_FILE_NAME, TrainingOptions,
+    load_existing_model_bundle_snapshot, rebuild_synthetic_model_bundle,
+    replace_model_manifest_if_current, train_model_from_jsonl_with_options,
 };
-use crate::storage::{read_json, save_json_atomic};
+use crate::models::{
+    ConnectorHealthStatus, FaultLabel, LabelMetrics, ModelEvaluation, ModelManifest,
+    ModelTrainingGate, ModelUncertaintyThresholds,
+};
+use crate::storage::save_json_atomic;
 use chrono::Duration;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,7 +33,7 @@ fn manifest() -> ModelManifest {
         .collect::<BTreeMap<_, _>>();
     let rows = FaultLabel::ALL.len() * 2;
     ModelManifest {
-        schema_version: "netdiag-model/v1".to_string(),
+        schema_version: MODEL_MANIFEST_SCHEMA.to_string(),
         model_name: "test".to_string(),
         model_kind: "rust-logistic".to_string(),
         created_at: Utc::now(),
@@ -36,6 +42,7 @@ fn manifest() -> ModelManifest {
         dataset_id: None,
         dataset_manifest_hash_sha256: None,
         model_file: MODEL_FILE_NAME.to_string(),
+        model_file_hash_sha256: "a".repeat(64),
         feature_names: vec!["latency_mean".to_string()],
         labels,
         training_examples: rows,
@@ -116,10 +123,11 @@ fn calibration_report() -> LabCalibrationReport {
         })
         .collect::<BTreeMap<_, _>>();
     LabCalibrationReport {
-        schema: "netdiag-lab-calibration/v1".to_string(),
+        schema: "netdiag-lab-calibration/v2".to_string(),
         generated_at: Utc::now(),
         artifact_root: "artifacts".to_string(),
         model_manifest_path: "artifacts/model/model_manifest.json".to_string(),
+        source_model_manifest_hash_sha256: "a".repeat(64),
         model_manifest_hash_sha256: Some("manifest-hash".to_string()),
         model_file_hash_sha256: Some("model-hash".to_string()),
         dataset_hash_sha256: Some("hash".to_string()),
@@ -174,6 +182,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn provision_test_model(artifacts: &Path) {
+    crate::storage::ensure_artifact_root_owned(artifacts).expect("owned artifacts dir");
     train_model_from_jsonl_with_options(
         repo_root().join("examples/datasets/pilot-smoke-training.jsonl"),
         artifacts.join("model"),
@@ -190,22 +199,31 @@ fn write_passing_benchmark(path: &Path) {
     save_json_atomic(path, &report).expect("benchmark report");
 }
 
+fn write_passing_benchmark_for_model(path: &Path, model_dir: &Path) {
+    let mut report = benchmark_report(vec![ood_section(ConnectorHealthStatus::Ok)], true);
+    let snapshot = load_existing_model_bundle_snapshot(model_dir).expect("model snapshot");
+    report.candidate_model_manifest_hash_sha256 = Some(snapshot.model_manifest_hash_sha256);
+    report.candidate_model_file_hash_sha256 = Some(snapshot.model_file_hash_sha256);
+    report.candidate_dataset_hash_sha256 = snapshot.manifest.dataset_hash_sha256;
+    save_json_atomic(path, &report).expect("benchmark report");
+}
+
 fn write_passing_calibration(artifacts: &Path) -> PathBuf {
     let model_dir = artifacts.join("model");
-    let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
-    let mut manifest: ModelManifest =
-        serde_json::from_value(read_json(&manifest_path).expect("manifest"))
-            .expect("manifest json");
+    let source = load_existing_model_bundle_snapshot(&model_dir).expect("source model snapshot");
+    let mut manifest = source.manifest.clone();
     let thresholds = ModelUncertaintyThresholds::default();
     manifest.uncertainty_thresholds = Some(thresholds.clone());
-    save_json_atomic(&manifest_path, &manifest).expect("manifest thresholds");
+    replace_model_manifest_if_current(&model_dir, &source.model_manifest_hash_sha256, &manifest)
+        .expect("manifest thresholds");
+    let current = load_existing_model_bundle_snapshot(&model_dir).expect("calibrated snapshot");
 
     let mut report = calibration_report();
     report.artifact_root = artifacts.display().to_string();
-    report.model_manifest_path = manifest_path.display().to_string();
-    report.model_manifest_hash_sha256 = Some(sha256_file(&manifest_path).expect("manifest hash"));
-    report.model_file_hash_sha256 =
-        Some(sha256_file(&model_dir.join(MODEL_FILE_NAME)).expect("model hash"));
+    report.model_manifest_path = current.manifest_path.display().to_string();
+    report.source_model_manifest_hash_sha256 = source.model_manifest_hash_sha256;
+    report.model_manifest_hash_sha256 = Some(current.model_manifest_hash_sha256);
+    report.model_file_hash_sha256 = Some(current.model_file_hash_sha256);
     report.dataset_hash_sha256 = manifest.dataset_hash_sha256.clone();
     report.calibrated_thresholds = thresholds;
     let calibration_path = artifacts.join("lab_calibration_report.json");
@@ -221,6 +239,9 @@ fn benchmark_report(sections: Vec<BenchmarkSection>, passed: bool) -> BenchmarkR
         passed,
         artifacts: "test".to_string(),
         output: "test".to_string(),
+        candidate_model_manifest_hash_sha256: None,
+        candidate_model_file_hash_sha256: None,
+        candidate_dataset_hash_sha256: None,
         environment: BenchmarkEnvironment {
             os: "test".to_string(),
             arch: "test".to_string(),
@@ -404,6 +425,15 @@ fn ood_coverage_gate_rejects_ood_failures() {
 }
 
 #[test]
+fn ood_coverage_gate_rejects_degraded_ood_checks() {
+    let report = benchmark_report(vec![ood_section(ConnectorHealthStatus::Degraded)], false);
+    let gate = ood_coverage_gate(&report);
+
+    assert!(!gate.passed);
+    assert!(gate.message.contains("ood-cpu-saturation"));
+}
+
+#[test]
 fn ood_coverage_gate_passes_explicit_ood_examples() {
     let report = benchmark_report(vec![ood_section(ConnectorHealthStatus::Ok)], true);
     let gate = ood_coverage_gate(&report);
@@ -436,6 +466,31 @@ fn calibration_gates_require_artifact_and_model_match() {
     let model_match = gate_by_name(&mismatch, "calibration_model_match");
     assert!(!model_match.passed);
     assert!(model_match.message.contains("manifest hash mismatch"));
+}
+
+#[test]
+fn calibration_gates_reject_v1_or_missing_source_identity() {
+    let mut report = calibration_report();
+    report.schema = "netdiag-lab-calibration/v1".to_string();
+    let gates = calibration_gates(
+        Ok(&report),
+        &calibrated_manifest(),
+        &calibration_options(),
+        Some("manifest-hash"),
+        Some("model-hash"),
+    );
+    assert!(!gate_by_name(&gates, "calibration_schema").passed);
+
+    report.schema = "netdiag-lab-calibration/v2".to_string();
+    report.source_model_manifest_hash_sha256.clear();
+    let gates = calibration_gates(
+        Ok(&report),
+        &calibrated_manifest(),
+        &calibration_options(),
+        Some("manifest-hash"),
+        Some("model-hash"),
+    );
+    assert!(!gate_by_name(&gates, "calibration_schema").passed);
 }
 
 #[test]
@@ -552,84 +607,4 @@ fn calibration_gates_require_known_label_and_ood_coverage() {
     assert!(coverage.message.contains("expected OOD runs"));
 }
 
-#[test]
-fn model_promotion_options_reject_invalid_thresholds() {
-    let result = evaluate_model_promotion(ModelPromotionOptions {
-        model_dir: "missing/model".into(),
-        benchmark_report: "missing/benchmark.json".into(),
-        calibration_report: "missing/calibration.json".into(),
-        min_rows_per_label: 1,
-        min_accuracy: f64::NAN,
-        min_macro_f1: 0.9,
-        allow_missing_evaluation: true,
-        max_ood_false_positive_rate: 0.05,
-        max_ood_false_negative_rate: 0.05,
-        max_rule_ml_disagreement_hotspot_rate: 0.10,
-        max_calibration_age_days: 30,
-        min_expected_ood_runs: 1,
-    });
-
-    let message = result.expect_err("invalid threshold").to_string();
-    assert!(message.contains("min_accuracy"));
-}
-
-#[test]
-fn model_promotion_gate_requires_evaluation_unless_explicitly_allowed() {
-    let temp = tempdir().expect("tempdir");
-    let artifacts = temp.path().join("artifacts");
-    provision_test_model(&artifacts);
-    let benchmark_report = temp.path().join("benchmark_report.json");
-    write_passing_benchmark(&benchmark_report);
-    let calibration_report = write_passing_calibration(&artifacts);
-
-    let strict = evaluate_model_promotion(ModelPromotionOptions {
-        model_dir: artifacts.join("model"),
-        benchmark_report: benchmark_report.clone(),
-        calibration_report: calibration_report.clone(),
-        min_rows_per_label: 1,
-        min_accuracy: 0.9,
-        min_macro_f1: 0.9,
-        allow_missing_evaluation: false,
-        max_ood_false_positive_rate: 0.05,
-        max_ood_false_negative_rate: 0.05,
-        max_rule_ml_disagreement_hotspot_rate: 0.10,
-        max_calibration_age_days: 30,
-        min_expected_ood_runs: 1,
-    })
-    .expect("strict gate");
-    assert!(!strict.passed);
-    assert!(
-        strict
-            .gates
-            .iter()
-            .any(|gate| gate.name == "evaluation_present" && !gate.passed)
-    );
-
-    let allowed = evaluate_model_promotion(ModelPromotionOptions {
-        model_dir: artifacts.join("model"),
-        benchmark_report,
-        calibration_report,
-        min_rows_per_label: 1,
-        min_accuracy: 0.9,
-        min_macro_f1: 0.9,
-        allow_missing_evaluation: true,
-        max_ood_false_positive_rate: 0.05,
-        max_ood_false_negative_rate: 0.05,
-        max_rule_ml_disagreement_hotspot_rate: 0.10,
-        max_calibration_age_days: 30,
-        min_expected_ood_runs: 1,
-    })
-    .expect("allowed gate");
-    assert!(allowed.passed);
-}
-
-#[test]
-fn default_promotion_thresholds_are_release_grade() {
-    assert_eq!(default_min_accuracy(), 0.90);
-    assert_eq!(default_min_macro_f1(), 0.90);
-    assert_eq!(default_max_ood_false_positive_rate(), 0.05);
-    assert_eq!(default_max_ood_false_negative_rate(), 0.05);
-    assert_eq!(default_max_rule_ml_disagreement_hotspot_rate(), 0.10);
-    assert_eq!(default_max_calibration_age_days(), 30);
-    assert_eq!(default_min_expected_ood_runs(), 1);
-}
+mod model_promotion;

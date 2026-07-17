@@ -1,19 +1,20 @@
 use netdiag_core::perf_budget::run_perf_measurements;
+use netdiag_platform::TrustedTempDirectory;
+use std::error::Error;
 use std::path::PathBuf;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args_os().any(|arg| arg == "--list") {
-        return;
+        return Ok(());
     }
-    let artifact_root = std::env::var_os("NETDIAG_PERF_ARTIFACTS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/perf-bench-artifacts")
-        });
-    let measurements =
-        run_perf_measurements(&artifact_root).expect("NetDiag performance measurements");
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&measurements).expect("serialize performance measurements")
-    );
+    let measurements = match std::env::var_os("NETDIAG_PERF_ARTIFACTS") {
+        Some(path) => run_perf_measurements(PathBuf::from(path))?,
+        None => {
+            let workspace = TrustedTempDirectory::create("netdiag-perf-bench-")?;
+            let operation = run_perf_measurements(workspace.path());
+            workspace.finish(operation)?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&measurements)?);
+    Ok(())
 }

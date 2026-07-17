@@ -1,22 +1,24 @@
-use crate::benchmark::BenchmarkReport;
-use crate::error::{IoContext, NetdiagError, Result};
-use crate::lab::LabCalibrationReport;
-use crate::ml::{MODEL_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model};
-use crate::models::ModelManifest;
-use crate::storage::{read_json, save_json_atomic};
+use crate::error::{NetdiagError, Result};
+use crate::ml::ModelBundleSnapshot;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+mod benchmark_identity;
 mod calibration;
 mod gates;
+mod input;
+mod model_state;
+mod snapshot;
+use benchmark_identity::benchmark_model_match_gate;
 use calibration::{CalibrationGateOptions, calibration_gates};
 use gates::{evaluation_gates, known_label_coverage_gate, ood_coverage_gate, training_gate};
+use input::{read_benchmark_report, read_calibration_report};
+use model_state::load_promotion_snapshot;
+use snapshot::persist_if_current;
 
 const MODEL_PROMOTION_GATE_SCHEMA: &str = "netdiag-model-promotion-gate/v1";
+const MAX_CALIBRATION_AGE_DAYS: u64 = 3_650;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPromotionOptions {
@@ -81,34 +83,35 @@ pub fn evaluate_model_promotion(options: ModelPromotionOptions) -> Result<ModelP
         "max_rule_ml_disagreement_hotspot_rate",
         options.max_rule_ml_disagreement_hotspot_rate,
     )?;
-    if options.max_calibration_age_days == 0 {
-        return Err(NetdiagError::InvalidTrace(
-            "max_calibration_age_days must be at least 1".to_string(),
-        ));
+    if !(1..=MAX_CALIBRATION_AGE_DAYS).contains(&options.max_calibration_age_days) {
+        return Err(NetdiagError::InvalidTrace(format!(
+            "max_calibration_age_days must be between 1 and {MAX_CALIBRATION_AGE_DAYS}"
+        )));
     }
 
+    let snapshot = load_promotion_snapshot(&options.model_dir)?;
+    evaluate_model_promotion_snapshot(options, snapshot)
+}
+
+fn evaluate_model_promotion_snapshot(
+    options: ModelPromotionOptions,
+    snapshot: ModelBundleSnapshot,
+) -> Result<ModelPromotionReport> {
     let model_dir = options.model_dir;
     let benchmark_report = options.benchmark_report;
     let calibration_report = options.calibration_report;
-    let manifest_path = model_dir.join(MODEL_MANIFEST_FILE_NAME);
-    let model_path = model_dir.join(MODEL_FILE_NAME);
-    let manifest: ModelManifest = serde_json::from_value(read_json(&manifest_path)?)?;
-    let benchmark: BenchmarkReport = serde_json::from_value(read_json(&benchmark_report)?)?;
+    let manifest = snapshot.manifest.clone();
+    let benchmark = read_benchmark_report(&benchmark_report)?;
     let calibration = read_calibration_report(&calibration_report);
-    let model_manifest_hash_sha256 = manifest_path
-        .is_file()
-        .then(|| sha256_file(&manifest_path))
-        .transpose()?;
-    let model_file_hash_sha256 = model_path
-        .is_file()
-        .then(|| sha256_file(&model_path))
-        .transpose()?;
+    let model_manifest_hash_sha256 = Some(snapshot.model_manifest_hash_sha256.clone());
+    let model_file_hash_sha256 = Some(snapshot.model_file_hash_sha256.clone());
 
     let mut gates = Vec::new();
-    gates.push(match load_existing_model(&model_dir) {
-        Ok(_) => gate("model_load", true, "model bundle loads successfully"),
-        Err(err) => gate("model_load", false, err.to_string()),
-    });
+    gates.push(gate(
+        "model_load",
+        true,
+        "immutable model bundle snapshot loaded successfully",
+    ));
     gates.push(gate(
         "synthetic_fallback",
         !manifest.synthetic_fallback,
@@ -139,6 +142,12 @@ pub fn evaluate_model_promotion(options: ModelPromotionOptions) -> Result<ModelP
         options.allow_missing_evaluation,
     ));
     gates.push(ood_coverage_gate(&benchmark));
+    gates.push(benchmark_model_match_gate(
+        &benchmark,
+        &manifest,
+        model_manifest_hash_sha256.as_deref(),
+        model_file_hash_sha256.as_deref(),
+    ));
     gates.extend(calibration_gates(
         calibration.as_ref().map_err(String::as_str),
         &manifest,
@@ -174,13 +183,8 @@ pub fn evaluate_model_promotion(options: ModelPromotionOptions) -> Result<ModelP
         model_file_hash_sha256,
         gates,
     };
-    save_json_atomic(model_dir.join("model_promotion_gate.json"), &report)?;
+    persist_if_current(&model_dir, &snapshot, &report)?;
     Ok(report)
-}
-
-fn read_calibration_report(path: &Path) -> std::result::Result<LabCalibrationReport, String> {
-    let value = read_json(path).map_err(|err| err.to_string())?;
-    serde_json::from_value::<LabCalibrationReport>(value).map_err(|err| err.to_string())
 }
 
 pub(super) fn gate(
@@ -193,20 +197,6 @@ pub(super) fn gate(
         passed,
         message: message.into(),
     }
-}
-
-fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_path(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = file.read(&mut buffer).with_path(path)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_rate_threshold(name: &str, value: f64) -> Result<()> {

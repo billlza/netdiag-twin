@@ -5,19 +5,23 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 chrono.workspace = true
+command-group.workspace = true
 csv.workspace = true
 linfa.workspace = true
 linfa-logistic.workspace = true
+netdiag-platform = { path = "../netdiag-platform" }
 ndarray.workspace = true
 opentelemetry-proto.workspace = true
 pcap.workspace = true
 petgraph.workspace = true
+prost.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 reqwest.workspace = true
@@ -25,17 +29,22 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tower.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 etherparse.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
 float-cmp.workspace = true
 insta.workspace = true
-tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [[bench]]
 name = "perf_budget"

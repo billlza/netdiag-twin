@@ -1,4 +1,5 @@
 use crate::error::{NetdiagError, Result};
+use crate::ingest::validate_trace_records;
 use crate::models::{
     DistributionStats, IngestResult, OverallTelemetry, TelemetrySummary, TelemetryWindow,
     ThroughputStats, TraceRecord, WindowLatencyStats,
@@ -13,7 +14,7 @@ pub fn summarize_telemetry(
     if records.is_empty() {
         return Err(NetdiagError::EmptyTrace);
     }
-    let windows = aggregate_by_window(records, window_seconds);
+    let windows = aggregate_by_window(records, window_seconds)?;
     let timestamps: Vec<DateTime<Utc>> = records.iter().map(|record| record.timestamp).collect();
     let latency: Vec<f64> = records.iter().map(|record| record.latency_ms).collect();
     let jitter: Vec<f64> = records.iter().map(|record| record.jitter_ms).collect();
@@ -39,15 +40,27 @@ pub fn summarize_telemetry(
         jitter_ms: distribution(&jitter),
         packet_loss_rate: mean(records.iter().map(|record| record.packet_loss_rate)),
         retransmission_rate: mean(records.iter().map(|record| record.retransmission_rate)),
-        timeout_events: records.iter().map(|record| record.timeout_events).sum(),
-        retry_events: records.iter().map(|record| record.retry_events).sum(),
+        timeout_events: finite_sum(
+            "overall timeout_events",
+            records.iter().map(|record| record.timeout_events),
+        )?,
+        retry_events: finite_sum(
+            "overall retry_events",
+            records.iter().map(|record| record.retry_events),
+        )?,
         throughput_mbps: ThroughputStats {
             mean: mean(throughput.iter().copied()),
             p95: quantile(&throughput, 0.95),
             min: Some(throughput.iter().copied().fold(f64::INFINITY, f64::min)),
         },
-        dns_failure_events: records.iter().map(|record| record.dns_failure_events).sum(),
-        tls_failure_events: records.iter().map(|record| record.tls_failure_events).sum(),
+        dns_failure_events: finite_sum(
+            "overall dns_failure_events",
+            records.iter().map(|record| record.dns_failure_events),
+        )?,
+        tls_failure_events: finite_sum(
+            "overall tls_failure_events",
+            records.iter().map(|record| record.tls_failure_events),
+        )?,
         quic_blocked_ratio: mean(records.iter().map(|record| record.quic_blocked_ratio)),
         window_count: windows.len(),
     };
@@ -64,7 +77,21 @@ pub fn summarize_ingest(ingest: &IngestResult, window_seconds: i64) -> Result<Te
     Ok(summary)
 }
 
-pub fn aggregate_by_window(records: &[TraceRecord], window_seconds: i64) -> Vec<TelemetryWindow> {
+pub fn aggregate_by_window(
+    records: &[TraceRecord],
+    window_seconds: i64,
+) -> Result<Vec<TelemetryWindow>> {
+    if window_seconds <= 0 {
+        return Err(NetdiagError::InvalidTrace(
+            "telemetry window size must be greater than zero seconds".to_string(),
+        ));
+    }
+    validate_trace_records(records)?;
+    let window_duration = Duration::try_seconds(window_seconds).ok_or_else(|| {
+        NetdiagError::InvalidTrace(format!(
+            "telemetry window size {window_seconds} seconds is out of range"
+        ))
+    })?;
     let mut grouped: BTreeMap<DateTime<Utc>, Vec<&TraceRecord>> = BTreeMap::new();
     for record in records {
         grouped
@@ -79,9 +106,17 @@ pub fn aggregate_by_window(records: &[TraceRecord], window_seconds: i64) -> Vec<
             let latency: Vec<f64> = chunk.iter().map(|record| record.latency_ms).collect();
             let jitter: Vec<f64> = chunk.iter().map(|record| record.jitter_ms).collect();
             let throughput: Vec<f64> = chunk.iter().map(|record| record.throughput_mbps).collect();
-            TelemetryWindow {
+            let end_ts = start_ts
+                .checked_add_signed(window_duration)
+                .ok_or_else(|| {
+                    NetdiagError::InvalidTrace(format!(
+                        "telemetry window ending after {} is out of range",
+                        start_ts.to_rfc3339()
+                    ))
+                })?;
+            Ok(TelemetryWindow {
                 start_ts,
-                end_ts: start_ts + Duration::seconds(window_seconds),
+                end_ts,
                 count: chunk.len(),
                 latency_ms: WindowLatencyStats {
                     p50: quantile(&latency, 0.50),
@@ -93,18 +128,30 @@ pub fn aggregate_by_window(records: &[TraceRecord], window_seconds: i64) -> Vec<
                 jitter_ms: distribution(&jitter),
                 packet_loss_rate: mean(chunk.iter().map(|record| record.packet_loss_rate)),
                 retransmission_rate: mean(chunk.iter().map(|record| record.retransmission_rate)),
-                timeout_events: chunk.iter().map(|record| record.timeout_events).sum(),
-                retry_events: chunk.iter().map(|record| record.retry_events).sum(),
+                timeout_events: finite_sum(
+                    "window timeout_events",
+                    chunk.iter().map(|record| record.timeout_events),
+                )?,
+                retry_events: finite_sum(
+                    "window retry_events",
+                    chunk.iter().map(|record| record.retry_events),
+                )?,
                 throughput_mbps: ThroughputStats {
                     mean: mean(throughput.iter().copied()),
                     p95: quantile(&throughput, 0.95),
                     min: None,
                 },
-                dns_failure_events: chunk.iter().map(|record| record.dns_failure_events).sum(),
-                tls_failure_events: chunk.iter().map(|record| record.tls_failure_events).sum(),
+                dns_failure_events: finite_sum(
+                    "window dns_failure_events",
+                    chunk.iter().map(|record| record.dns_failure_events),
+                )?,
+                tls_failure_events: finite_sum(
+                    "window tls_failure_events",
+                    chunk.iter().map(|record| record.tls_failure_events),
+                )?,
                 quic_blocked_ratio: mean(chunk.iter().map(|record| record.quic_blocked_ratio)),
                 raw_rows: chunk.len(),
-            }
+            })
         })
         .collect()
 }
@@ -169,21 +216,48 @@ pub fn quantile(values: &[f64], q: f64) -> f64 {
 
 pub fn mean(values: impl IntoIterator<Item = f64>) -> f64 {
     let mut count = 0usize;
-    let mut sum = 0.0;
+    let mut average = 0.0_f64;
     for value in values {
+        if !value.is_finite() {
+            return f64::NAN;
+        }
         count += 1;
-        sum += value;
+        let weight = 1.0 / count as f64;
+        average = average.mul_add(1.0 - weight, value * weight);
     }
-    if count == 0 { 0.0 } else { sum / count as f64 }
+    average
 }
 
 pub fn stddev(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    let avg = mean(values.iter().copied());
-    let variance = mean(values.iter().map(|value| (value - avg).powi(2)));
-    variance.sqrt()
+    let scale = values.iter().copied().map(f64::abs).fold(0.0, f64::max);
+    if !scale.is_finite() {
+        return f64::NAN;
+    }
+    if scale == 0.0 {
+        return 0.0;
+    }
+    let normalized_mean = mean(values.iter().map(|value| value / scale));
+    let normalized_variance = mean(values.iter().map(|value| {
+        let delta = value / scale - normalized_mean;
+        delta * delta
+    }));
+    normalized_variance.sqrt() * scale
+}
+
+fn finite_sum(name: &str, values: impl IntoIterator<Item = f64>) -> Result<f64> {
+    let mut total = 0.0;
+    for value in values {
+        total += value;
+        if !total.is_finite() {
+            return Err(NetdiagError::InvalidTrace(format!(
+                "telemetry {name} aggregation overflowed"
+            )));
+        }
+    }
+    Ok(total)
 }
 
 fn floor_time(timestamp: DateTime<Utc>, window_seconds: i64) -> DateTime<Utc> {
@@ -191,3 +265,6 @@ fn floor_time(timestamp: DateTime<Utc>, window_seconds: i64) -> DateTime<Utc> {
     let floor = seconds - seconds.rem_euclid(window_seconds.max(1));
     Utc.timestamp_opt(floor, 0).single().unwrap_or(timestamp)
 }
+
+#[cfg(test)]
+mod tests;

@@ -862,19 +862,38 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
             "strict CI must install rustfmt and clippy before running the quality gate"
         )
     for fragment in (
-        "sudo mktemp -d /opt/netdiag-platform-security.XXXXXX",
-        '[[ "$trusted_root" == /opt/netdiag-platform-security.?????? ]]',
+        '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]',
+        "validate_trusted_ancestor() {",
+        "for trusted_ancestor in / /var /var/lib; do",
+        '[[ -L "$ancestor" || ! -d "$ancestor" ]]',
+        'owner="$(stat -c \'%u\' -- "$ancestor")"',
+        '(( (8#$mode & 8#022) != 0 ))',
+        "sudo -- /usr/bin/mktemp -d -- /var/lib/netdiag-platform-security.XXXXXX",
+        '[[ "$trusted_root" =~ ^/var/lib/netdiag-platform-security\\.[A-Za-z0-9]{6}$ ]]',
         "readonly trusted_root",
-        'sudo chown "$(id -u):$(id -g)" "$trusted_root"',
-        'chmod 700 "$trusted_root"',
-        'git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"',
+        "cd /",
+        'sudo -- /usr/bin/rm -rf --one-file-system -- "$trusted_root"',
+        'sudo -- /usr/bin/chown -- "$runner_uid:$runner_gid" "$trusted_root"',
+        '/usr/bin/chmod -- 0700 "$trusted_root"',
+        'stat -c \'%u:%g:%a\' -- "$trusted_root"',
+        'git clone --quiet --no-local --no-checkout -- "$GITHUB_WORKSPACE" "$trusted_root/repo"',
+        'git -C "$trusted_root/repo" checkout --quiet --detach "$EXPECTED_SHA"',
         '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
-        'sudo rm -rf -- "$trusted_root"',
         "cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features",
     ):
         if fragment not in platform_body:
             failures.append(
                 f"Linux platform tests are missing trusted-checkout control: {fragment}"
+            )
+    for untrusted_root in (
+        "/opt/netdiag-platform-security.",
+        "/tmp/netdiag-platform-security.",
+        "$HOME/netdiag-platform-security.",
+        "${HOME}/netdiag-platform-security.",
+    ):
+        if untrusted_root in platform_body:
+            failures.append(
+                f"Linux platform tests must not fall back to an untrusted checkout root: {untrusted_root}"
             )
 
     required_package_fragments = (

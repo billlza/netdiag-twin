@@ -102,22 +102,62 @@ jobs:
           EXPECTED_SHA: ${{ inputs.checkout_ref || github.sha }}
         run: |
           set -euo pipefail
-          trusted_root="$(sudo mktemp -d /opt/netdiag-platform-security.XXXXXX)"
-          [[ "$trusted_root" == /opt/netdiag-platform-security.?????? ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || (
+            echo "platform-security expected SHA must be a full lowercase commit SHA" >&2
+            exit 2
+          )
+          validate_trusted_ancestor() {
+            local ancestor mode owner
+            ancestor="$1"
+            if [[ -L "$ancestor" || ! -d "$ancestor" ]]; then
+              echo "trusted checkout ancestor is not a physical directory: $ancestor" >&2
+              exit 2
+            fi
+            owner="$(stat -c '%u' -- "$ancestor")"
+            if [[ "$owner" != 0 ]]; then
+              echo "trusted checkout ancestor is not root-owned: $ancestor" >&2
+              exit 2
+            fi
+            mode="$(stat -c '%a' -- "$ancestor")"
+            if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & 8#022) != 0 )); then
+              echo "trusted checkout ancestor is group/world-writable: $ancestor" >&2
+              exit 2
+            fi
+          }
+          for trusted_ancestor in / /var /var/lib; do
+            validate_trusted_ancestor "$trusted_ancestor"
+          done
+          trusted_root="$(sudo -- /usr/bin/mktemp -d -- /var/lib/netdiag-platform-security.XXXXXX)"
+          [[ "$trusted_root" =~ ^/var/lib/netdiag-platform-security\.[A-Za-z0-9]{6}$ ]] || (
+            echo "mktemp returned an unexpected trusted checkout path" >&2
+            exit 2
+          )
           readonly trusted_root
           cleanup_trusted_root() {
             status=$?
             trap - EXIT
-            if ! sudo rm -rf -- "$trusted_root"; then
+            cd /
+            if [[ ! "$trusted_root" =~ ^/var/lib/netdiag-platform-security\.[A-Za-z0-9]{6}$ ]]; then
+              echo "refusing to clean an unexpected platform-security path" >&2
+              exit 1
+            fi
+            if ! sudo -- /usr/bin/rm -rf --one-file-system -- "$trusted_root"; then
               echo "failed to remove trusted platform-security checkout" >&2
               exit 1
             fi
             exit "$status"
           }
           trap cleanup_trusted_root EXIT
-          sudo chown "$(id -u):$(id -g)" "$trusted_root"
-          chmod 700 "$trusted_root"
-          git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          readonly runner_uid runner_gid
+          sudo -- /usr/bin/chown -- "$runner_uid:$runner_gid" "$trusted_root"
+          /usr/bin/chmod -- 0700 "$trusted_root"
+          [[ ! -L "$trusted_root" && -d "$trusted_root" ]]
+          [[ "$(stat -c '%u:%g:%a' -- "$trusted_root")" == "$runner_uid:$runner_gid:700" ]]
+          [[ -z "$(find "$trusted_root" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+          git clone --quiet --no-local --no-checkout -- "$GITHUB_WORKSPACE" "$trusted_root/repo"
+          git -C "$trusted_root/repo" checkout --quiet --detach "$EXPECTED_SHA"
           actual_sha="$(git -C "$trusted_root/repo" rev-parse HEAD)"
           [[ "$actual_sha" == "$EXPECTED_SHA" ]] || (
             echo "trusted checkout SHA mismatch: expected=$EXPECTED_SHA actual=$actual_sha" >&2

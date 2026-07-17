@@ -170,6 +170,39 @@ rm -rf "$ARTIFACTS"
         self.assertNotEqual(code, 0)
         self.assertIn("must install rustfmt and clippy", stdout + stderr)
 
+    def test_workflow_hygiene_rejects_untrusted_platform_checkout_roots(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_directory = Path(tmp) / "workflows"
+            workflow_directory.mkdir()
+            for name in ("ci.yml", "release.yml"):
+                (workflow_directory / name).write_text(
+                    (REPO_ROOT / ".github/workflows" / name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            platform_body = (
+                REPO_ROOT / ".github/workflows/platform-security.yml"
+            ).read_text(encoding="utf-8")
+            (workflow_directory / "platform-security.yml").write_text(
+                platform_body.replace(
+                    "/var/lib/netdiag-platform-security.",
+                    "/opt/netdiag-platform-security.",
+                ),
+                encoding="utf-8",
+            )
+            module.WORKFLOW_DIRECTORY = workflow_directory
+            module.RELEASE_WORKFLOW = workflow_directory / "release.yml"
+            module.CI_WORKFLOW = workflow_directory / "ci.yml"
+            code, stdout, stderr = run_main(module)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn(
+            "must not fall back to an untrusted checkout root",
+            stdout + stderr,
+        )
+
     def test_private_credential_file_patterns_are_ignored(self) -> None:
         required_patterns = ("*.p8", "*.pfx", "*.pem", "*.key")
         samples = (
@@ -3041,16 +3074,32 @@ class CiPlatformGateTests(unittest.TestCase):
             job,
         )
         for fragment in (
-            "sudo mktemp -d /opt/netdiag-platform-security.XXXXXX",
-            '[[ "$trusted_root" == /opt/netdiag-platform-security.?????? ]]',
+            '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]',
+            "validate_trusted_ancestor() {",
+            "for trusted_ancestor in / /var /var/lib; do",
+            '[[ -L "$ancestor" || ! -d "$ancestor" ]]',
+            'owner="$(stat -c \'%u\' -- "$ancestor")"',
+            '(( (8#$mode & 8#022) != 0 ))',
+            "sudo -- /usr/bin/mktemp -d -- /var/lib/netdiag-platform-security.XXXXXX",
+            '[[ "$trusted_root" =~ ^/var/lib/netdiag-platform-security\\.[A-Za-z0-9]{6}$ ]]',
             "readonly trusted_root",
-            'sudo chown "$(id -u):$(id -g)" "$trusted_root"',
-            'chmod 700 "$trusted_root"',
-            'git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"',
+            "cd /",
+            'sudo -- /usr/bin/rm -rf --one-file-system -- "$trusted_root"',
+            'sudo -- /usr/bin/chown -- "$runner_uid:$runner_gid" "$trusted_root"',
+            '/usr/bin/chmod -- 0700 "$trusted_root"',
+            'stat -c \'%u:%g:%a\' -- "$trusted_root"',
+            'git clone --quiet --no-local --no-checkout -- "$GITHUB_WORKSPACE" "$trusted_root/repo"',
+            'git -C "$trusted_root/repo" checkout --quiet --detach "$EXPECTED_SHA"',
             '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
-            'sudo rm -rf -- "$trusted_root"',
         ):
             self.assertIn(fragment, job)
+        for untrusted_root in (
+            "/opt/netdiag-platform-security.",
+            "/tmp/netdiag-platform-security.",
+            "$HOME/netdiag-platform-security.",
+            "${HOME}/netdiag-platform-security.",
+        ):
+            self.assertNotIn(untrusted_root, job)
 
     def test_strict_ci_installs_rustfmt_and_clippy_before_the_quality_gate(self) -> None:
         ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(

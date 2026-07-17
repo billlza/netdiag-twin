@@ -184,11 +184,15 @@ executes offline pcap parsing without requiring a privileged capture driver. The
 setup fails before Cargo if either the import library or runtime DLL is absent.
 Because GitHub's Ubuntu workspace inherits a default ACL from `/home`, the Linux
 runtime suite is executed from a private `0700` checkout atomically created by
-`sudo mktemp` beneath root-owned, non-writable `/opt`, then assigned to the runner.
-The harness verifies that this checkout is the exact caller SHA and treats cleanup
-failure as a job failure; the production trusted-directory policy is never relaxed
-for CI. A private child beneath sticky, world-writable `/tmp` is intentionally not
-used because the strict adapter trust chain validates every ancestor.
+`sudo mktemp` beneath `/var/lib`, then assigned to the runner. Before that privileged
+creation, the harness verifies that `/`, `/var`, and `/var/lib` are physical,
+root-owned directories without group or world write bits. It validates the bounded
+random path, post-`chown` identity and mode, and exact caller SHA, and treats cleanup
+failure as a job failure. The production trusted-directory policy remains the final
+ACL and path-trust authority and is never relaxed for CI. Runner-image permission or
+ACL drift therefore fails closed; the workflow does not fall back to `$HOME`,
+sticky world-writable `/tmp`, or the current runner image's writable `/opt`, because
+the strict adapter trust chain validates every ancestor.
 
 Both CI and Release call this same reusable workflow, so a tag cannot bypass
 native Windows validation. Release additionally requires a successful main CI

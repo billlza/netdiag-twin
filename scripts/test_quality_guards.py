@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tarfile
@@ -195,6 +196,61 @@ rm -rf "$ARTIFACTS"
         }
         self.assertTrue({"*.profraw", "*.profdata"} <= configured_patterns)
 
+    def test_build_output_ignores_do_not_hide_source_modules(self) -> None:
+        ignore_body = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        configured_patterns = {
+            line.strip()
+            for line in ignore_body.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        self.assertIn("/target/", configured_patterns)
+        self.assertIn("/crates/*/target/", configured_patterns)
+        self.assertNotIn("target/", configured_patterns)
+
+        samples = (
+            "target/debug/netdiag",
+            "crates/netdiag-core/target/debug/netdiag",
+            "crates/netdiag-core/src/storage/atomic_file/target/binding.rs",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp)
+            (repository / ".gitignore").write_text(ignore_body, encoding="utf-8")
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            result = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    f"core.excludesFile={os.devnull}",
+                    "check-ignore",
+                    "--no-index",
+                    "--stdin",
+                ],
+                cwd=repository,
+                input="\n".join(samples) + "\n",
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(tuple(result.stdout.splitlines()), samples[:2])
+
+    def test_architecture_budgeted_sources_must_exist_in_the_git_index(self) -> None:
+        guard_body = (REPO_ROOT / "scripts/check_architecture_guard.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'git -C "$ROOT" ls-files --error-unmatch -- "$path"', guard_body
+        )
+        self.assertIn(
+            'architecture guard failed: $path is absent from the Git index', guard_body
+        )
+
     def run_release_guard(self, body: str) -> tuple[int, str]:
         module = load_script("check_release_gate_hygiene")
         if "schema_python" not in body:
@@ -208,13 +264,33 @@ rm -rf "$ARTIFACTS"
                 "}\n"
                 + body
             )
+        if "run_adapter_contracts" not in body:
+            body = (
+                "run_adapter_contracts() {\n"
+                "  local validator_target_dir\n"
+                '  validator_target_dir="$ROOT/target/adapter-validator"\n'
+                '  local validator="$validator_target_dir/debug/netdiag-cli"\n'
+                '  CARGO_TARGET_DIR="$validator_target_dir" cargo build --locked --quiet \\\n'
+                "    -p netdiag-cli --bin netdiag-cli\n"
+                '  scripts/validate_adapter_samples.py --rust-validator "$validator"\n'
+                '  scripts/validate_adapter_contract.py --rust-validator "$validator"\n'
+                "}\n"
+                + body
+            )
         if "run_strict" not in body:
             body = (
-                f"run_pilot_smoke() {{\n{body}\n}}\n"
+                f"run_pilot_smoke() {{\n{body}\n"
+                '  benchmark_report_archive="$ROOT/target/benchmark-reports"\n'
+                '  published_benchmark_report="$benchmark_report_archive/${workspace##*/}"\n'
+                "  python3 scripts/publish_benchmark_report.py \\\n"
+                '    "$benchmark_report" "$published_benchmark_report"\n'
+                "  cleanup_pilot_smoke\n"
+                "}\n"
                 "run_strict() {\n"
                 "  cargo test --locked -p netdiag-core --bench perf_budget --all-features\n"
                 '  LLVM_PROFILE_FILE_NAME="netdiag-%m-%p.profraw" cargo llvm-cov nextest --locked -p netdiag-app --all-features --lib --bins --tests\n'
                 "  python3 scripts/check_app_security_coverage.py --summary app.json --dep-info-dir deps --aggregate-min 80 --file-min 50\n"
+                "  run_adapter_contracts\n"
                 "  run_pilot_smoke\n"
                 "}\n"
             )
@@ -440,6 +516,18 @@ rm -rf "$ARTIFACTS"
         )
         self.assertTrue(
             any("pin the reviewed package" in failure for failure in failures),
+            failures,
+        )
+
+        failures = self.run_schema_requirements_guard(
+            input_body,
+            lock_body.replace(
+                'typing-extensions==4.16.0 ; python_version < "3.13"',
+                'typing-extensions==4.16.0 ; python_version < "3.12"',
+            ),
+        )
+        self.assertTrue(
+            any("Python 3.12 typing-extensions" in failure for failure in failures),
             failures,
         )
 
@@ -884,6 +972,27 @@ rm -rf "$ARTIFACTS"
         self.assertNotEqual(code, 0)
         self.assertIn("run_strict must invoke run_pilot_smoke", output)
 
+    def test_rejects_adapter_validator_built_after_pilot_smoke(self) -> None:
+        code, output = self.run_release_guard(
+            """
+            run_pilot_smoke() {
+              cargo run --locked -p netdiag-cli -- lab calibrate --artifacts target/pilot-artifacts
+              cargo run --locked -p netdiag-cli -- benchmark run --model-dir target/pilot-artifacts/model
+              cargo run --locked -p netdiag-cli -- pilot model-gate --model-dir target/pilot-artifacts/model
+            }
+            run_strict() {
+              cargo test --locked -p netdiag-core --bench perf_budget --all-features
+              LLVM_PROFILE_FILE_NAME="netdiag-%m-%p.profraw" cargo llvm-cov nextest --locked -p netdiag-app --all-features --lib --bins --tests
+              python3 scripts/check_app_security_coverage.py --summary app.json --dep-info-dir deps --aggregate-min 80 --file-min 50
+              run_pilot_smoke
+              run_adapter_contracts
+            }
+            """
+        )
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("must build the Rust adapter validator before pilot smoke", output)
+
     def test_commands_outside_smoke_cannot_satisfy_release_chain(self) -> None:
         code, output = self.run_release_guard(
             """
@@ -956,6 +1065,231 @@ rm -rf "$ARTIFACTS"
 
 
 class AdapterContractTests(unittest.TestCase):
+    @staticmethod
+    def create_rust_validator(workspace: Path, *, body: str = "validator") -> Path:
+        validator = (
+            workspace / "target" / "adapter-validator" / "debug" / "netdiag-cli"
+        )
+        validator.parent.mkdir(parents=True)
+        validator.write_text(body, encoding="utf-8")
+        validator.chmod(0o700)
+        return validator
+
+    def test_rust_ingest_uses_the_prebuilt_binary_with_an_empty_environment(self) -> None:
+        module = load_script("adapter_process")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            validator = self.create_rust_validator(workspace)
+            sample = workspace / "sample.json"
+            sample.write_text("{}", encoding="utf-8")
+            trusted = module.trusted_rust_ingest_validator(validator, workspace)
+            completed = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            with mock.patch.object(
+                module, "run_bounded", return_value=completed
+            ) as bounded:
+                module.validate_rust_ingest(trusted, sample, workspace)
+
+        self.assertEqual(
+            bounded.call_args.args[0],
+            [str(validator), "validate-trace", str(sample)],
+        )
+        self.assertEqual(bounded.call_args.kwargs["cwd"], workspace)
+        self.assertEqual(bounded.call_args.kwargs["environment"], {})
+        self.assertEqual(
+            bounded.call_args.kwargs["timeout_seconds"],
+            module.RUST_VALIDATION_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            bounded.call_args.kwargs["stdout_limit_bytes"],
+            module.RUST_VALIDATION_OUTPUT_LIMIT_BYTES,
+        )
+        self.assertEqual(
+            bounded.call_args.kwargs["stderr_limit_bytes"],
+            module.RUST_VALIDATION_OUTPUT_LIMIT_BYTES,
+        )
+
+    def test_rust_ingest_rejects_a_nonzero_validator_exit(self) -> None:
+        module = load_script("adapter_process")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=7, stdout="less-specific stdout", stderr="invalid trace"
+        )
+        with mock.patch.object(
+            module,
+            "trusted_rust_ingest_validator",
+            return_value=Path("/trusted/netdiag-cli"),
+        ), mock.patch.object(module, "run_bounded", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "invalid trace"):
+                module.validate_rust_ingest(
+                    Path("/trusted/netdiag-cli"),
+                    Path("/sample.json"),
+                    Path("/workspace"),
+                )
+
+    def test_rust_ingest_rejects_stderr_from_a_successful_validator(self) -> None:
+        module = load_script("adapter_process")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="unexpected diagnostic"
+        )
+        with mock.patch.object(
+            module,
+            "trusted_rust_ingest_validator",
+            return_value=Path("/trusted/netdiag-cli"),
+        ), mock.patch.object(module, "run_bounded", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "non-empty stderr on success"):
+                module.validate_rust_ingest(
+                    Path("/trusted/netdiag-cli"),
+                    Path("/sample.json"),
+                    Path("/workspace"),
+                )
+
+    def test_rust_ingest_validator_rejects_untrusted_paths_and_modes(self) -> None:
+        module = load_script("adapter_process")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            validator = self.create_rust_validator(workspace)
+            cases = (
+                (
+                    Path("target/adapter-validator/debug/netdiag-cli"),
+                    "normalized absolute path",
+                ),
+                (workspace / "outside" / "netdiag-cli", "trusted build location"),
+                (
+                    workspace
+                    / "target"
+                    / "adapter-validator"
+                    / "debug"
+                    / ".."
+                    / "debug"
+                    / "netdiag-cli",
+                    "normalized absolute path",
+                ),
+            )
+            for path, expected in cases:
+                with self.subTest(path=path), self.assertRaisesRegex(
+                    RuntimeError, expected
+                ):
+                    module.trusted_rust_ingest_validator(path, workspace)
+
+            validator.chmod(0o720)
+            with self.assertRaisesRegex(RuntimeError, "group- or world-writable"):
+                module.trusted_rust_ingest_validator(validator, workspace)
+            validator.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "must be executable"):
+                module.trusted_rust_ingest_validator(validator, workspace)
+            validator.chmod(0o700)
+            metadata = validator.lstat()
+            with mock.patch.object(
+                module.os, "geteuid", return_value=metadata.st_uid + 1
+            ), self.assertRaisesRegex(RuntimeError, "untrusted owner"):
+                module.trusted_rust_ingest_validator(validator, workspace)
+
+    def test_rust_ingest_validator_rejects_empty_directory_and_symlink_targets(self) -> None:
+        module = load_script("adapter_process")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            validator = self.create_rust_validator(workspace, body="")
+            with self.assertRaisesRegex(RuntimeError, "non-empty regular file"):
+                module.trusted_rust_ingest_validator(validator, workspace)
+
+            validator.unlink()
+            validator.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "non-empty regular file"):
+                module.trusted_rust_ingest_validator(validator, workspace)
+
+            validator.rmdir()
+            real = workspace / "real-validator"
+            real.write_text("validator", encoding="utf-8")
+            real.chmod(0o700)
+            validator.symlink_to(real)
+            with self.assertRaisesRegex(RuntimeError, "must not contain symlinks"):
+                module.trusted_rust_ingest_validator(validator, workspace)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            real_target = workspace / "real-target"
+            validator = self.create_rust_validator(real_target)
+            target_link = workspace / "target"
+            target_link.symlink_to(real_target / "target", target_is_directory=True)
+            linked_validator = (
+                target_link / "adapter-validator" / "debug" / "netdiag-cli"
+            )
+            self.assertTrue(validator.is_file())
+            with self.assertRaisesRegex(RuntimeError, "must not contain symlinks"):
+                module.trusted_rust_ingest_validator(linked_validator, workspace)
+
+    def test_rust_ingest_validator_rejects_writable_directory_chain(self) -> None:
+        module = load_script("adapter_process")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            validator = self.create_rust_validator(workspace)
+            for directory in (workspace, workspace / "target"):
+                original_mode = stat.S_IMODE(directory.stat().st_mode)
+                directory.chmod(0o770)
+                try:
+                    with self.subTest(directory=directory), self.assertRaisesRegex(
+                        RuntimeError, "directory chain must not be group- or world-writable"
+                    ):
+                        module.trusted_rust_ingest_validator(validator, workspace)
+                finally:
+                    directory.chmod(original_mode)
+
+    def test_rust_ingest_revalidates_a_replaced_validator_before_execution(self) -> None:
+        module = load_script("adapter_process")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            validator = self.create_rust_validator(workspace)
+            sample = workspace / "sample.json"
+            sample.write_text("{}", encoding="utf-8")
+            trusted = module.trusted_rust_ingest_validator(validator, workspace)
+            replacement = workspace / "replacement"
+            replacement.write_text("replacement", encoding="utf-8")
+            replacement.chmod(0o700)
+            validator.unlink()
+            validator.symlink_to(replacement)
+
+            with mock.patch.object(module, "run_bounded") as bounded:
+                with self.assertRaisesRegex(RuntimeError, "must not contain symlinks"):
+                    module.validate_rust_ingest(trusted, sample, workspace)
+            bounded.assert_not_called()
+
+    def test_rust_ingest_validator_rejects_linux_and_macos_acl_entries(self) -> None:
+        module = load_script("adapter_process")
+        path = Path("/trusted")
+        with mock.patch.object(module.sys, "platform", "linux"), mock.patch.object(
+            module.os,
+            "listxattr",
+            return_value=["system.posix_acl_access"],
+            create=True,
+        ), self.assertRaisesRegex(RuntimeError, "must not carry an extended ACL"):
+            module._validate_acl_boundary((path,))
+
+        acl_output = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="drwx------ 2 user staff 64 /trusted\n 0: group:staff allow write\n",
+            stderr="",
+        )
+        with mock.patch.object(module.sys, "platform", "darwin"), mock.patch.object(
+            module, "run_bounded", return_value=acl_output
+        ), self.assertRaisesRegex(RuntimeError, "must not carry an extended ACL"):
+            module._validate_acl_boundary((path,))
+
+    def test_adapter_ingest_requires_an_explicit_validator_argument(self) -> None:
+        for script in ("validate_adapter_samples", "validate_adapter_contract"):
+            module = load_script(script)
+            with self.subTest(script=script), mock.patch.object(
+                sys, "argv", [script]
+            ), redirect_stderr(io.StringIO()), self.assertRaisesRegex(SystemExit, "2"):
+                module.main()
+            with self.subTest(script=f"{script}-schema-only"), mock.patch.object(
+                sys,
+                "argv",
+                [script, "--schema-only", "--rust-validator", "/tmp/validator"],
+            ), redirect_stderr(io.StringIO()), self.assertRaisesRegex(SystemExit, "2"):
+                module.main()
+
     def test_release_guard_rejects_buffering_adapter_subprocess(self) -> None:
         module = load_script("check_release_gate_hygiene")
         original = (SCRIPTS / "adapter_process.py").read_text(encoding="utf-8")
@@ -1362,6 +1696,168 @@ class AdapterContractTests(unittest.TestCase):
         self.assertIs(preflight["passed"], False)
         self.assertEqual(preflight["health"]["status"], "error")
         self.assertEqual(preflight["checks"][-1]["status"], "error")
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX report publication contract")
+class BenchmarkReportPublicationTests(unittest.TestCase):
+    @staticmethod
+    def create_report(root: Path, name: str = "report") -> Path:
+        report = root / name
+        report.mkdir(mode=0o700)
+        for file_name in ("benchmark_report.json", "benchmark_report.md"):
+            path = report / file_name
+            path.write_text(f"non-empty {file_name}\n", encoding="utf-8")
+            path.chmod(0o600)
+        return report
+
+    def test_publish_moves_the_exact_report_without_changing_identity(self) -> None:
+        module = load_script("publish_benchmark_report")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = self.create_report(root)
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            destination = root / "archive" / "pilot-smoke.verified"
+
+            module.publish_benchmark_report(source, destination)
+
+            self.assertFalse(source.exists())
+            self.assertEqual(
+                (destination.stat().st_dev, destination.stat().st_ino),
+                source_identity,
+            )
+            self.assertEqual(
+                {entry.name for entry in destination.iterdir()},
+                module.EXPECTED_REPORT_FILES,
+            )
+
+    def test_publish_never_replaces_an_existing_destination(self) -> None:
+        module = load_script("publish_benchmark_report")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = self.create_report(root)
+            destination = root / "archive" / "pilot-smoke.existing"
+            destination.mkdir(parents=True, mode=0o700)
+            marker = destination / "existing"
+            marker.write_text("keep", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "refusing to replace",
+            ):
+                module.publish_benchmark_report(source, destination)
+
+            self.assertTrue(source.is_dir())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_publish_rejects_missing_extra_empty_and_symlink_files(self) -> None:
+        module = load_script("publish_benchmark_report")
+        cases = ("missing", "extra", "empty", "symlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                source = self.create_report(root)
+                json_report = source / "benchmark_report.json"
+                if case == "missing":
+                    json_report.unlink()
+                elif case == "extra":
+                    (source / "unexpected.txt").write_text("unexpected")
+                elif case == "empty":
+                    json_report.write_text("")
+                else:
+                    json_report.unlink()
+                    json_report.symlink_to(source / "benchmark_report.md")
+                destination = root / "archive" / f"pilot-smoke.{case}"
+
+                with self.assertRaises(module.BenchmarkReportPublicationError):
+                    module.publish_benchmark_report(source, destination)
+                self.assertTrue(source.is_dir())
+                self.assertFalse(destination.exists())
+
+    def test_publish_rejects_unsafe_source_file_archive_and_owner(self) -> None:
+        module = load_script("publish_benchmark_report")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            source = self.create_report(root)
+            source.chmod(0o770)
+            with self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "source must not be group- or world-writable",
+            ):
+                module.publish_benchmark_report(
+                    source, root / "archive-source" / "pilot-smoke.source"
+                )
+
+            source.chmod(0o700)
+            report_file = source / "benchmark_report.json"
+            report_file.chmod(0o660)
+            with self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "must not be group- or world-writable",
+            ):
+                module.publish_benchmark_report(
+                    source, root / "archive-file" / "pilot-smoke.file"
+                )
+
+            report_file.chmod(0o600)
+            archive = root / "archive-mode"
+            archive.mkdir()
+            archive.chmod(0o770)
+            with self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "archive must not be group- or world-writable",
+            ):
+                module.publish_benchmark_report(
+                    source, archive / "pilot-smoke.archive"
+                )
+
+            archive.chmod(0o700)
+            owner = source.stat().st_uid
+            with mock.patch.object(module.os, "geteuid", return_value=owner + 1):
+                with self.assertRaisesRegex(
+                    module.BenchmarkReportPublicationError,
+                    "source must be owned by the current user",
+                ):
+                    module.publish_benchmark_report(
+                        source, root / "archive-owner" / "pilot-smoke.owner"
+                    )
+
+    def test_publish_rejects_symlink_directories_and_surfaces_rename_failure(self) -> None:
+        module = load_script("publish_benchmark_report")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            real_source = self.create_report(root, "real-source")
+            source_link = root / "source-link"
+            source_link.symlink_to(real_source, target_is_directory=True)
+            with self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "source must be a directory",
+            ):
+                module.publish_benchmark_report(
+                    source_link, root / "archive-link" / "pilot-smoke.link"
+                )
+
+            archive_target = root / "archive-target"
+            archive_target.mkdir(mode=0o700)
+            archive_link = root / "archive-symlink"
+            archive_link.symlink_to(archive_target, target_is_directory=True)
+            with self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "archive must be a directory",
+            ):
+                module.publish_benchmark_report(
+                    real_source, archive_link / "pilot-smoke.archive-link"
+                )
+
+            destination = root / "archive-rename" / "pilot-smoke.rename"
+            with mock.patch.object(
+                module.os, "rename", side_effect=OSError("controlled failure")
+            ), self.assertRaisesRegex(
+                module.BenchmarkReportPublicationError,
+                "could not be published atomically",
+            ):
+                module.publish_benchmark_report(real_source, destination)
+            self.assertTrue(real_source.is_dir())
+            self.assertFalse(destination.exists())
 
 
 class AdapterMeasurementQualityTests(unittest.TestCase):
@@ -2003,6 +2499,7 @@ class PatchContractHygieneTests(unittest.TestCase):
         exclude_patch: bool = True,
         contract_patch: str = "demo",
         preserve_upstream_tests: bool = False,
+        untracked_patch_file: str | None = None,
     ) -> tuple[int, str]:
         module = load_script("check_patch_contract_hygiene")
         with tempfile.TemporaryDirectory() as tmp:
@@ -2078,6 +2575,25 @@ class PatchContractHygieneTests(unittest.TestCase):
             )
             quality = root / "check_rust_quality.sh"
             quality.write_text(quality_script, encoding="utf-8")
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "add", "--force", "."],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            if untracked_patch_file is not None:
+                subprocess.run(
+                    ["git", "rm", "--cached", "--quiet", "--", untracked_patch_file],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                )
             module.ROOT = root
             module.WORKSPACE_MANIFEST = root / "Cargo.toml"
             module.QUALITY_SCRIPT = quality
@@ -2087,6 +2603,14 @@ class PatchContractHygieneTests(unittest.TestCase):
     def test_accepts_explicit_independent_patch_contracts(self) -> None:
         code, output = self.run_patch_guard()
         self.assertEqual(code, 0, output)
+
+    def test_rejects_patch_file_present_only_in_the_worktree(self) -> None:
+        code, output = self.run_patch_guard(
+            untracked_patch_file="third_party/demo/Cargo.toml"
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("files absent from the Git index", output)
+        self.assertIn("Cargo.toml", output)
 
     def test_rejects_contract_function_not_invoked_by_strict(self) -> None:
         body = self.VALID_QUALITY_SCRIPT.replace(
@@ -2400,6 +2924,48 @@ class CiPlatformGateTests(unittest.TestCase):
         job = self.platform_job()
         match = re.search(r'NETDIAG_VCPKG_COMMIT: "([0-9a-f]{40})"', job)
         self.assertIsNotNone(match)
+        cache_path = "${{ runner.temp }}/netdiag-vcpkg-binary-cache"
+        self.assertIn(f"path: {cache_path}", job)
+        self.assertIn(f"VCPKG_DEFAULT_BINARY_CACHE: {cache_path}", job)
+        self.assertLess(
+            job.index("- name: Restore pinned Windows libpcap binary cache"),
+            job.index("- name: Install pinned Windows libpcap test runtime"),
+        )
+        install_step = job.split(
+            "- name: Install pinned Windows libpcap test runtime", 1
+        )[1].split("\n      - name:", 1)[0]
+        strict_mode = install_step.index("Set-StrictMode -Version Latest")
+        terminating_errors = install_step.index('$ErrorActionPreference = "Stop"')
+        native_errors = install_step.index(
+            "$PSNativeCommandUseErrorActionPreference = $true"
+        )
+        cache_creation = install_step.index(
+            "New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE"
+        )
+        cache_validation = install_step.index(
+            "Test-Path -LiteralPath $env:VCPKG_DEFAULT_BINARY_CACHE -PathType Container"
+        )
+        install = install_step.index('install "libpcap:$triplet"')
+        self.assertEqual(
+            [
+                strict_mode,
+                terminating_errors,
+                native_errors,
+                cache_creation,
+                cache_validation,
+                install,
+            ],
+            sorted(
+                [
+                    strict_mode,
+                    terminating_errors,
+                    native_errors,
+                    cache_creation,
+                    cache_validation,
+                    install,
+                ]
+            ),
+        )
         self.assertIn('install "libpcap:$triplet"', job)
         self.assertIn("lib\\wpcap.lib", job)
         self.assertIn("bin\\wpcap.dll", job)
@@ -2524,6 +3090,40 @@ class DocsWorkflowHygieneTests(unittest.TestCase):
             code, stdout, stderr = run_main(module)
         return code, stdout + stderr
 
+    def test_guard_covers_adapter_command_documents(self) -> None:
+        module = load_script("check_docs_workflow_hygiene")
+        covered = {path.relative_to(module.ROOT).as_posix() for path in module.DOCS}
+        self.assertIn("docs/api-source.md", covered)
+        self.assertIn("examples/adapters/README.md", covered)
+
+    def test_rejects_adapter_validation_without_the_prebuilt_validator(self) -> None:
+        code, output = self.run_docs_guard(
+            """
+            ```bash
+            python3 scripts/validate_adapter_samples.py
+            ```
+            """
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("must pass the fixed Rust validator", output)
+        self.assertIn("must follow a locked validator build", output)
+
+    def test_accepts_explicit_adapter_validator_build_and_commands(self) -> None:
+        code, output = self.run_docs_guard(
+            """
+            ```bash
+            validator_target="$(pwd -P)/target/adapter-validator"
+            CARGO_TARGET_DIR="$validator_target" cargo build --locked \\
+              -p netdiag-cli --bin netdiag-cli
+            .venv-jsonschema/bin/python scripts/validate_adapter_samples.py \\
+              --rust-validator "$validator_target/debug/netdiag-cli"
+            .venv-jsonschema/bin/python scripts/validate_adapter_contract.py \\
+              --rust-validator "$validator_target/debug/netdiag-cli"
+            ```
+            """
+        )
+        self.assertEqual(code, 0, output)
+
     def test_rejects_lab_calibration_before_first_lab_run(self) -> None:
         code, output = self.run_docs_guard(
             """
@@ -2553,12 +3153,24 @@ class DocsWorkflowHygieneTests(unittest.TestCase):
     def test_allows_bundled_benchmark_example_without_model_dir(self) -> None:
         code, output = self.run_docs_guard(
             """
+            CARGO_TARGET_DIR="$PWD/target/adapter-validator" cargo build --locked -p netdiag-cli --bin netdiag-cli
             cargo run -p netdiag-cli -- benchmark run \\
               --artifacts target/benchmark-artifacts \\
               --output target/benchmark-report
             """
         )
         self.assertEqual(code, 0, output)
+
+    def test_rejects_benchmark_example_without_validator_prebuild(self) -> None:
+        code, output = self.run_docs_guard(
+            """
+            cargo run -p netdiag-cli -- benchmark run \\
+              --artifacts target/benchmark-artifacts \\
+              --output target/benchmark-report
+            """
+        )
+        self.assertNotEqual(code, 0)
+        self.assertIn("must prebuild the trusted Rust validator", output)
 
     def test_promotion_benchmark_requires_candidate_model_dir(self) -> None:
         code, output = self.run_docs_guard(
@@ -2596,6 +3208,7 @@ class DocsWorkflowHygieneTests(unittest.TestCase):
             """
             cargo run -p netdiag-cli -- lab run examples/scenarios/lab-congestion-001.yaml
             cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
+            CARGO_TARGET_DIR="$PWD/target/adapter-validator" cargo build --locked -p netdiag-cli --bin netdiag-cli
             cargo run -p netdiag-cli -- benchmark run --model-dir artifacts/model
             cargo run -p netdiag-cli -- pilot model-gate \\
               --model-dir artifacts/model \\
@@ -3542,6 +4155,10 @@ class CoverageSummaryTests(unittest.TestCase):
         self.assertIn("artifact-root initialize", smoke)
         self.assertIn('training_dataset="$workspace/input/', smoke)
         self.assertIn('--model-dir "$artifacts/model"', smoke)
+        self.assertIn(
+            'benchmark_report_archive="$ROOT/target/benchmark-reports"', smoke
+        )
+        self.assertIn("python3 scripts/publish_benchmark_report.py", smoke)
         self.assertIn("failed pilot smoke workspace preserved for diagnosis", smoke)
         self.assertIn("refusing to clean an unverified pilot smoke workspace", smoke)
         self.assertRegex(smoke, r"(?m)^\s*cleanup_pilot_smoke\s*$")

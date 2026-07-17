@@ -10,8 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCS = [
     ROOT / "README.md",
     ROOT / "docs" / "getting-started.md",
+    ROOT / "docs" / "api-source.md",
     ROOT / "docs" / "quality-gates.md",
     ROOT / "docs" / "release-process.md",
+    ROOT / "examples" / "adapters" / "README.md",
 ]
 SCOPED_COVERAGE_MARKERS = (
     "v0.5 pilot/cli",
@@ -94,6 +96,49 @@ def logical_cargo_commands(body: str) -> list[str]:
     return commands
 
 
+def shell_code_blocks(body: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] | None = None
+    inside_fence = False
+    for raw_line in body.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            if inside_fence:
+                if current is not None:
+                    blocks.append("\n".join(current))
+                current = None
+                inside_fence = False
+            else:
+                language = stripped[3:].strip().lower()
+                current = [] if language in {"", "bash", "sh", "shell"} else None
+                inside_fence = True
+            continue
+        if inside_fence and current is not None:
+            current.append(raw_line)
+    return blocks
+
+
+def logical_shell_commands(body: str) -> list[str]:
+    commands: list[str] = []
+    current: list[str] = []
+    for raw_line in body.splitlines():
+        line = strip_shell_comment(raw_line).strip()
+        if not line:
+            continue
+        continued = line.endswith("\\")
+        normalized = line[:-1].strip() if continued else line
+        if current:
+            current.append(normalized)
+        else:
+            current = [normalized]
+        if not continued:
+            commands.append(" ".join(current))
+            current = []
+    if current:
+        commands.append(" ".join(current))
+    return commands
+
+
 def check_coverage_claims(path: Path, body: str, failures: list[str]) -> None:
     for paragraph in paragraphs(body):
         lower = " ".join(paragraph.lower().split())
@@ -150,6 +195,85 @@ def check_promotion_command_examples(path: Path, body: str, failures: list[str])
             )
 
 
+def check_benchmark_validator_prebuilds(
+    path: Path, body: str, failures: list[str]
+) -> None:
+    for paragraph in paragraphs(body):
+        commands = logical_cargo_commands(paragraph)
+        benchmark_indexes = [
+            index for index, command in enumerate(commands) if "benchmark run" in command
+        ]
+        if not benchmark_indexes:
+            continue
+        validator_build_indexes = [
+            index
+            for index, command in enumerate(commands)
+            if "CARGO_TARGET_DIR=" in command
+            and "cargo build --locked" in command
+            and "-p netdiag-cli" in command
+            and "--bin netdiag-cli" in command
+        ]
+        relative = path.relative_to(ROOT)
+        for benchmark_index in benchmark_indexes:
+            if not any(index < benchmark_index for index in validator_build_indexes):
+                failures.append(
+                    f"{relative} benchmark example must prebuild the trusted Rust validator"
+                )
+
+
+def check_adapter_validator_commands(
+    path: Path, body: str, failures: list[str]
+) -> None:
+    relative = path.relative_to(ROOT)
+    for stale in (
+        "python3 scripts/validate_adapter_samples.py",
+        "python3 scripts/validate_adapter_contract.py",
+    ):
+        if stale in body:
+            failures.append(
+                f"{relative} documents a validator command without the reviewed schema venv: {stale}"
+            )
+    for block in shell_code_blocks(body):
+        commands = logical_shell_commands(block)
+        validator_indexes = [
+            index
+            for index, command in enumerate(commands)
+            if "scripts/validate_adapter_samples.py" in command
+            or "scripts/validate_adapter_contract.py" in command
+        ]
+        if not validator_indexes:
+            continue
+        build_indexes = [
+            index
+            for index, command in enumerate(commands)
+            if "CARGO_TARGET_DIR=" in command
+            and "cargo build --locked" in command
+            and "-p netdiag-cli" in command
+            and "--bin netdiag-cli" in command
+        ]
+        if 'validator_target="$(pwd -P)/target/adapter-validator"' not in block:
+            failures.append(
+                f"{relative} adapter validation block must bind the fixed validator target"
+            )
+        for index in validator_indexes:
+            command = commands[index]
+            if not any(build_index < index for build_index in build_indexes):
+                failures.append(
+                    f"{relative} adapter validation command must follow a locked validator build"
+                )
+            if ".venv-jsonschema/bin/python" not in command:
+                failures.append(
+                    f"{relative} adapter validation command must use the reviewed schema venv"
+                )
+            if (
+                "--rust-validator" not in command
+                or "$validator_target/debug/netdiag-cli" not in command
+            ):
+                failures.append(
+                    f"{relative} adapter validation command must pass the fixed Rust validator"
+                )
+
+
 def main() -> int:
     failures: list[str] = []
     for path in DOCS:
@@ -162,6 +286,8 @@ def main() -> int:
             )
         check_coverage_claims(path, body, failures)
         check_promotion_command_examples(path, body, failures)
+        check_benchmark_validator_prebuilds(path, body, failures)
+        check_adapter_validator_commands(path, body, failures)
 
     if failures:
         for failure in failures:

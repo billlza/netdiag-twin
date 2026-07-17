@@ -2,7 +2,7 @@ use super::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const RESPONSIVE_PROCESS_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 

@@ -27,6 +27,9 @@ CI_WORKFLOW = WORKFLOW_DIRECTORY / "ci.yml"
 SCHEMA_REQUIREMENTS_INPUT = ROOT / "requirements-jsonschema.in"
 SCHEMA_REQUIREMENTS_LOCK = ROOT / "requirements-jsonschema.lock"
 ADAPTER_PROCESS_SOURCE = ROOT / "scripts" / "adapter_process.py"
+BENCHMARK_REPORT_PUBLISHER_SOURCE = (
+    ROOT / "scripts" / "publish_benchmark_report.py"
+)
 ADAPTER_VALIDATOR_SOURCES = (
     ROOT / "scripts" / "validate_adapter_samples.py",
     ROOT / "scripts" / "validate_adapter_contract.py",
@@ -226,7 +229,10 @@ def yaml_job_body(body: str, name: str) -> str | None:
 
 
 def validate_schema_requirements(failures: list[str]) -> None:
-    expected_input = "jsonschema[format-nongpl]==4.25.1\n"
+    expected_input = (
+        "jsonschema[format-nongpl]==4.25.1\n"
+        'typing-extensions==4.16.0; python_version < "3.13"\n'
+    )
     if not SCHEMA_REQUIREMENTS_INPUT.is_file():
         failures.append("schema validator input requirements file is missing")
         return
@@ -248,7 +254,11 @@ def validate_schema_requirements(failures: list[str]) -> None:
     pinned: dict[str, int] = {}
     current: str | None = None
     for line in lock_body.splitlines():
-        match = re.fullmatch(r"([a-z0-9][a-z0-9_.-]*)==([^\\\s]+) \\", line)
+        match = re.fullmatch(
+            r'([a-z0-9][a-z0-9_.-]*)==([^\\\s;]+)'
+            r'( ; python_version < "3\.13")? \\',
+            line,
+        )
         if match is not None:
             if current is not None and pinned[current] == 0:
                 failures.append(f"schema validator dependency {current} has no SHA-256 hash")
@@ -262,6 +272,14 @@ def validate_schema_requirements(failures: list[str]) -> None:
         failures.append(f"schema validator dependency {current} has no SHA-256 hash")
     if pinned.get("jsonschema") is None or "jsonschema==4.25.1 \\" not in lock_body:
         failures.append("schema validator lock must pin jsonschema 4.25.1")
+    if (
+        pinned.get("typing-extensions") is None
+        or 'typing-extensions==4.16.0 ; python_version < "3.13" \\'
+        not in lock_body
+    ):
+        failures.append(
+            "schema validator lock must pin the Python 3.12 typing-extensions dependency"
+        )
     if not pinned:
         failures.append("schema validator lock contains no pinned dependencies")
 
@@ -304,6 +322,20 @@ def validate_adapter_process_hygiene(failures: list[str]) -> None:
         "env=dict(environment)",
         "def validation_python_environment(",
         '[sys.executable, "-I", "-B", str(adapter_path), *args]',
+        "def trusted_rust_ingest_validator(",
+        'root / "target" / "adapter-validator" / "debug" / "netdiag-cli"',
+        "def _directory_chain(",
+        "metadata.st_uid not in trusted_owners",
+        "Rust ingest validator directory chain must not be group- or world-writable",
+        "def _validate_acl_boundary(",
+        "os.listxattr(path, follow_symlinks=False)",
+        '["/bin/ls", "-lde", *[str(path) for path in paths]]',
+        "metadata.st_uid != os.geteuid()",
+        "stat.S_IWGRP | stat.S_IWOTH",
+        "def validate_rust_ingest(",
+        "validator = trusted_rust_ingest_validator(validator, workspace_root)",
+        '[str(validator), "validate-trace", str(sample_path)]',
+        "environment={},",
         "os.killpg",
         "signal.SIGKILL",
         "payload.decode(\"utf-8\")",
@@ -314,8 +346,22 @@ def validate_adapter_process_hygiene(failures: list[str]) -> None:
             )
     for source in ADAPTER_VALIDATOR_SOURCES:
         body = source.read_text(encoding="utf-8")
-        if "run_bounded(" not in body:
-            failures.append(f"adapter validator must use run_bounded: {source}")
+        for fragment in (
+            "--rust-validator",
+            "trusted_rust_ingest_validator(args.rust_validator, ROOT)",
+            "validate_rust_ingest(rust_validator, sample_path, ROOT)",
+        ):
+            if fragment not in body:
+                failures.append(
+                    f"adapter validator must use the explicit prebuilt Rust boundary: "
+                    f"{source}: {fragment}"
+                )
+        for forbidden in ("shutil.which", '"cargo"', "'cargo'"):
+            if forbidden in body:
+                failures.append(
+                    f"adapter validator must not invoke Cargo during sample validation: "
+                    f"{source}: {forbidden}"
+                )
 
     iperf_body = IPERF_ADAPTER_SOURCE.read_text(encoding="utf-8")
     for fragment in (
@@ -347,6 +393,27 @@ def validate_adapter_process_hygiene(failures: list[str]) -> None:
         if fragment not in tc_netem_body:
             failures.append(
                 f"tc/netem adapter is missing its fail-closed mutation control: {fragment}"
+            )
+
+
+def validate_benchmark_report_publisher_hygiene(failures: list[str]) -> None:
+    if not BENCHMARK_REPORT_PUBLISHER_SOURCE.is_file():
+        failures.append("benchmark report publisher source is missing")
+        return
+    body = BENCHMARK_REPORT_PUBLISHER_SOURCE.read_text(encoding="utf-8")
+    for fragment in (
+        "class BenchmarkReportPublicationError(RuntimeError)",
+        'EXPECTED_REPORT_FILES = frozenset({"benchmark_report.json", "benchmark_report.md"})',
+        "def publish_benchmark_report(source: Path, destination: Path) -> None:",
+        "metadata.st_uid != os.geteuid()",
+        "stat.S_IWGRP | stat.S_IWOTH",
+        "refusing to replace an existing benchmark report archive entry",
+        "os.rename(source, destination)",
+        "published benchmark report identity changed during publication",
+    ):
+        if fragment not in body:
+            failures.append(
+                f"benchmark report publisher is missing fail-closed control: {fragment}"
             )
 
 
@@ -727,6 +794,61 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         failures.append(
             "CI schema environments must install the reviewed binary-only hash lock exactly"
         )
+    adapter_schema_body = yaml_job_body(ci_body, "adapter-schema") or ""
+    required_adapter_schema_fragments = (
+        "CARGO_TARGET_DIR: ${{ github.workspace }}/target/adapter-validator",
+        "cargo build --locked --quiet -p netdiag-cli --bin netdiag-cli",
+        '.venv-jsonschema/bin/python scripts/validate_adapter_samples.py --rust-validator "$CARGO_TARGET_DIR/debug/netdiag-cli"',
+        '.venv-jsonschema/bin/python scripts/validate_adapter_contract.py --rust-validator "$CARGO_TARGET_DIR/debug/netdiag-cli"',
+    )
+    for fragment in required_adapter_schema_fragments:
+        if fragment not in adapter_schema_body:
+            failures.append(
+                f"adapter-schema must prebuild and reuse the trusted Rust validator: {fragment}"
+            )
+    if all(
+        fragment in adapter_schema_body for fragment in required_adapter_schema_fragments
+    ):
+        adapter_schema_indexes = [
+            adapter_schema_body.index(fragment)
+            for fragment in required_adapter_schema_fragments
+        ]
+        if adapter_schema_indexes != sorted(adapter_schema_indexes):
+            failures.append(
+                "adapter-schema must build the trusted Rust validator before both validation passes"
+            )
+    rust_ci_body = yaml_job_body(ci_body, "rust") or ""
+    strict_step = rust_ci_body.find("id: strict_quality")
+    success_upload = rust_ci_body.find("- name: Upload successful benchmark report")
+    failure_upload = rust_ci_body.find("- name: Upload failed benchmark diagnostics")
+    if min(strict_step, success_upload, failure_upload) < 0 or not (
+        strict_step < success_upload < failure_upload
+    ):
+        failures.append(
+            "CI must order the strict gate before separate successful and failed benchmark uploads"
+        )
+    else:
+        success_upload_body = rust_ci_body[success_upload:failure_upload]
+        failure_upload_body = rust_ci_body[failure_upload:]
+        for fragment in (
+            "steps.strict_quality.outcome == 'success'",
+            "path: target/benchmark-reports",
+            "if-no-files-found: error",
+        ):
+            if fragment not in success_upload_body:
+                failures.append(
+                    f"CI successful benchmark upload is missing: {fragment}"
+                )
+        for fragment in (
+            "steps.strict_quality.outcome == 'failure'",
+            "target/pilot-smoke.*/benchmark-report",
+            "target/benchmark-reports/pilot-smoke.*",
+            "if-no-files-found: ignore",
+        ):
+            if fragment not in failure_upload_body:
+                failures.append(
+                    f"CI failed benchmark diagnostics upload is missing: {fragment}"
+                )
     if "ref: ${{ inputs.checkout_ref || github.sha }}" not in platform_body:
         failures.append(
             "platform security workflow must checkout the immutable caller revision"
@@ -769,6 +891,9 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         "resolve_trusted_python_runtime",
         'BoundedCommand::new(executable)',
         '.args(["-E", "-B", "-s"])',
+        'RUST_VALIDATOR_RELATIVE_PATH: &str = "target/adapter-validator/debug/netdiag-cli"',
+        ".canonicalize().with_path(&repository_path)?",
+        '.arg("--rust-validator")',
         '("PATH", runtime_path)',
         '("PYTHONNOUSERSITE", "1")',
         '("PYTHONDONTWRITEBYTECODE", "1")',
@@ -777,6 +902,10 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
             failures.append(
                 f"benchmark validation is missing trusted Python control: {fragment}"
             )
+    if '.arg("--schema-only")' in benchmark_body:
+        failures.append(
+            "benchmark validation must not bypass Rust ingest with --schema-only"
+        )
 
     ordered_steps = (
         "Validate release provenance",
@@ -822,6 +951,7 @@ def main() -> int:
     smoke_body = shell_function_body(active_body, "run_pilot_smoke")
     strict_body = shell_function_body(active_body, "run_strict")
     schema_python_body = shell_function_body(active_body, "schema_python")
+    adapter_contract_body = shell_function_body(active_body, "run_adapter_contracts")
     commands = logical_cargo_commands(smoke_body or "")
     calibrate_indexes = [
         index for index, command in enumerate(commands) if "lab calibrate" in command
@@ -835,6 +965,7 @@ def main() -> int:
     failures: list[str] = []
     validate_schema_requirements(failures)
     validate_adapter_process_hygiene(failures)
+    validate_benchmark_report_publisher_hygiene(failures)
     validate_perf_script_hygiene(failures)
     validate_release_evidence_input_hygiene(failures)
     validate_workflow_hygiene(failures)
@@ -853,6 +984,38 @@ def main() -> int:
             failures.append(
                 "check_rust_quality.sh schema_python must not fall back to basename python3"
             )
+    if adapter_contract_body is None:
+        failures.append("check_rust_quality.sh must define run_adapter_contracts")
+    else:
+        required_adapter_contract_fragments = (
+            'validator_target_dir="$ROOT/target/adapter-validator"',
+            'CARGO_TARGET_DIR="$validator_target_dir" cargo build --locked --quiet',
+            "-p netdiag-cli --bin netdiag-cli",
+            'scripts/validate_adapter_samples.py --rust-validator "$validator"',
+            'scripts/validate_adapter_contract.py --rust-validator "$validator"',
+        )
+        for fragment in required_adapter_contract_fragments:
+            if fragment not in adapter_contract_body:
+                failures.append(
+                    "check_rust_quality.sh run_adapter_contracts must prebuild and "
+                    f"reuse the trusted Rust validator: {fragment}"
+                )
+        if adapter_contract_body.count("cargo build") != 1:
+            failures.append(
+                "check_rust_quality.sh run_adapter_contracts must build the Rust validator exactly once"
+            )
+        if all(
+            fragment in adapter_contract_body
+            for fragment in required_adapter_contract_fragments
+        ):
+            adapter_contract_indexes = [
+                adapter_contract_body.index(fragment)
+                for fragment in required_adapter_contract_fragments
+            ]
+            if adapter_contract_indexes != sorted(adapter_contract_indexes):
+                failures.append(
+                    "check_rust_quality.sh must build the Rust validator before both validation passes"
+                )
     for variable in FORBIDDEN_COVERAGE_ENVIRONMENT:
         if os.environ.get(variable):
             failures.append(
@@ -895,12 +1058,50 @@ def main() -> int:
         failures.append(
             "check_rust_quality.sh must define a parseable run_pilot_smoke function"
         )
+    else:
+        for fragment in (
+            'benchmark_report_archive="$ROOT/target/benchmark-reports"',
+            'published_benchmark_report="$benchmark_report_archive/${workspace##*/}"',
+            "python3 scripts/publish_benchmark_report.py",
+            '"$benchmark_report" "$published_benchmark_report"',
+        ):
+            if fragment not in smoke_body:
+                failures.append(
+                    f"check_rust_quality.sh pilot smoke report publication is missing: {fragment}"
+                )
+        model_gate_position = smoke_body.find("pilot model-gate")
+        publication_position = smoke_body.find(
+            "python3 scripts/publish_benchmark_report.py"
+        )
+        cleanup_position = smoke_body.rfind("\n  cleanup_pilot_smoke")
+        if min(model_gate_position, publication_position, cleanup_position) < 0 or not (
+            model_gate_position < publication_position < cleanup_position
+        ):
+            failures.append(
+                "check_rust_quality.sh must publish the benchmark report after model-gate and before cleanup"
+            )
     if strict_body is None:
         failures.append("check_rust_quality.sh must define a parseable run_strict function")
     else:
-        if re.search(r"(?m)^\s*run_pilot_smoke(?:\s*(?:;|$))", strict_body) is None:
+        adapter_contract_match = re.search(
+            r"(?m)^\s*run_adapter_contracts(?:\s*(?:;|$))", strict_body
+        )
+        pilot_smoke_match = re.search(
+            r"(?m)^\s*run_pilot_smoke(?:\s*(?:;|$))", strict_body
+        )
+        if pilot_smoke_match is None:
             failures.append(
                 "check_rust_quality.sh run_strict must invoke run_pilot_smoke"
+            )
+        if adapter_contract_match is None:
+            failures.append(
+                "check_rust_quality.sh run_strict must build and validate the Rust adapter boundary"
+            )
+        elif pilot_smoke_match is not None and (
+            adapter_contract_match.start() > pilot_smoke_match.start()
+        ):
+            failures.append(
+                "check_rust_quality.sh run_strict must build the Rust adapter validator before pilot smoke"
             )
         strict_commands = logical_cargo_commands(strict_body)
         if not any(

@@ -280,6 +280,8 @@ done
 Gate a trained model before promoting it for real pilots:
 
 ```bash
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked -p netdiag-cli --bin netdiag-cli
 cargo run -p netdiag-cli -- lab calibrate --artifacts artifacts
 cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
@@ -356,6 +358,8 @@ cargo test --workspace
 RUSTFLAGS="-D warnings" cargo test --workspace
 scripts/check_perf_budget.sh
 scripts/check_architecture_guard.sh
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked -p netdiag-cli --bin netdiag-cli
 cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
   --output target/benchmark-report
@@ -398,12 +402,15 @@ cargo run -p netdiag-cli -- reliability check --artifacts artifacts --run-id <ru
 Run the bundled benchmark report:
 
 ```bash
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked -p netdiag-cli --bin netdiag-cli
 cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
   --output target/benchmark-report
 ```
 
-The bundled benchmark provisions its deterministic smoke model. For
+The bundled benchmark reuses the prebuilt Rust ingest validator from the fixed
+workspace target shown above and provisions its deterministic smoke model. For
 promotion/release use, pass `--model-dir artifacts/model` so
 `benchmark_report.json` records the candidate model and dataset hashes that
 `pilot model-gate` verifies.

@@ -2,16 +2,20 @@ use super::CaptureControl;
 use crate::bounded_process::{BoundedCommand, ProcessFailure, ProcessFailureReason, ProcessLimits};
 use crate::error::{NetdiagError, Result};
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 pub(super) const NETSTAT_PROGRAM: &str = "/usr/sbin/netstat";
 
+#[cfg(target_os = "macos")]
 const NETSTAT_LIMITS: ProcessLimits = ProcessLimits {
     timeout: Duration::from_secs(2),
     stdout_bytes: 1024 * 1024,
     stderr_bytes: 64 * 1024,
 };
 
+#[cfg(target_os = "macos")]
 pub(super) fn read_netstat_output(control: &CaptureControl) -> Result<Vec<u8>> {
     run_netstat(Path::new(NETSTAT_PROGRAM), control, NETSTAT_LIMITS)
 }

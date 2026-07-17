@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MODE="${1:-fast}"
 COVERAGE_MIN="${NETDIAG_COVERAGE_MIN:-90}"
 WORKSPACE_COVERAGE_MIN="${NETDIAG_WORKSPACE_COVERAGE_MIN:-79.5}"
@@ -41,9 +41,15 @@ schema_python() {
 
 run_adapter_contracts() {
   local python
+  local validator
+  local validator_target_dir
   python="$(schema_python)"
-  "$python" scripts/validate_adapter_samples.py
-  "$python" scripts/validate_adapter_contract.py
+  validator_target_dir="$ROOT/target/adapter-validator"
+  validator="$validator_target_dir/debug/netdiag-cli"
+  CARGO_TARGET_DIR="$validator_target_dir" cargo build --locked --quiet \
+    -p netdiag-cli --bin netdiag-cli
+  "$python" scripts/validate_adapter_samples.py --rust-validator "$validator"
+  "$python" scripts/validate_adapter_contract.py --rust-validator "$validator"
 }
 
 run_python_quality_guards() {
@@ -140,12 +146,16 @@ run_pilot_smoke() {
   local training_dataset
   local benchmark_artifacts
   local benchmark_report
+  local benchmark_report_archive
+  local published_benchmark_report
   workspace="$(mktemp -d "$ROOT/target/pilot-smoke.XXXXXX")"
   artifacts="$workspace/artifacts"
   scenarios="$workspace/scenarios"
   training_dataset="$workspace/input/pilot-smoke-training-expanded.jsonl"
   benchmark_artifacts="$workspace/benchmark-artifacts"
   benchmark_report="$workspace/benchmark-report"
+  benchmark_report_archive="$ROOT/target/benchmark-reports"
+  published_benchmark_report="$benchmark_report_archive/${workspace##*/}"
 
   cleanup_pilot_smoke() {
     local status=$?
@@ -288,6 +298,8 @@ PY
     --benchmark-report "$benchmark_report/benchmark_report.json" \
     --calibration-report "$artifacts/lab_calibration_report.json" \
     --min-rows-per-label 1
+  python3 scripts/publish_benchmark_report.py \
+    "$benchmark_report" "$published_benchmark_report"
   cleanup_pilot_smoke
   )
 }

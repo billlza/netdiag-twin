@@ -17,6 +17,11 @@ check_lines() {
   local path="$1"
   local max_lines="$2"
   local lines
+  if ! git -C "$ROOT" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+    echo "architecture guard failed: $path is absent from the Git index" >&2
+    fail=1
+    return
+  fi
   lines="$("$PYTHON_EXECUTABLE" -B "$ROOT/scripts/count_production_lines.py" "$ROOT/$path")"
   if (( lines > max_lines )); then
     echo "architecture guard failed: $path has $lines production lines, max $max_lines" >&2

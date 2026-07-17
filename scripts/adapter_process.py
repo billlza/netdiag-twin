@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -20,6 +21,10 @@ from strict_json import parse_json_strict
 ADAPTER_TIMEOUT_SECONDS = 15.0
 ADAPTER_STDOUT_LIMIT_BYTES = 4 * 1024 * 1024
 ADAPTER_STDERR_LIMIT_BYTES = 256 * 1024
+RUST_VALIDATION_TIMEOUT_SECONDS = 60.0
+RUST_VALIDATION_OUTPUT_LIMIT_BYTES = 1024 * 1024
+TRUST_INSPECTION_TIMEOUT_SECONDS = 2.0
+TRUST_INSPECTION_OUTPUT_LIMIT_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _PIPE_CLOSE_TIMEOUT_SECONDS = 0.5
 
@@ -264,34 +269,129 @@ def validation_python_environment() -> dict[str, str]:
     }
 
 
-def rust_validation_environment() -> dict[str, str]:
-    path = os.environ.get("PATH")
-    if not path:
-        raise RuntimeError("PATH is required to execute the Rust ingest validator")
-    environment = {
-        "PATH": path,
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-    for name in (
-        "HOME",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "CARGO_TARGET_DIR",
-        "CARGO_NET_OFFLINE",
-        "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-        "SDKROOT",
-        "DEVELOPER_DIR",
-        "MACOSX_DEPLOYMENT_TARGET",
-    ):
-        value = os.environ.get(name)
-        if value is not None:
-            environment[name] = value
-    return environment
+def _directory_chain(path: Path) -> tuple[Path, ...]:
+    return tuple(reversed((path, *path.parents)))
+
+
+def _validate_linux_acl_boundary(paths: Sequence[Path]) -> None:
+    for path in paths:
+        try:
+            attributes = os.listxattr(path, follow_symlinks=False)
+        except (AttributeError, OSError) as error:
+            raise RuntimeError("Rust ingest validator ACL state is unavailable") from error
+        for attribute in attributes:
+            name = os.fsdecode(attribute).lower()
+            namespace = name.split(".", 1)[0]
+            if "acl" in name and namespace in {"security", "system", "trusted"}:
+                raise RuntimeError(
+                    "Rust ingest validator path must not carry an extended ACL"
+                )
+
+
+def _validate_macos_acl_boundary(paths: Sequence[Path]) -> None:
+    completed = run_bounded(
+        ["/bin/ls", "-lde", *[str(path) for path in paths]],
+        cwd=Path("/"),
+        timeout_seconds=TRUST_INSPECTION_TIMEOUT_SECONDS,
+        stdout_limit_bytes=TRUST_INSPECTION_OUTPUT_LIMIT_BYTES,
+        stderr_limit_bytes=TRUST_INSPECTION_OUTPUT_LIMIT_BYTES,
+        environment={"LC_ALL": "C"},
+    )
+    if completed.returncode != 0 or completed.stderr.strip():
+        raise RuntimeError("Rust ingest validator ACL state could not be inspected")
+    for line in completed.stdout.splitlines():
+        entry_number = line.lstrip().split(":", 1)[0]
+        if entry_number.isdecimal():
+            raise RuntimeError(
+                "Rust ingest validator path must not carry an extended ACL"
+            )
+
+
+def _validate_acl_boundary(paths: Sequence[Path]) -> None:
+    if sys.platform == "darwin":
+        _validate_macos_acl_boundary(paths)
+    elif sys.platform.startswith("linux"):
+        _validate_linux_acl_boundary(paths)
+    else:
+        raise RuntimeError(
+            "Rust ingest validator ACL validation is unsupported on this platform"
+        )
+
+
+def trusted_rust_ingest_validator(path: Path, workspace_root: Path) -> Path:
+    if os.name != "posix":
+        raise RuntimeError("Rust ingest validation requires a POSIX process boundary")
+    if not path.is_absolute() or ".." in path.parts:
+        raise RuntimeError("Rust ingest validator must be a normalized absolute path")
+    if not workspace_root.is_absolute() or ".." in workspace_root.parts:
+        raise RuntimeError("workspace root must be a normalized absolute path")
+    try:
+        root = workspace_root.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("workspace root could not be resolved") from error
+    if root != workspace_root:
+        raise RuntimeError("workspace root path must not contain symlinks")
+    expected = root / "target" / "adapter-validator" / "debug" / "netdiag-cli"
+    if path != expected:
+        raise RuntimeError("Rust ingest validator is outside the trusted build location")
+
+    trusted_owners = {0, os.geteuid()}
+    directories = _directory_chain(path.parent)
+    try:
+        for directory in directories:
+            metadata = directory.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError(
+                    "Rust ingest validator directory chain must not contain symlinks"
+                )
+            if metadata.st_uid not in trusted_owners:
+                raise RuntimeError(
+                    "Rust ingest validator directory chain has an untrusted owner"
+                )
+            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise RuntimeError(
+                    "Rust ingest validator directory chain must not be group- or world-writable"
+                )
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("Rust ingest validator is unavailable") from error
+    if resolved != path:
+        raise RuntimeError("Rust ingest validator path must not contain symlinks")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size <= 0:
+        raise RuntimeError("Rust ingest validator must be a non-empty regular file")
+    if metadata.st_uid != os.geteuid():
+        raise RuntimeError("Rust ingest validator must be owned by the current user")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError("Rust ingest validator must not be group- or world-writable")
+    if not os.access(path, os.X_OK):
+        raise RuntimeError("Rust ingest validator must be executable")
+    _validate_acl_boundary((*directories, path))
+    return path
+
+
+def validate_rust_ingest(
+    validator: Path, sample_path: Path, workspace_root: Path
+) -> None:
+    # Revalidate immediately before every execution. Once the complete directory
+    # chain is private, another OS principal cannot replace the checked path;
+    # processes running under this same effective UID are not a security boundary.
+    validator = trusted_rust_ingest_validator(validator, workspace_root)
+    completed = run_bounded(
+        [str(validator), "validate-trace", str(sample_path)],
+        cwd=workspace_root,
+        timeout_seconds=RUST_VALIDATION_TIMEOUT_SECONDS,
+        stdout_limit_bytes=RUST_VALIDATION_OUTPUT_LIMIT_BYTES,
+        stderr_limit_bytes=RUST_VALIDATION_OUTPUT_LIMIT_BYTES,
+        environment={},
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        raise RuntimeError(detail)
+    if completed.stderr.strip():
+        raise RuntimeError("Rust ingest validation emitted non-empty stderr on success")
 
 
 def run_json(adapter_path: Path, args: list[str]) -> Any:

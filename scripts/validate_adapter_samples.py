@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -11,9 +10,9 @@ from typing import Any
 
 from adapter_process import (
     parse_json_strict,
-    run_bounded,
     run_json,
-    rust_validation_environment,
+    trusted_rust_ingest_validator,
+    validate_rust_ingest,
 )
 from adapter_quality import validate_declared_measurement_quality
 from schema_validation import bounded_validation_errors
@@ -28,8 +27,6 @@ except ImportError as error:
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "examples/adapters/schema/netdiag-adapter-payload.schema.json"
-RUST_VALIDATION_TIMEOUT_SECONDS = 60.0
-RUST_VALIDATION_OUTPUT_LIMIT_BYTES = 1024 * 1024
 
 
 def main() -> int:
@@ -39,7 +36,22 @@ def main() -> int:
         action="store_true",
         help="skip Rust ingest validation and only validate JSON schema",
     )
+    parser.add_argument(
+        "--rust-validator",
+        type=Path,
+        help="trusted absolute netdiag-cli path built for ingest validation",
+    )
     args = parser.parse_args()
+    if args.schema_only and args.rust_validator is not None:
+        parser.error("--rust-validator cannot be used with --schema-only")
+    if not args.schema_only and args.rust_validator is None:
+        parser.error("--rust-validator is required unless --schema-only is used")
+    rust_validator: Path | None = None
+    if args.rust_validator is not None:
+        try:
+            rust_validator = trusted_rust_ingest_validator(args.rust_validator, ROOT)
+        except RuntimeError as error:
+            parser.error(str(error))
     schema = parse_json_strict(
         SCHEMA_PATH.read_text(encoding="utf-8"), source="adapter payload schema"
     )
@@ -66,13 +78,13 @@ def main() -> int:
                     print(f"  - {error}", file=sys.stderr)
                 continue
 
-            if not args.schema_only:
+            if rust_validator is not None:
                 sample_path = tmp_dir / f"{name}.json"
                 sample_path.write_text(
                     json.dumps(payload, allow_nan=False), encoding="utf-8"
                 )
                 try:
-                    validate_rust_ingest(sample_path)
+                    validate_rust_ingest(rust_validator, sample_path, ROOT)
                 except RuntimeError as error:
                     failed = True
                     print(f"{name}: Rust ingest validation failed", file=sys.stderr)
@@ -96,36 +108,6 @@ def discover_adapters() -> list[tuple[str, Path]]:
 
 def emit_sample(adapter_path: Path) -> Any:
     return run_json(adapter_path, ["--emit-sample"])
-
-
-def validate_rust_ingest(sample_path: Path) -> None:
-    cargo = shutil.which("cargo")
-    if cargo is None:
-        raise RuntimeError("cargo executable is unavailable")
-    completed = run_bounded(
-        [
-            cargo,
-            "run",
-            "--quiet",
-            "-p",
-            "netdiag-cli",
-            "--",
-            "validate-trace",
-            str(sample_path),
-        ],
-        cwd=ROOT,
-        timeout_seconds=RUST_VALIDATION_TIMEOUT_SECONDS,
-        stdout_limit_bytes=RUST_VALIDATION_OUTPUT_LIMIT_BYTES,
-        stderr_limit_bytes=RUST_VALIDATION_OUTPUT_LIMIT_BYTES,
-        environment=rust_validation_environment(),
-    )
-    if completed.returncode != 0:
-        stderr = completed.stderr.strip()
-        stdout = completed.stdout.strip()
-        detail = stderr or stdout or f"exit code {completed.returncode}"
-        raise RuntimeError(detail)
-    if completed.stderr.strip():
-        raise RuntimeError("Rust ingest validation emitted non-empty stderr on success")
 
 
 def validation_errors(validator: Draft202012Validator, instance: Any) -> list[str]:

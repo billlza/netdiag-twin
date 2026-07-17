@@ -1,4 +1,5 @@
-target/
+/target/
+/crates/*/target/
 .venv-jsonschema/
 __pycache__/
 *.pyc

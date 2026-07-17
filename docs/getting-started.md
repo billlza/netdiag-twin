@@ -94,6 +94,8 @@ Run the v0.5.3 reliability and benchmark gates:
 ```bash
 python3 -m venv --clear --copies .venv-jsonschema
 .venv-jsonschema/bin/python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked -p netdiag-cli --bin netdiag-cli
 cargo run -p netdiag-cli -- benchmark run \
   --artifacts target/benchmark-artifacts \
   --output target/benchmark-report

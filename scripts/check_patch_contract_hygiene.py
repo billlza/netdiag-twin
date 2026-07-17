@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -94,6 +95,56 @@ def validate_patch_manifests(
         if not isinstance(package, dict) or package.get("name") != crate:
             failures.append(
                 f"local patch {crate} manifest package.name must match the patched crate"
+            )
+
+
+def validate_patch_trackedness(
+    patches: dict[str, str], failures: list[str]
+) -> None:
+    for crate, relative in sorted(patches.items()):
+        patch_root = ROOT / relative
+        try:
+            tracked_result = subprocess.run(
+                ["git", "-C", str(ROOT), "ls-files", "-z", "--", relative],
+                check=False,
+                capture_output=True,
+            )
+        except OSError as error:
+            failures.append(f"could not inspect tracked files for local patch {crate}: {error}")
+            continue
+        if tracked_result.returncode != 0:
+            failures.append(
+                f"could not inspect tracked files for local patch {crate}: "
+                f"git exited with {tracked_result.returncode}"
+            )
+            continue
+        try:
+            tracked = {
+                Path(path).relative_to(relative).as_posix()
+                for path in tracked_result.stdout.decode("utf-8").split("\0")
+                if path
+            }
+        except (UnicodeError, ValueError) as error:
+            failures.append(
+                f"could not parse tracked files for local patch {crate}: {error}"
+            )
+            continue
+
+        try:
+            local = {
+                path.relative_to(patch_root).as_posix()
+                for path in patch_root.rglob("*")
+                if path.is_file() or path.is_symlink()
+            }
+        except OSError as error:
+            failures.append(
+                f"could not enumerate tracked files for local patch {crate}: {error}"
+            )
+            continue
+        untracked = sorted(local - tracked)
+        if untracked:
+            failures.append(
+                f"local patch {crate} contains files absent from the Git index: {untracked}"
             )
 
 
@@ -319,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     patches = local_patches(workspace, failures)
     validate_patch_manifests(patches, excluded, failures)
+    validate_patch_trackedness(patches, failures)
     owners = contract_packages(members, set(patches), failures)
     provenance = validate_patch_provenance(
         ROOT,

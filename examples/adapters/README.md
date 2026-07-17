@@ -49,9 +49,16 @@ records and permissive for lab-specific metadata under `experiment`.
 
 Every Python adapter supports deterministic offline sample generation:
 
-```sh
+```bash
 python3 examples/adapters/dns-probe/adapter.py --emit-sample
-python3 scripts/validate_adapter_samples.py
+python3 -m venv --clear --copies .venv-jsonschema
+.venv-jsonschema/bin/python -m pip install --disable-pip-version-check \
+  --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked \
+  -p netdiag-cli --bin netdiag-cli
+.venv-jsonschema/bin/python scripts/validate_adapter_samples.py \
+  --rust-validator "$validator_target/debug/netdiag-cli"
 ```
 
 The CI validator uses `--emit-sample`, so adapter schema checks do not require
@@ -70,8 +77,12 @@ contract:
 
 The Generic Lab Kit adapters implement this contract now:
 
-```sh
-python3 scripts/validate_adapter_contract.py
+```bash
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked \
+  -p netdiag-cli --bin netdiag-cli
+.venv-jsonschema/bin/python scripts/validate_adapter_contract.py \
+  --rust-validator "$validator_target/debug/netdiag-cli"
 ```
 
 Pilot keeps `adapter_sample` as a compatibility mode for older adapters, but

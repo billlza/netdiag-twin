@@ -1,7 +1,7 @@
 use super::super::{BenchmarkCheck, BenchmarkSection, repo_root, timed_section};
 use super::schema_validation::schema_python_runtime;
 use crate::bounded_process::{BoundedCommand, ProcessFailure, ProcessFailureReason, ProcessLimits};
-use crate::error::{NetdiagError, Result};
+use crate::error::{IoContext, NetdiagError, Result};
 use crate::models::ConnectorHealthStatus;
 use serde_json::json;
 use std::path::Path;
@@ -13,22 +13,26 @@ const VALIDATOR_LIMITS: ProcessLimits = ProcessLimits {
     stdout_bytes: 1024 * 1024,
     stderr_bytes: 1024 * 1024,
 };
+const RUST_VALIDATOR_RELATIVE_PATH: &str = "target/adapter-validator/debug/netdiag-cli";
 
 pub(in crate::benchmark) fn run_adapter_validation_section() -> Result<BenchmarkSection> {
     timed_section("adapter schema and ingest", || {
         let python = schema_python_runtime()?;
+        let repository_path = repo_root();
+        let repository = repository_path.canonicalize().with_path(&repository_path)?;
+        let rust_validator = repository.join(RUST_VALIDATOR_RELATIVE_PATH);
         [
             "validate_adapter_samples.py",
             "validate_adapter_contract.py",
         ]
         .into_iter()
         .map(|script_name| {
-            let repository = repo_root();
             let script = repository.join("scripts").join(script_name);
             let output = execute_validator(
                 python.executable(),
                 python.runtime_path(),
                 &script,
+                &rust_validator,
                 &repository,
                 script_name,
                 VALIDATOR_LIMITS,
@@ -43,6 +47,7 @@ pub(super) fn execute_validator(
     executable: &Path,
     runtime_path: &str,
     script: &Path,
+    rust_validator: &Path,
     repository: &Path,
     script_name: &str,
     limits: ProcessLimits,
@@ -51,6 +56,8 @@ pub(super) fn execute_validator(
     command
         .args(["-E", "-B", "-s"])
         .arg(script)
+        .arg("--rust-validator")
+        .arg(rust_validator)
         .current_dir(repository)
         .envs([
             ("PATH", runtime_path),
@@ -62,7 +69,7 @@ pub(super) fn execute_validator(
         .map_err(|failure| validator_process_error(script_name, failure))
 }
 
-fn validator_check(script_name: &str, output: Output) -> BenchmarkCheck {
+pub(super) fn validator_check(script_name: &str, output: Output) -> BenchmarkCheck {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     BenchmarkCheck {

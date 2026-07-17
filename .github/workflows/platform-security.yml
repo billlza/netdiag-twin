@@ -62,6 +62,13 @@ jobs:
         env:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.temp }}/netdiag-vcpkg-binary-cache
         run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          if (!(Test-Path -LiteralPath $env:VCPKG_DEFAULT_BINARY_CACHE -PathType Container)) {
+            throw "vcpkg binary cache path is not a directory"
+          }
           $vcpkgRoot = Join-Path $env:RUNNER_TEMP "netdiag-vcpkg"
           git -c init.defaultBranch=main init --quiet $vcpkgRoot
           git -C $vcpkgRoot remote add origin https://github.com/microsoft/vcpkg.git

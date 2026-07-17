@@ -192,10 +192,26 @@ Validate lab adapter output against
 `examples/adapters/schema/netdiag-adapter-payload.schema.json`; NetDiag uses the
 canonical `records` for diagnosis and preserves experiment metadata in lab
 evidence files.
-Every example Python adapter also supports `--emit-sample`, and CI runs
-`python3 scripts/validate_adapter_samples.py` so JSON Schema drift, Rust ingest
-regressions, and full pipeline/report smoke failures are caught without touching
-live lab infrastructure. Pilot manifests must explicitly set `adapter.mode:
+Every example Python adapter also supports `--emit-sample`. CI installs the
+reviewed schema lock, builds one Rust ingest validator at the fixed workspace
+target, and passes that exact binary to both validation passes:
+
+```bash
+python3 -m venv --clear --copies .venv-jsonschema
+.venv-jsonschema/bin/python -m pip install --disable-pip-version-check \
+  --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
+validator_target="$(pwd -P)/target/adapter-validator"
+CARGO_TARGET_DIR="$validator_target" cargo build --locked \
+  -p netdiag-cli --bin netdiag-cli
+.venv-jsonschema/bin/python scripts/validate_adapter_samples.py \
+  --rust-validator "$validator_target/debug/netdiag-cli"
+.venv-jsonschema/bin/python scripts/validate_adapter_contract.py \
+  --rust-validator "$validator_target/debug/netdiag-cli"
+```
+
+This catches JSON Schema drift, Rust ingest regressions, and full
+pipeline/report smoke failures without touching live lab infrastructure. Pilot
+manifests must explicitly set `adapter.mode:
 sample` before a contract adapter receives `--emit-sample`; `adapter.mode: live`
 uses `--collect` without the sample flag. Missing or legacy mode metadata fails
 closed.

@@ -41,8 +41,12 @@ The fast gate runs:
 - `python3 scripts/check_patch_contract_hygiene.py`
 - explicit metadata, test, and warning-denied Clippy for every local patch
   contract
-- `scripts/validate_adapter_samples.py`
-- `scripts/validate_adapter_contract.py`
+- one locked `netdiag-cli` build with
+  `CARGO_TARGET_DIR="$(pwd -P)/target/adapter-validator"`
+- `.venv-jsonschema/bin/python scripts/validate_adapter_samples.py
+  --rust-validator "$(pwd -P)/target/adapter-validator/debug/netdiag-cli"`
+- `.venv-jsonschema/bin/python scripts/validate_adapter_contract.py
+  --rust-validator "$(pwd -P)/target/adapter-validator/debug/netdiag-cli"`
 - `python3 scripts/check_release_gate_hygiene.py`
 - `python3 scripts/check_docs_workflow_hygiene.py`
 - `python3 scripts/check_real_device_readiness.py`

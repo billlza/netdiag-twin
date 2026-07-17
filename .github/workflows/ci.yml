@@ -42,6 +42,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 20
     env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/adapter-validator
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Silence Git default branch hint
@@ -56,10 +57,12 @@ jobs:
         run: |
           python3 -m venv --clear --copies .venv-jsonschema
           .venv-jsonschema/bin/python -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r requirements-jsonschema.lock
+      - name: Build Rust ingest validator
+        run: cargo build --locked --quiet -p netdiag-cli --bin netdiag-cli
       - name: Validate adapter samples through schema and Rust ingest
-        run: .venv-jsonschema/bin/python scripts/validate_adapter_samples.py
+        run: .venv-jsonschema/bin/python scripts/validate_adapter_samples.py --rust-validator "$CARGO_TARGET_DIR/debug/netdiag-cli"
       - name: Validate Generic Lab Kit adapter contract
-        run: .venv-jsonschema/bin/python scripts/validate_adapter_contract.py
+        run: .venv-jsonschema/bin/python scripts/validate_adapter_contract.py --rust-validator "$CARGO_TARGET_DIR/debug/netdiag-cli"
 
   rust:
     runs-on: macos-14
@@ -102,6 +105,7 @@ jobs:
             https://static.crates.io/crates/wayland-scanner/wayland-scanner-0.31.10.crate
           python3 scripts/check_patch_contract_hygiene.py --archive-dir target/upstream-crates
       - name: Strict Rust quality gate
+        id: strict_quality
         run: scripts/check_rust_quality.sh strict
       - name: Upload performance report
         if: always()
@@ -110,10 +114,19 @@ jobs:
           name: perf-budget-report
           path: target/perf-budget-report.json
           if-no-files-found: ignore
-      - name: Upload benchmark report
-        if: always()
+      - name: Upload successful benchmark report
+        if: ${{ always() && steps.strict_quality.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-report
-          path: target/benchmark-report
+          path: target/benchmark-reports
+          if-no-files-found: error
+      - name: Upload failed benchmark diagnostics
+        if: ${{ always() && steps.strict_quality.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-report-failure
+          path: |
+            target/pilot-smoke.*/benchmark-report
+            target/benchmark-reports/pilot-smoke.*
           if-no-files-found: ignore

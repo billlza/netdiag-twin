@@ -121,12 +121,11 @@ fn overlap_error(reported: &Path) -> NetdiagError {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod tests {
     use super::leaf_names_may_alias;
     use std::path::Path;
 
-    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn unicode_case_fold_aliases_are_conservative_before_creation() {
         assert!(leaf_names_may_alias(

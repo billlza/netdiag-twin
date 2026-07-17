@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import unittest
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
@@ -4262,12 +4263,30 @@ class CoverageSummaryTests(unittest.TestCase):
         self.assertNotIn("target/llvm-cov-target", strict)
 
     def test_nextest_leaks_are_release_blocking_without_relaxing_detection(self) -> None:
-        config = (REPO_ROOT / ".config" / "nextest.toml").read_text(encoding="utf-8")
-        self.assertIn("[profile.default]", config)
-        self.assertIn(
-            'leak-timeout = { period = "200ms", result = "fail" }',
-            config,
+        with (REPO_ROOT / ".config" / "nextest.toml").open("rb") as handle:
+            config = tomllib.load(handle)
+        default = config["profile"]["default"]
+        self.assertEqual(
+            default["leak-timeout"],
+            {"period": "200ms", "result": "fail"},
         )
+        credential_overrides = [
+            override
+            for override in default["overrides"]
+            if override.get("filter")
+            == 'package(netdiag-app) & test(/^credential_lifecycle::/)'
+        ]
+        self.assertEqual(
+            credential_overrides,
+            [
+                {
+                    "filter": 'package(netdiag-app) & test(/^credential_lifecycle::/)',
+                    "threads-required": "num-test-threads",
+                }
+            ],
+        )
+        self.assertNotIn("leak-timeout", credential_overrides[0])
+        self.assertNotIn("retries", credential_overrides[0])
 
     def test_pilot_smoke_uses_an_initialized_unique_workspace(self) -> None:
         quality = (SCRIPTS / "check_rust_quality.sh").read_text(encoding="utf-8")

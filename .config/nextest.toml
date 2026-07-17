@@ -1,2 +1,6 @@
 [profile.default]
 leak-timeout = { period = "200ms", result = "fail" }
+
+[[profile.default.overrides]]
+filter = 'package(netdiag-app) & test(/^credential_lifecycle::/)'
+threads-required = "num-test-threads"

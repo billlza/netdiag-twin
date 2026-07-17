@@ -102,19 +102,21 @@ jobs:
           EXPECTED_SHA: ${{ inputs.checkout_ref || github.sha }}
         run: |
           set -euo pipefail
-          trusted_root="$(mktemp -d /tmp/netdiag-platform-security.XXXXXX)"
-          [[ "$trusted_root" == /tmp/netdiag-platform-security.?????? ]]
-          chmod 700 "$trusted_root"
+          trusted_root="$(sudo mktemp -d /opt/netdiag-platform-security.XXXXXX)"
+          [[ "$trusted_root" == /opt/netdiag-platform-security.?????? ]]
+          readonly trusted_root
           cleanup_trusted_root() {
             status=$?
             trap - EXIT
-            if ! rm -rf -- "$trusted_root"; then
+            if ! sudo rm -rf -- "$trusted_root"; then
               echo "failed to remove trusted platform-security checkout" >&2
               exit 1
             fi
             exit "$status"
           }
           trap cleanup_trusted_root EXIT
+          sudo chown "$(id -u):$(id -g)" "$trusted_root"
+          chmod 700 "$trusted_root"
           git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"
           actual_sha="$(git -C "$trusted_root/repo" rev-parse HEAD)"
           [[ "$actual_sha" == "$EXPECTED_SHA" ]] || (

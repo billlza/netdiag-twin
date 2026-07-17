@@ -25,10 +25,10 @@ impl StagedAdapters {
         #[cfg(not(unix))]
         {
             let _ = (manifest, manifest_dir, trusted_root, configured_root);
-            return Err(NetdiagError::Connector(
+            Err(NetdiagError::Connector(
                 "adapter staging is disabled on this platform because no atomic no-follow filesystem boundary is available"
                     .to_string(),
-            ));
+            ))
         }
         #[cfg(unix)]
         {

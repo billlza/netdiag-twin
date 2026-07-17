@@ -183,10 +183,12 @@ vcpkg commit with the null live-capture backend and the `wpcap` ABI name; this
 executes offline pcap parsing without requiring a privileged capture driver. The
 setup fails before Cargo if either the import library or runtime DLL is absent.
 Because GitHub's Ubuntu workspace inherits a default ACL from `/home`, the Linux
-runtime suite is executed from a private `0700` checkout created beneath the
-root-owned sticky `/tmp` boundary. The harness verifies that this checkout is the
-exact caller SHA and treats cleanup failure as a job failure; the production
-trusted-directory policy is never relaxed for CI.
+runtime suite is executed from a private `0700` checkout atomically created by
+`sudo mktemp` beneath root-owned, non-writable `/opt`, then assigned to the runner.
+The harness verifies that this checkout is the exact caller SHA and treats cleanup
+failure as a job failure; the production trusted-directory policy is never relaxed
+for CI. A private child beneath sticky, world-writable `/tmp` is intentionally not
+used because the strict adapter trust chain validates every ancestor.
 
 Both CI and Release call this same reusable workflow, so a tag cannot bypass
 native Windows validation. Release additionally requires a successful main CI

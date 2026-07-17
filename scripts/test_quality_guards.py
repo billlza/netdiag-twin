@@ -3041,11 +3041,14 @@ class CiPlatformGateTests(unittest.TestCase):
             job,
         )
         for fragment in (
-            "mktemp -d /tmp/netdiag-platform-security.XXXXXX",
+            "sudo mktemp -d /opt/netdiag-platform-security.XXXXXX",
+            '[[ "$trusted_root" == /opt/netdiag-platform-security.?????? ]]',
+            "readonly trusted_root",
+            'sudo chown "$(id -u):$(id -g)" "$trusted_root"',
             'chmod 700 "$trusted_root"',
             'git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"',
             '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
-            'rm -rf -- "$trusted_root"',
+            'sudo rm -rf -- "$trusted_root"',
         ):
             self.assertIn(fragment, job)
 

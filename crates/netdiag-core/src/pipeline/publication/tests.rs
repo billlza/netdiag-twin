@@ -1,6 +1,8 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::*;
-use crate::error::{AtomicPublishPhase, IoContext, NetdiagError};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::error::IoContext;
+use crate::error::{AtomicPublishPhase, NetdiagError};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]

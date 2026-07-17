@@ -108,7 +108,7 @@ pub enum NetdiagError {
     TrustedTemporaryDirectory {
         context: &'static str,
         #[source]
-        source: netdiag_platform::TrustedTempDirectoryError,
+        source: Box<netdiag_platform::TrustedTempDirectoryError>,
     },
     #[error(
         "operation completed for {context}, but trusted temporary directory cleanup failed: {source}"
@@ -116,7 +116,7 @@ pub enum NetdiagError {
     TrustedTemporaryDirectoryCleanupAfterSuccess {
         context: &'static str,
         #[source]
-        source: netdiag_platform::TrustedTempDirectoryError,
+        source: Box<netdiag_platform::TrustedTempDirectoryError>,
     },
     #[error(
         "operation failed for {context}: {operation}; trusted temporary directory cleanup also failed: {cleanup}"
@@ -125,7 +125,7 @@ pub enum NetdiagError {
         context: &'static str,
         #[source]
         operation: Box<NetdiagError>,
-        cleanup: netdiag_platform::TrustedTempDirectoryError,
+        cleanup: Box<netdiag_platform::TrustedTempDirectoryError>,
     },
     #[error(
         "evidence snapshot operation failed at {path}: {operation}; incomplete snapshot cleanup also failed: {cleanup}"

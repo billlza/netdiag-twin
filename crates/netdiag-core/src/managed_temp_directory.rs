@@ -11,8 +11,12 @@ pub(crate) struct ManagedTempDirectory {
 
 impl ManagedTempDirectory {
     pub(crate) fn create(context: &'static str, prefix: &str) -> Result<Self> {
-        let directory = TrustedTempDirectory::create(prefix)
-            .map_err(|source| NetdiagError::TrustedTemporaryDirectory { context, source })?;
+        let directory = TrustedTempDirectory::create(prefix).map_err(|source| {
+            NetdiagError::TrustedTemporaryDirectory {
+                context,
+                source: Box::new(source),
+            }
+        })?;
         Ok(Self { context, directory })
     }
 
@@ -24,7 +28,7 @@ impl ManagedTempDirectory {
         self.directory.validate_identity().map_err(|source| {
             NetdiagError::TrustedTemporaryDirectory {
                 context: self.context,
-                source,
+                source: Box::new(source),
             }
         })
     }
@@ -36,14 +40,14 @@ impl ManagedTempDirectory {
             Err(TrustedTempDirectoryFinishError::Cleanup(source)) => {
                 Err(NetdiagError::TrustedTemporaryDirectoryCleanupAfterSuccess {
                     context: self.context,
-                    source,
+                    source: Box::new(source),
                 })
             }
             Err(TrustedTempDirectoryFinishError::OperationAndCleanup { operation, cleanup }) => {
                 Err(NetdiagError::TrustedTemporaryDirectoryOperationAndCleanup {
                     context: self.context,
                     operation: Box::new(operation),
-                    cleanup,
+                    cleanup: Box::new(cleanup),
                 })
             }
         }

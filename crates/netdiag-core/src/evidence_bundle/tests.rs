@@ -285,7 +285,7 @@ fn failed_export_preserves_operation_and_snapshot_cleanup_failures() {
     };
     assert!(operation.to_string().contains("snapshot changed"));
     assert!(matches!(
-        cleanup,
+        cleanup.as_ref(),
         netdiag_platform::TrustedTempDirectoryError::CleanupSkipped { .. }
     ));
     assert_eq!(

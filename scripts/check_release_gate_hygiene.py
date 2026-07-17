@@ -857,8 +857,10 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         failures.append(
             "platform security workflow must verify the immutable caller revision"
         )
-    if "components: rustfmt" not in rust_ci_body:
-        failures.append("strict CI must install rustfmt before running the quality gate")
+    if "components: rustfmt, clippy" not in rust_ci_body:
+        failures.append(
+            "strict CI must install rustfmt and clippy before running the quality gate"
+        )
     for fragment in (
         "mktemp -d /tmp/netdiag-platform-security.XXXXXX",
         'chmod 700 "$trusted_root"',

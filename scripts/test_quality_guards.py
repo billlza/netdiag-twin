@@ -143,6 +143,33 @@ rm -rf "$ARTIFACTS"
         self.assertNotEqual(code, 0)
         self.assertIn("locked schema environment", stdout + stderr)
 
+    def test_workflow_hygiene_requires_clippy_for_the_strict_gate(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_directory = Path(tmp) / "workflows"
+            workflow_directory.mkdir()
+            for name in ("release.yml", "platform-security.yml"):
+                (workflow_directory / name).write_text(
+                    (REPO_ROOT / ".github/workflows" / name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            ci_body = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+                encoding="utf-8"
+            )
+            (workflow_directory / "ci.yml").write_text(
+                ci_body.replace("components: rustfmt, clippy", "components: rustfmt", 1),
+                encoding="utf-8",
+            )
+            module.WORKFLOW_DIRECTORY = workflow_directory
+            module.RELEASE_WORKFLOW = workflow_directory / "release.yml"
+            module.CI_WORKFLOW = workflow_directory / "ci.yml"
+            code, stdout, stderr = run_main(module)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("must install rustfmt and clippy", stdout + stderr)
+
     def test_private_credential_file_patterns_are_ignored(self) -> None:
         required_patterns = ("*.p8", "*.pfx", "*.pem", "*.key")
         samples = (
@@ -3022,14 +3049,14 @@ class CiPlatformGateTests(unittest.TestCase):
         ):
             self.assertIn(fragment, job)
 
-    def test_strict_ci_installs_rustfmt_before_the_quality_gate(self) -> None:
+    def test_strict_ci_installs_rustfmt_and_clippy_before_the_quality_gate(self) -> None:
         ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
         rust_job = ci_workflow.split("  rust:\n", 1)[1]
-        self.assertIn("components: rustfmt", rust_job)
+        self.assertIn("components: rustfmt, clippy", rust_job)
         self.assertLess(
-            rust_job.index("components: rustfmt"),
+            rust_job.index("components: rustfmt, clippy"),
             rust_job.index("scripts/check_rust_quality.sh strict"),
         )
 

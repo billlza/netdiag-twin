@@ -305,6 +305,7 @@ PY
 }
 
 run_fast() {
+  require_tool rg
   cargo fmt --all -- --check
   cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
   RUSTFLAGS="-D warnings" cargo test --locked --workspace --all-features
@@ -324,6 +325,7 @@ run_fast() {
 
 run_strict() {
   require_tool python3
+  require_tool rg
   require_cargo_subcommand nextest
   require_cargo_subcommand llvm-cov
   require_cargo_subcommand deny

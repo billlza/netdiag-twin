@@ -2,6 +2,33 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RIPGREP_EXECUTABLE="$(command -v rg || true)"
+if [[ -z "$RIPGREP_EXECUTABLE" || "$RIPGREP_EXECUTABLE" != /* || ! -f "$RIPGREP_EXECUTABLE" || ! -x "$RIPGREP_EXECUTABLE" ]]; then
+  echo "architecture guard failed: an absolute executable ripgrep (rg) is required" >&2
+  exit 2
+fi
+readonly RIPGREP_EXECUTABLE
+
+rg_matches() {
+  local status
+  if "$RIPGREP_EXECUTABLE" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if (( status == 1 )); then
+    return 1
+  fi
+  echo "architecture guard failed: ripgrep scan failed with status $status" >&2
+  exit 2
+}
+
+if ! rg_matches --quiet --fixed-strings \
+  'netdiag-ripgrep-self-test' <<< 'netdiag-ripgrep-self-test'; then
+  echo "architecture guard failed: ripgrep self-test did not match expected input" >&2
+  exit 2
+fi
+
 PYTHON_EXECUTABLE="${NETDIAG_PYTHON_EXECUTABLE:-}"
 if [[ -z "$PYTHON_EXECUTABLE" ]]; then
   PYTHON_EXECUTABLE="$(command -v python3 || true)"
@@ -118,7 +145,7 @@ check_lines "crates/netdiag-app/src/translations.rs" 410
 check_lines "crates/netdiag-app/src/source_selection.rs" 100
 check_lines "crates/netdiag-app/src/topology_state.rs" 40
 
-if rg --line-number 'std::process::Command|Command::new|/usr/libexec/PlistBuddy' \
+if rg_matches --line-number 'std::process::Command|Command::new|/usr/libexec/PlistBuddy' \
   "$ROOT/crates/netdiag-app/src/updater.rs"; then
   echo "architecture guard failed: updater metadata reads must stay in-process" >&2
   fail=1
@@ -592,7 +619,7 @@ pipeline_publication_paths=(
   "$ROOT/crates/netdiag-core/src/pipeline/execution.rs"
   "$ROOT/crates/netdiag-core/src/pipeline/publication.rs"
 )
-if rg --line-number \
+if rg_matches --line-number \
   'create_dir_all|remove_dir_all|(std::)?fs::rename|path_status' \
   "${pipeline_publication_paths[@]}"; then
   echo "architecture guard failed: pipeline run publication reintroduced path-based directory mutation" >&2
@@ -605,22 +632,22 @@ perf_lifecycle_paths=(
   "$ROOT/crates/netdiag-core/src/perf_budget/workspace.rs"
   "$ROOT/crates/netdiag-core/benches/perf_budget.rs"
 )
-if rg --line-number \
+if rg_matches --line-number \
   'remove_dir_all|create_dir_all|join\("current"\)|perf-bench-artifacts' \
   "${perf_lifecycle_paths[@]}"; then
   echo "architecture guard failed: performance measurements reintroduced path-based workspace reset" >&2
   fail=1
 fi
-if ! rg --quiet 'create_root_bound_staged_directory' \
+if ! rg_matches --quiet 'create_root_bound_staged_directory' \
      "$ROOT/crates/netdiag-core/src/perf_budget/workspace.rs" || \
-   ! rg --quiet 'discard_root_bound_staged_directory' \
+   ! rg_matches --quiet 'discard_root_bound_staged_directory' \
      "$ROOT/crates/netdiag-core/src/perf_budget/workspace.rs"; then
   echo "architecture guard failed: performance workspaces are no longer root-bound and disposable" >&2
   fail=1
 fi
-if ! rg --quiet 'TrustedTempDirectory::create' \
+if ! rg_matches --quiet 'TrustedTempDirectory::create' \
      "$ROOT/crates/netdiag-core/benches/perf_budget.rs" || \
-   ! rg --quiet 'workspace\.finish\(operation\)' \
+   ! rg_matches --quiet 'workspace\.finish\(operation\)' \
      "$ROOT/crates/netdiag-core/benches/perf_budget.rs"; then
   echo "architecture guard failed: the performance benchmark default workspace is no longer isolated and explicitly cleaned" >&2
   fail=1
@@ -642,12 +669,12 @@ strict_json_boundary_paths=(
   "$ROOT/crates/netdiag-core/src/pilot/promotion/input.rs"
   "$ROOT/crates/netdiag-core/src/perf_budget.rs"
 )
-if rg --line-number 'serde_json::from_(slice|str|reader)' "${strict_json_boundary_paths[@]}"; then
+if rg_matches --line-number 'serde_json::from_(slice|str|reader)' "${strict_json_boundary_paths[@]}"; then
   echo "architecture guard failed: persisted semantic JSON bypasses duplicate-key validation" >&2
   fail=1
 fi
 for strict_json_boundary in "${strict_json_boundary_paths[@]}"; do
-  if ! rg --quiet 'strict_json::from_slice' "$strict_json_boundary"; then
+  if ! rg_matches --quiet 'strict_json::from_slice' "$strict_json_boundary"; then
     echo "architecture guard failed: persisted semantic JSON no longer uses the strict decoder: $strict_json_boundary" >&2
     fail=1
   fi
@@ -660,19 +687,19 @@ capability_lifecycle_paths=(
   "$ROOT/crates/netdiag-core/src/pilot.rs"
   "$ROOT/crates/netdiag-core/src/benchmark.rs"
 )
-if rg --line-number \
+if rg_matches --line-number \
   'capability:[[:space:]]*Option|Option<&[^>]*ArtifactRootCapability>|capability\.as_ref\(\)' \
   "${capability_lifecycle_paths[@]}"; then
   echo "architecture guard failed: artifact publication capability became optional" >&2
   fail=1
 fi
-if rg --line-number '\bupdate_run_index\b' "${pipeline_publication_paths[@]}"; then
+if rg_matches --line-number '\bupdate_run_index\b' "${pipeline_publication_paths[@]}"; then
   echo "architecture guard failed: pipeline publication reintroduced a path-based run index update" >&2
   fail=1
 fi
-if ! rg --quiet 'RunPublicationRoot::Owned' "$ROOT/crates/netdiag-core/src/pipeline.rs" || \
-   ! rg --quiet 'RunPublicationRoot::Nested' "$ROOT/crates/netdiag-core/src/pipeline.rs" || \
-   ! rg --quiet 'reconcile_nested_run_publication_index' "$ROOT/crates/netdiag-core/src/pipeline/execution.rs"; then
+if ! rg_matches --quiet 'RunPublicationRoot::Owned' "$ROOT/crates/netdiag-core/src/pipeline.rs" || \
+   ! rg_matches --quiet 'RunPublicationRoot::Nested' "$ROOT/crates/netdiag-core/src/pipeline.rs" || \
+   ! rg_matches --quiet 'reconcile_nested_run_publication_index' "$ROOT/crates/netdiag-core/src/pipeline/execution.rs"; then
   echo "architecture guard failed: pipeline owned/nested publication roots are no longer explicit" >&2
   fail=1
 fi
@@ -680,28 +707,28 @@ for capability_owner in \
   "$ROOT/crates/netdiag-core/src/lab.rs" \
   "$ROOT/crates/netdiag-core/src/pilot.rs" \
   "$ROOT/crates/netdiag-core/src/benchmark.rs"; do
-  if ! rg --quiet 'prepare_artifact_root' "$capability_owner"; then
+  if ! rg_matches --quiet 'prepare_artifact_root' "$capability_owner"; then
     echo "architecture guard failed: top-level operation no longer retains an artifact-root capability: $capability_owner" >&2
     fail=1
   fi
 done
-if ! rg --quiet 'create_root_bound_staged_directory' "$ROOT/crates/netdiag-core/src/lab.rs" || \
-   ! rg --quiet 'finish_root_bound_staged_directory' "$ROOT/crates/netdiag-core/src/lab.rs"; then
+if ! rg_matches --quiet 'create_root_bound_staged_directory' "$ROOT/crates/netdiag-core/src/lab.rs" || \
+   ! rg_matches --quiet 'finish_root_bound_staged_directory' "$ROOT/crates/netdiag-core/src/lab.rs"; then
   echo "architecture guard failed: Lab outer run no longer uses the root-bound staged lifecycle" >&2
   fail=1
 fi
-if ! rg --quiet 'create_staged_pilot_run' "$ROOT/crates/netdiag-core/src/pilot.rs" || \
-   ! rg --quiet 'finish_root_bound_staged_directory' "$ROOT/crates/netdiag-core/src/pilot.rs"; then
+if ! rg_matches --quiet 'create_staged_pilot_run' "$ROOT/crates/netdiag-core/src/pilot.rs" || \
+   ! rg_matches --quiet 'finish_root_bound_staged_directory' "$ROOT/crates/netdiag-core/src/pilot.rs"; then
   echo "architecture guard failed: Pilot outer run no longer uses the root-bound staged lifecycle" >&2
   fail=1
 fi
-if rg --multiline --line-number \
+if rg_matches --multiline --line-number \
   'fs::write\([^;]{0,200}run_id\.txt' \
   "$ROOT/crates/netdiag-core/src/lab.rs"; then
   echo "architecture guard failed: Lab run_id.txt reintroduced a direct, non-durable write" >&2
   fail=1
 fi
-if rg --line-number \
+if rg_matches --line-number \
   'std::fs|fs::(create_dir|create_dir_all|rename|remove_dir_all)' \
   "$ROOT/crates/netdiag-core/src/pilot/run_directory.rs"; then
   echo "architecture guard failed: Pilot outer run creation bypasses staged atomic directories" >&2
@@ -719,19 +746,19 @@ otlp_receiver_paths=(
   "$ROOT/crates/netdiag-core/src/connectors/otlp/server/runtime.rs"
   "$ROOT/crates/netdiag-core/src/connectors/otlp/server/shutdown.rs"
 )
-if rg --line-number \
+if rg_matches --line-number \
   'VecDeque<[^>]*ExportMetricsServiceRequest|request:[[:space:]]*ExportMetricsServiceRequest' \
   "${otlp_receiver_paths[@]}"; then
   echo "architecture guard failed: OTLP receiver reintroduced a raw request queue" >&2
   fail=1
 fi
-if ! rg --quiet \
+if ! rg_matches --quiet \
   '\.max_decoding_message_size\(MAX_DECODING_MESSAGE_BYTES\)' \
   "$ROOT/crates/netdiag-core/src/connectors/otlp.rs"; then
   echo "architecture guard failed: OTLP tonic decoding limit is not explicitly configured" >&2
   fail=1
 fi
-if ! rg --quiet \
+if ! rg_matches --quiet \
   'parse_loopback_bind_addr\(&config\.bind_addr\)' \
   "$ROOT/crates/netdiag-core/src/connectors/otlp.rs"; then
   echo "architecture guard failed: OTLP startup no longer enforces the loopback boundary" >&2

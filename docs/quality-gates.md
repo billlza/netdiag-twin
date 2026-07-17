@@ -22,7 +22,11 @@ NETDIAG_APP_SECURITY_FILE_COVERAGE_MIN=50 \
 scripts/check_rust_quality.sh strict
 ```
 
-The strict gate requires:
+Both gate levels require `ripgrep` (`rg`) for portable architecture-policy
+searches. Local runs may use a compatible installation; CI installs and
+verifies the pinned 15.2.0 release.
+
+The strict gate additionally requires:
 
 - `cargo-nextest` 0.9.136
 - `cargo-llvm-cov` 0.8.7

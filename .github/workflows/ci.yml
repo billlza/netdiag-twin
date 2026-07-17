@@ -89,12 +89,32 @@ jobs:
           CARGO_LLVM_COV_VERSION: "0.8.7"
           CARGO_MACHETE_VERSION: "0.9.2"
           CARGO_NEXTEST_VERSION: "0.9.136"
+          RIPGREP_VERSION: "15.2.0"
         run: |
+          set -euo pipefail
           rustup component add llvm-tools-preview
           cargo install cargo-nextest --version "$CARGO_NEXTEST_VERSION" --locked --quiet
           cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --quiet
           cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked --quiet
           cargo install cargo-machete --version "$CARGO_MACHETE_VERSION" --locked --quiet
+          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"
+          if [[ -e "$ripgrep_root" || -L "$ripgrep_root" ]]; then
+            echo "isolated ripgrep installation root already exists" >&2
+            exit 2
+          fi
+          cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet --root "$ripgrep_root"
+          ripgrep_bin_dir="$ripgrep_root/bin"
+          ripgrep_executable="$ripgrep_bin_dir/rg"
+          if [[ -z "$ripgrep_executable" || "$ripgrep_executable" != /* || -L "$ripgrep_executable" || ! -f "$ripgrep_executable" || ! -x "$ripgrep_executable" ]]; then
+            echo "installed ripgrep is not an absolute regular executable" >&2
+            exit 2
+          fi
+          ripgrep_version="$("$ripgrep_executable" --version)"
+          if [[ "${ripgrep_version%%$'\n'*}" != "ripgrep $RIPGREP_VERSION" ]]; then
+            echo "installed ripgrep version does not match the pinned version" >&2
+            exit 2
+          fi
+          printf '%s\n' "$ripgrep_bin_dir" >> "$GITHUB_PATH"
       - name: Bind vendored patches to published source archives
         run: |
           mkdir -p target/upstream-crates

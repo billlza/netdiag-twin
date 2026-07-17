@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -169,6 +170,40 @@ rm -rf "$ARTIFACTS"
 
         self.assertNotEqual(code, 0)
         self.assertIn("must install rustfmt and clippy", stdout + stderr)
+
+    def test_workflow_hygiene_requires_pinned_ripgrep_for_the_strict_gate(
+        self,
+    ) -> None:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_directory = Path(tmp) / "workflows"
+            workflow_directory.mkdir()
+            for name in ("release.yml", "platform-security.yml"):
+                (workflow_directory / name).write_text(
+                    (REPO_ROOT / ".github/workflows" / name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            ci_body = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+                encoding="utf-8"
+            )
+            install = (
+                '          cargo install ripgrep --version "$RIPGREP_VERSION" '
+                '--locked --quiet --root "$ripgrep_root"\n'
+            )
+            self.assertIn(install, ci_body)
+            (workflow_directory / "ci.yml").write_text(
+                ci_body.replace(install, "", 1),
+                encoding="utf-8",
+            )
+            module.WORKFLOW_DIRECTORY = workflow_directory
+            module.RELEASE_WORKFLOW = workflow_directory / "release.yml"
+            module.CI_WORKFLOW = workflow_directory / "ci.yml"
+            code, stdout, stderr = run_main(module)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("must install and verify pinned ripgrep", stdout + stderr)
 
     def test_workflow_hygiene_rejects_untrusted_platform_checkout_roots(self) -> None:
         module = load_script("check_release_gate_hygiene")
@@ -344,8 +379,112 @@ rm -rf "$ARTIFACTS"
             'architecture guard failed: $path is absent from the Git index', guard_body
         )
 
+    def test_architecture_guard_fails_once_when_ripgrep_is_missing(self) -> None:
+        bash = shutil.which("bash")
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(bash)
+        self.assertIsNotNone(dirname)
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_directory = Path(tmp) / "bin"
+            tool_directory.mkdir()
+            shutil.copy(dirname, tool_directory / "dirname")
+            result = subprocess.run(
+                [bash, SCRIPTS / "check_architecture_guard.sh"],
+                cwd=REPO_ROOT,
+                env={**os.environ, "PATH": str(tool_directory)},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "architecture guard failed: an absolute executable ripgrep (rg) is required\n",
+        )
+
+    def test_architecture_guard_fails_once_when_ripgrep_scan_errors(self) -> None:
+        bash = shutil.which("bash")
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(bash)
+        self.assertIsNotNone(dirname)
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_directory = Path(tmp) / "bin"
+            tool_directory.mkdir()
+            shutil.copy(dirname, tool_directory / "dirname")
+            fake_ripgrep = tool_directory / "rg"
+            fake_ripgrep.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+            fake_ripgrep.chmod(
+                fake_ripgrep.stat().st_mode
+                | stat.S_IXUSR
+                | stat.S_IXGRP
+                | stat.S_IXOTH
+            )
+            result = subprocess.run(
+                [bash, SCRIPTS / "check_architecture_guard.sh"],
+                cwd=REPO_ROOT,
+                env={**os.environ, "PATH": str(tool_directory)},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "architecture guard failed: ripgrep scan failed with status 2\n",
+        )
+
+    def test_quality_gate_fails_before_work_when_ripgrep_is_missing(self) -> None:
+        bash = shutil.which("bash")
+        dirname = shutil.which("dirname")
+        self.assertIsNotNone(bash)
+        self.assertIsNotNone(dirname)
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_directory = Path(tmp) / "bin"
+            tool_directory.mkdir()
+            shutil.copy(dirname, tool_directory / "dirname")
+            shutil.copy(sys.executable, tool_directory / "python3")
+            result = subprocess.run(
+                [bash, SCRIPTS / "check_rust_quality.sh", "strict"],
+                cwd=REPO_ROOT,
+                env={**os.environ, "PATH": str(tool_directory)},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "missing required tool: rg\n")
+
+    def test_quality_gate_requires_ripgrep_before_expensive_commands(self) -> None:
+        quality_body = (SCRIPTS / "check_rust_quality.sh").read_text(
+            encoding="utf-8"
+        )
+        fast_body = quality_body.split("run_fast() {", 1)[1].split(
+            "run_strict() {", 1
+        )[0]
+        strict_body = quality_body.split("run_strict() {", 1)[1].split(
+            'case "$MODE" in', 1
+        )[0]
+        self.assertLess(fast_body.index("require_tool rg"), fast_body.index("cargo fmt"))
+        self.assertLess(
+            strict_body.index("require_tool rg"), strict_body.index("cargo fmt")
+        )
+
     def run_release_guard(self, body: str) -> tuple[int, str]:
         module = load_script("check_release_gate_hygiene")
+        if "run_fast" not in body:
+            body = (
+                "run_fast() {\n"
+                "  require_tool rg\n"
+                "  cargo fmt --all -- --check\n"
+                "}\n"
+                + body
+            )
         if "schema_python" not in body:
             body = (
                 'schema_python() {\n'
@@ -380,6 +519,8 @@ rm -rf "$ARTIFACTS"
                 "  cleanup_pilot_smoke\n"
                 "}\n"
                 "run_strict() {\n"
+                "  require_tool rg\n"
+                "  cargo fmt --all -- --check\n"
                 "  cargo test --locked -p netdiag-core --bench perf_budget --all-features\n"
                 '  LLVM_PROFILE_FILE_NAME="netdiag-%m-%p.profraw" cargo llvm-cov nextest --locked -p netdiag-app --all-features --lib --bins --tests\n'
                 "  python3 scripts/check_app_security_coverage.py --summary app.json --dep-info-dir deps --aggregate-min 80 --file-min 50\n"
@@ -3162,6 +3303,37 @@ class CiPlatformGateTests(unittest.TestCase):
             rust_job.index("components: rustfmt, clippy"),
             rust_job.index("scripts/check_rust_quality.sh strict"),
         )
+
+    def test_strict_ci_installs_pinned_ripgrep_before_the_quality_gate(self) -> None:
+        ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        rust_job = ci_workflow.split("  rust:\n", 1)[1]
+        version = 'RIPGREP_VERSION: "15.2.0"'
+        root = 'ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"'
+        install = (
+            'cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet '
+            '--root "$ripgrep_root"'
+        )
+        presence = 'ripgrep_executable="$ripgrep_bin_dir/rg"'
+        version_capture = 'ripgrep_version="$("$ripgrep_executable" --version)"'
+        version_check = '"ripgrep $RIPGREP_VERSION"'
+        path_export = 'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'
+        strict_gate = "scripts/check_rust_quality.sh strict"
+        self.assertIn(version, rust_job)
+        self.assertIn(root, rust_job)
+        self.assertIn(install, rust_job)
+        self.assertIn(presence, rust_job)
+        self.assertIn(version_capture, rust_job)
+        self.assertIn(version_check, rust_job)
+        self.assertIn(path_export, rust_job)
+        self.assertLess(rust_job.index(version), rust_job.index(root))
+        self.assertLess(rust_job.index(root), rust_job.index(install))
+        self.assertLess(rust_job.index(install), rust_job.index(presence))
+        self.assertLess(rust_job.index(presence), rust_job.index(version_capture))
+        self.assertLess(rust_job.index(version_capture), rust_job.index(version_check))
+        self.assertLess(rust_job.index(version_check), rust_job.index(path_export))
+        self.assertLess(rust_job.index(path_export), rust_job.index(strict_gate))
 
     def test_platform_warnings_and_native_dependencies_fail_closed(self) -> None:
         job = self.platform_job()

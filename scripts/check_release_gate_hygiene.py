@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 QUALITY_SCRIPT = ROOT / "scripts" / "check_rust_quality.sh"
+ARCHITECTURE_GUARD_SCRIPT = ROOT / "scripts" / "check_architecture_guard.sh"
 PACKAGE_SCRIPT = ROOT / "scripts" / "package_macos_app.sh"
 PERF_SCRIPT = ROOT / "scripts" / "check_perf_budget.sh"
 BENCHMARK_SOURCE = ROOT / "crates" / "netdiag-core" / "src" / "benchmark.rs"
@@ -861,6 +862,56 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         failures.append(
             "strict CI must install rustfmt and clippy before running the quality gate"
         )
+    ripgrep_version = 'RIPGREP_VERSION: "15.2.0"'
+    ripgrep_install = (
+        'cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet --root "$ripgrep_root"'
+    )
+    ripgrep_root = 'ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"'
+    ripgrep_presence = 'ripgrep_executable="$ripgrep_bin_dir/rg"'
+    ripgrep_version_capture = (
+        'ripgrep_version="$("$ripgrep_executable" --version)"'
+    )
+    ripgrep_version_check = '"ripgrep $RIPGREP_VERSION"'
+    ripgrep_path_export = 'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'
+    strict_quality_command = "scripts/check_rust_quality.sh strict"
+    for fragment in (
+        ripgrep_version,
+        ripgrep_root,
+        ripgrep_install,
+        ripgrep_presence,
+        ripgrep_version_capture,
+        ripgrep_version_check,
+        ripgrep_path_export,
+    ):
+        if fragment not in rust_ci_body:
+            failures.append(
+                f"strict CI must install and verify pinned ripgrep before running the quality gate: {fragment}"
+            )
+    if all(
+        fragment in rust_ci_body
+        for fragment in (
+            ripgrep_version,
+            ripgrep_root,
+            ripgrep_install,
+            ripgrep_presence,
+            ripgrep_version_capture,
+            ripgrep_version_check,
+            ripgrep_path_export,
+            strict_quality_command,
+        )
+    ) and not (
+        rust_ci_body.index(ripgrep_version)
+        < rust_ci_body.index(ripgrep_root)
+        < rust_ci_body.index(ripgrep_install)
+        < rust_ci_body.index(ripgrep_presence)
+        < rust_ci_body.index(ripgrep_version_capture)
+        < rust_ci_body.index(ripgrep_version_check)
+        < rust_ci_body.index(ripgrep_path_export)
+        < rust_ci_body.index(strict_quality_command)
+    ):
+        failures.append(
+            "strict CI must install and verify pinned ripgrep before running the quality gate"
+        )
     for fragment in (
         '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]',
         "validate_trusted_ancestor() {",
@@ -1004,8 +1055,10 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
 
 def main() -> int:
     body = QUALITY_SCRIPT.read_text()
+    architecture_guard_body = ARCHITECTURE_GUARD_SCRIPT.read_text()
     active_body = uncommented_body(body)
     smoke_body = shell_function_body(active_body, "run_pilot_smoke")
+    fast_body = shell_function_body(active_body, "run_fast")
     strict_body = shell_function_body(active_body, "run_strict")
     schema_python_body = shell_function_body(active_body, "schema_python")
     adapter_contract_body = shell_function_body(active_body, "run_adapter_contracts")
@@ -1026,6 +1079,44 @@ def main() -> int:
     validate_perf_script_hygiene(failures)
     validate_release_evidence_input_hygiene(failures)
     validate_workflow_hygiene(failures)
+    for function_name, function_body in (("run_fast", fast_body), ("run_strict", strict_body)):
+        if function_body is None:
+            failures.append(
+                f"check_rust_quality.sh must define a parseable {function_name} function"
+            )
+            continue
+        ripgrep_preflight = function_body.find("require_tool rg")
+        first_expensive_command = function_body.find("cargo fmt")
+        if (
+            ripgrep_preflight < 0
+            or first_expensive_command < 0
+            or ripgrep_preflight > first_expensive_command
+        ):
+            failures.append(
+                f"check_rust_quality.sh {function_name} must require ripgrep before expensive commands"
+            )
+    architecture_guard_preflight = (
+        'RIPGREP_EXECUTABLE="$(command -v rg || true)"'
+    )
+    architecture_guard_diagnostic = (
+        "architecture guard failed: an absolute executable ripgrep (rg) is required"
+    )
+    first_architecture_check = architecture_guard_body.find("check_lines() {")
+    for fragment in (
+        architecture_guard_preflight,
+        architecture_guard_diagnostic,
+        "readonly RIPGREP_EXECUTABLE",
+        "rg_matches() {",
+        "architecture guard failed: ripgrep scan failed with status $status",
+        "netdiag-ripgrep-self-test",
+    ):
+        position = architecture_guard_body.find(fragment)
+        if position < 0 or (
+            first_architecture_check >= 0 and position > first_architecture_check
+        ):
+            failures.append(
+                f"check_architecture_guard.sh must fail fast when ripgrep is unavailable: {fragment}"
+            )
     if schema_python_body is None:
         failures.append("check_rust_quality.sh must define schema_python")
     else:

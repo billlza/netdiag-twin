@@ -3316,7 +3316,9 @@ class CiPlatformGateTests(unittest.TestCase):
             '--root "$ripgrep_root"'
         )
         presence = 'ripgrep_executable="$ripgrep_bin_dir/rg"'
-        version_capture = 'ripgrep_version="$("$ripgrep_executable" --version)"'
+        version_capture = (
+            'installed_version_output="$("$ripgrep_executable" --version)"'
+        )
         version_check = '"ripgrep $RIPGREP_VERSION"'
         path_export = 'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'
         strict_gate = "scripts/check_rust_quality.sh strict"

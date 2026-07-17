@@ -109,8 +109,8 @@ jobs:
             echo "installed ripgrep is not an absolute regular executable" >&2
             exit 2
           fi
-          ripgrep_version="$("$ripgrep_executable" --version)"
-          if [[ "${ripgrep_version%%$'\n'*}" != "ripgrep $RIPGREP_VERSION" ]]; then
+          installed_version_output="$("$ripgrep_executable" --version)"
+          if [[ "${installed_version_output%%$'\n'*}" != "ripgrep $RIPGREP_VERSION" ]]; then
             echo "installed ripgrep version does not match the pinned version" >&2
             exit 2
           fi

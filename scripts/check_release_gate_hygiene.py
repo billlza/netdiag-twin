@@ -869,7 +869,7 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
     ripgrep_root = 'ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"'
     ripgrep_presence = 'ripgrep_executable="$ripgrep_bin_dir/rg"'
     ripgrep_version_capture = (
-        'ripgrep_version="$("$ripgrep_executable" --version)"'
+        'installed_version_output="$("$ripgrep_executable" --version)"'
     )
     ripgrep_version_check = '"ripgrep $RIPGREP_VERSION"'
     ripgrep_path_export = 'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'

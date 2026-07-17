@@ -190,9 +190,13 @@ root-owned directories without group or world write bits. It validates the bound
 random path, post-`chown` identity and mode, and exact caller SHA, and treats cleanup
 failure as a job failure. The production trusted-directory policy remains the final
 ACL and path-trust authority and is never relaxed for CI. Runner-image permission or
-ACL drift therefore fails closed; the workflow does not fall back to `$HOME`,
-sticky world-writable `/tmp`, or the current runner image's writable `/opt`, because
-the strict adapter trust chain validates every ancestor.
+ACL drift therefore fails closed. Generic Rust and Python test fixtures receive a
+separate verified `0700` `test-tmp` child through process-scoped `TMPDIR`, `TMP`, and
+`TEMP` bindings. That fixture binding does not alter the explicit Unix system
+temporary root `/tmp`, the coordination namespace, production managed temporary
+directories, or adapter child-process isolation. The trusted checkout never falls
+back to `$HOME`, sticky world-writable `/tmp`, or the current runner image's writable
+`/opt`, because the strict adapter trust chain validates every checkout ancestor.
 
 Both CI and Release call this same reusable workflow, so a tag cannot bypass
 native Windows validation. Release additionally requires a successful main CI

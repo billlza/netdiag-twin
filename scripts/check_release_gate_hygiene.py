@@ -879,12 +879,31 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         'git clone --quiet --no-local --no-checkout -- "$GITHUB_WORKSPACE" "$trusted_root/repo"',
         'git -C "$trusted_root/repo" checkout --quiet --detach "$EXPECTED_SHA"',
         '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
-        "cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features",
+        'test_tmp="$trusted_root/test-tmp"',
+        '[[ "$test_tmp" =~ ^/var/lib/netdiag-platform-security\\.[A-Za-z0-9]{6}/test-tmp$ ]]',
+        "readonly test_tmp",
+        '/usr/bin/mkdir --mode=0700 -- "$test_tmp"',
+        '[[ ! -L "$test_tmp" && -d "$test_tmp" ]]',
+        '/usr/bin/realpath -e -- "$test_tmp"',
+        'stat -c \'%u:%g:%a\' -- "$test_tmp"',
+        'test_tmp_identity="$(stat -c \'%d:%i\' -- "$test_tmp")"',
+        "readonly test_tmp_identity",
+        "actual = Path(tempfile.gettempdir()).resolve(strict=True)",
+        'TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features',
+        '[[ "$(stat -c \'%d:%i\' -- "$test_tmp")" == "$test_tmp_identity" ]]',
     ):
         if fragment not in platform_body:
             failures.append(
                 f"Linux platform tests are missing trusted-checkout control: {fragment}"
             )
+    platform_job_body = yaml_job_body(platform_body, "platform-security") or ""
+    linux_test_step = platform_job_body.split(
+        "- name: Test full platform and consumer layers on Linux", 1
+    )[-1].split("- name: Test Windows platform primitives", 1)[0]
+    if "export TMPDIR" in linux_test_step or "GITHUB_ENV" in linux_test_step:
+        failures.append(
+            "Linux platform test temp bindings must remain scoped to the cargo-test process tree"
+        )
     for untrusted_root in (
         "/opt/netdiag-platform-security.",
         "/tmp/netdiag-platform-security.",

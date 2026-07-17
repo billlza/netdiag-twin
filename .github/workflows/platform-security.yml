@@ -163,8 +163,33 @@ jobs:
             echo "trusted checkout SHA mismatch: expected=$EXPECTED_SHA actual=$actual_sha" >&2
             exit 2
           )
+          test_tmp="$trusted_root/test-tmp"
+          [[ "$test_tmp" =~ ^/var/lib/netdiag-platform-security\.[A-Za-z0-9]{6}/test-tmp$ ]]
+          readonly test_tmp
+          /usr/bin/mkdir --mode=0700 -- "$test_tmp"
+          [[ ! -L "$test_tmp" && -d "$test_tmp" ]]
+          [[ "$(/usr/bin/realpath -e -- "$test_tmp")" == "$test_tmp" ]]
+          [[ "$(stat -c '%u:%g:%a' -- "$test_tmp")" == "$runner_uid:$runner_gid:700" ]]
+          [[ -z "$(find "$test_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+          test_tmp_identity="$(stat -c '%d:%i' -- "$test_tmp")"
+          readonly test_tmp_identity
+          TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" \
+            /usr/bin/python3 -I - "$test_tmp" <<'PY'
+          from pathlib import Path
+          import sys
+          import tempfile
+
+          expected = Path(sys.argv[1]).resolve(strict=True)
+          actual = Path(tempfile.gettempdir()).resolve(strict=True)
+          if actual != expected:
+              raise SystemExit(f"test fixture temp root mismatch: expected={expected} actual={actual}")
+          PY
           cd "$trusted_root/repo"
-          cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features
+          TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features
+          [[ ! -L "$test_tmp" && -d "$test_tmp" ]]
+          [[ "$(/usr/bin/realpath -e -- "$test_tmp")" == "$test_tmp" ]]
+          [[ "$(stat -c '%u:%g:%a' -- "$test_tmp")" == "$runner_uid:$runner_gid:700" ]]
+          [[ "$(stat -c '%d:%i' -- "$test_tmp")" == "$test_tmp_identity" ]]
       - name: Test Windows platform primitives with warnings denied
         if: runner.os == 'Windows'
         run: cargo test --locked -p netdiag-platform --all-targets --all-features

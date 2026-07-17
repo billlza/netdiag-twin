@@ -7,6 +7,13 @@ fn resolves_an_absolute_canonical_platform_root() {
     let root = system_temporary_root_path().expect("system temporary root");
     assert!(root.is_absolute());
     assert_eq!(root.canonicalize().expect("canonical root"), root);
+    #[cfg(unix)]
+    assert_eq!(
+        root,
+        std::path::Path::new("/tmp")
+            .canonicalize()
+            .expect("canonical /tmp")
+    );
 }
 
 #[cfg(any(unix, windows))]

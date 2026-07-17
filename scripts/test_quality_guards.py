@@ -203,6 +203,38 @@ rm -rf "$ARTIFACTS"
             stdout + stderr,
         )
 
+    def test_workflow_hygiene_requires_scoped_platform_test_temp(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_directory = Path(tmp) / "workflows"
+            workflow_directory.mkdir()
+            for name in ("ci.yml", "release.yml"):
+                (workflow_directory / name).write_text(
+                    (REPO_ROOT / ".github/workflows" / name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            platform_body = (
+                REPO_ROOT / ".github/workflows/platform-security.yml"
+            ).read_text(encoding="utf-8")
+            scoped_command = (
+                'TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" '
+                "cargo test --locked"
+            )
+            self.assertIn(scoped_command, platform_body)
+            (workflow_directory / "platform-security.yml").write_text(
+                platform_body.replace(scoped_command, "cargo test --locked", 1),
+                encoding="utf-8",
+            )
+            module.WORKFLOW_DIRECTORY = workflow_directory
+            module.RELEASE_WORKFLOW = workflow_directory / "release.yml"
+            module.CI_WORKFLOW = workflow_directory / "ci.yml"
+            code, stdout, stderr = run_main(module)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("TMPDIR=", stdout + stderr)
+
     def test_private_credential_file_patterns_are_ignored(self) -> None:
         required_patterns = ("*.p8", "*.pfx", "*.pem", "*.key")
         samples = (
@@ -3041,7 +3073,9 @@ class CiPlatformGateTests(unittest.TestCase):
         linux_test = next(
             line.strip()
             for line in job.splitlines()
-            if line.strip().startswith("cargo test ")
+            if line.strip().startswith(
+                'TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" cargo test '
+            )
             and "-p netdiag-cli" in line
         )
         for command in [clippy, linux_test]:
@@ -3091,8 +3125,25 @@ class CiPlatformGateTests(unittest.TestCase):
             'git clone --quiet --no-local --no-checkout -- "$GITHUB_WORKSPACE" "$trusted_root/repo"',
             'git -C "$trusted_root/repo" checkout --quiet --detach "$EXPECTED_SHA"',
             '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
+            'test_tmp="$trusted_root/test-tmp"',
+            '[[ "$test_tmp" =~ ^/var/lib/netdiag-platform-security\\.[A-Za-z0-9]{6}/test-tmp$ ]]',
+            "readonly test_tmp",
+            '/usr/bin/mkdir --mode=0700 -- "$test_tmp"',
+            '[[ ! -L "$test_tmp" && -d "$test_tmp" ]]',
+            '/usr/bin/realpath -e -- "$test_tmp"',
+            'stat -c \'%u:%g:%a\' -- "$test_tmp"',
+            'test_tmp_identity="$(stat -c \'%d:%i\' -- "$test_tmp")"',
+            "readonly test_tmp_identity",
+            "actual = Path(tempfile.gettempdir()).resolve(strict=True)",
+            'TMPDIR="$test_tmp" TMP="$test_tmp" TEMP="$test_tmp" cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features',
+            '[[ "$(stat -c \'%d:%i\' -- "$test_tmp")" == "$test_tmp_identity" ]]',
         ):
             self.assertIn(fragment, job)
+        linux_test_step = job.split(
+            "- name: Test full platform and consumer layers on Linux", 1
+        )[1].split("- name: Test Windows platform primitives", 1)[0]
+        self.assertNotIn("export TMPDIR", linux_test_step)
+        self.assertNotIn("GITHUB_ENV", linux_test_step)
         for untrusted_root in (
             "/opt/netdiag-platform-security.",
             "/tmp/netdiag-platform-security.",

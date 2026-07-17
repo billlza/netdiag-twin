@@ -857,6 +857,20 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         failures.append(
             "platform security workflow must verify the immutable caller revision"
         )
+    if "components: rustfmt" not in rust_ci_body:
+        failures.append("strict CI must install rustfmt before running the quality gate")
+    for fragment in (
+        "mktemp -d /tmp/netdiag-platform-security.XXXXXX",
+        'chmod 700 "$trusted_root"',
+        'git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"',
+        '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
+        'rm -rf -- "$trusted_root"',
+        "cargo test --locked -p netdiag-platform -p netdiag-core -p netdiag-cli -p netdiag-app --all-targets --all-features",
+    ):
+        if fragment not in platform_body:
+            failures.append(
+                f"Linux platform tests are missing trusted-checkout control: {fragment}"
+            )
 
     required_package_fragments = (
         'BUILD_MODE="${2:-build}"',

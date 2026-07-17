@@ -204,5 +204,6 @@ fn text_attribute(key: &str, value: &str) -> KeyValue {
         value: Some(AnyValue {
             value: Some(any_value::Value::StringValue(value.to_string())),
         }),
+        key_strindex: 0,
     }
 }

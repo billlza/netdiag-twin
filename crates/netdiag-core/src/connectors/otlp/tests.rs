@@ -57,6 +57,7 @@ async fn deep_attributes_and_excessive_datapoints_do_not_enter_queue() {
         attributes: vec![KeyValue {
             key: "nested".to_string(),
             value: Some(nested_array_value(9)),
+            key_strindex: 0,
         }],
         ..Default::default()
     });

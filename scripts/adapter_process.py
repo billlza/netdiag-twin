@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -27,6 +28,48 @@ TRUST_INSPECTION_TIMEOUT_SECONDS = 2.0
 TRUST_INSPECTION_OUTPUT_LIMIT_BYTES = 64 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _PIPE_CLOSE_TIMEOUT_SECONDS = 0.5
+_MACOS_ACL_ENTRY = re.compile(r"^\s*\d+:\s+(\S+)\s+(.+?)\s*$")
+_MACOS_ACL_TAGS = frozenset({"allow", "deny"})
+_MACOS_ACL_INHERITANCE_FLAGS = frozenset(
+    {"directory_inherit", "file_inherit", "inherited", "limit_inherit", "only_inherit"}
+)
+_MACOS_ACL_PERMISSIONS = frozenset(
+    {
+        "add_file",
+        "add_subdirectory",
+        "append",
+        "chown",
+        "delete",
+        "delete_child",
+        "execute",
+        "list",
+        "read",
+        "readattr",
+        "readextattr",
+        "readsecurity",
+        "search",
+        "synchronize",
+        "write",
+        "writeattr",
+        "writeextattr",
+        "writesecurity",
+    }
+)
+_MACOS_ACL_MUTATION_PERMISSIONS = frozenset(
+    {
+        "add_file",
+        "add_subdirectory",
+        "append",
+        "chown",
+        "delete",
+        "delete_child",
+        "write",
+        "writeattr",
+        "writeextattr",
+        "writesecurity",
+    }
+)
+
 
 def _signal_process_group(process: subprocess.Popen[bytes], signal_number: int) -> bool:
     try:
@@ -288,6 +331,20 @@ def _validate_linux_acl_boundary(paths: Sequence[Path]) -> None:
                 )
 
 
+def _trusted_macos_acl_principals() -> frozenset[str]:
+    try:
+        import pwd
+
+        return frozenset(
+            {
+                f"user:{pwd.getpwuid(0).pw_name}",
+                f"user:{pwd.getpwuid(os.geteuid()).pw_name}",
+            }
+        )
+    except (ImportError, KeyError, OSError) as error:
+        raise RuntimeError("Rust ingest validator ACL identities are unavailable") from error
+
+
 def _validate_macos_acl_boundary(paths: Sequence[Path]) -> None:
     completed = run_bounded(
         ["/bin/ls", "-lde", *[str(path) for path in paths]],
@@ -299,11 +356,38 @@ def _validate_macos_acl_boundary(paths: Sequence[Path]) -> None:
     )
     if completed.returncode != 0 or completed.stderr.strip():
         raise RuntimeError("Rust ingest validator ACL state could not be inspected")
+    trusted_principals = _trusted_macos_acl_principals()
     for line in completed.stdout.splitlines():
-        entry_number = line.lstrip().split(":", 1)[0]
-        if entry_number.isdecimal():
+        stripped = line.lstrip()
+        entry_number = stripped.split(":", 1)[0]
+        if not entry_number.isdecimal():
+            continue
+        match = _MACOS_ACL_ENTRY.fullmatch(line)
+        if match is None:
+            raise RuntimeError("Rust ingest validator ACL state is unsupported")
+        principal, policy = match.groups()
+        if not principal.startswith(("user:", "group:")):
+            raise RuntimeError("Rust ingest validator ACL state is unsupported")
+        fields = policy.replace(",", " ").split()
+        tags = [field for field in fields if field in _MACOS_ACL_TAGS]
+        if len(tags) != 1:
+            raise RuntimeError("Rust ingest validator ACL state is unsupported")
+        tag = tags[0]
+        permissions = {
+            field
+            for field in fields
+            if field not in _MACOS_ACL_TAGS
+            and field not in _MACOS_ACL_INHERITANCE_FLAGS
+        }
+        if not permissions or not permissions <= _MACOS_ACL_PERMISSIONS:
+            raise RuntimeError("Rust ingest validator ACL state is unsupported")
+        if (
+            tag == "allow"
+            and permissions & _MACOS_ACL_MUTATION_PERMISSIONS
+            and principal not in trusted_principals
+        ):
             raise RuntimeError(
-                "Rust ingest validator path must not carry an extended ACL"
+                "Rust ingest validator ACL must not grant mutation access"
             )
 
 
@@ -316,6 +400,10 @@ def _validate_acl_boundary(paths: Sequence[Path]) -> None:
         raise RuntimeError(
             "Rust ingest validator ACL validation is unsupported on this platform"
         )
+
+
+def _is_trusted_sticky_directory(metadata: os.stat_result) -> bool:
+    return metadata.st_uid == 0 and bool(metadata.st_mode & stat.S_ISVTX)
 
 
 def trusted_rust_ingest_validator(path: Path, workspace_root: Path) -> Path:
@@ -348,7 +436,9 @@ def trusted_rust_ingest_validator(path: Path, workspace_root: Path) -> Path:
                 raise RuntimeError(
                     "Rust ingest validator directory chain has an untrusted owner"
                 )
-            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
+                _is_trusted_sticky_directory(metadata)
+            ):
                 raise RuntimeError(
                     "Rust ingest validator directory chain must not be group- or world-writable"
                 )

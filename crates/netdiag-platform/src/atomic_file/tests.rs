@@ -1,9 +1,7 @@
 use super::*;
 use crate::open_trusted_directory_chain;
 use std::error::Error;
-use std::io;
-#[cfg(unix)]
-use std::io::Write;
+use std::io::{self, Write};
 
 #[test]
 fn atomic_publication_error_preserves_its_primary_io_source() {

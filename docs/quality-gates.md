@@ -182,6 +182,11 @@ Ubuntu installs ACL and libpcap fixtures. Windows builds libpcap from a pinned
 vcpkg commit with the null live-capture backend and the `wpcap` ABI name; this
 executes offline pcap parsing without requiring a privileged capture driver. The
 setup fails before Cargo if either the import library or runtime DLL is absent.
+Because GitHub's Ubuntu workspace inherits a default ACL from `/home`, the Linux
+runtime suite is executed from a private `0700` checkout created beneath the
+root-owned sticky `/tmp` boundary. The harness verifies that this checkout is the
+exact caller SHA and treats cleanup failure as a job failure; the production
+trusted-directory policy is never relaxed for CI.
 
 Both CI and Release call this same reusable workflow, so a tag cannot bypass
 native Windows validation. Release additionally requires a successful main CI

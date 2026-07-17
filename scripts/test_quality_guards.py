@@ -1235,6 +1235,18 @@ class AdapterContractTests(unittest.TestCase):
                 finally:
                     directory.chmod(original_mode)
 
+    def test_rust_ingest_validator_accepts_only_root_owned_sticky_writable_boundaries(
+        self,
+    ) -> None:
+        module = load_script("adapter_process")
+        trusted = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o1777)
+        wrong_owner = mock.Mock(st_uid=1, st_mode=stat.S_IFDIR | 0o1777)
+        missing_sticky_bit = mock.Mock(st_uid=0, st_mode=stat.S_IFDIR | 0o0777)
+
+        self.assertTrue(module._is_trusted_sticky_directory(trusted))
+        self.assertFalse(module._is_trusted_sticky_directory(wrong_owner))
+        self.assertFalse(module._is_trusted_sticky_directory(missing_sticky_bit))
+
     def test_rust_ingest_revalidates_a_replaced_validator_before_execution(self) -> None:
         module = load_script("adapter_process")
         with tempfile.TemporaryDirectory() as tmp:
@@ -1254,7 +1266,9 @@ class AdapterContractTests(unittest.TestCase):
                     module.validate_rust_ingest(trusted, sample, workspace)
             bounded.assert_not_called()
 
-    def test_rust_ingest_validator_rejects_linux_and_macos_acl_entries(self) -> None:
+    def test_rust_ingest_validator_rejects_linux_and_mutating_macos_acl_entries(
+        self,
+    ) -> None:
         module = load_script("adapter_process")
         path = Path("/trusted")
         with mock.patch.object(module.sys, "platform", "linux"), mock.patch.object(
@@ -1273,8 +1287,98 @@ class AdapterContractTests(unittest.TestCase):
         )
         with mock.patch.object(module.sys, "platform", "darwin"), mock.patch.object(
             module, "run_bounded", return_value=acl_output
-        ), self.assertRaisesRegex(RuntimeError, "must not carry an extended ACL"):
+        ), mock.patch.object(
+            module, "_trusted_macos_acl_principals", return_value=frozenset()
+        ), self.assertRaisesRegex(RuntimeError, "must not grant mutation access"):
             module._validate_acl_boundary((path,))
+
+    def test_rust_ingest_validator_accepts_restrictive_and_read_only_macos_acls(
+        self,
+    ) -> None:
+        module = load_script("adapter_process")
+        path = Path("/trusted")
+        acl_output = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "drwx------ 2 user staff 64 /trusted\n"
+                " 0: group:everyone deny delete\n"
+                " 1: group:auditors inherited allow read,list,search,readattr\n"
+                " 2: user:trusted allow write,append,writeattr\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(module.sys, "platform", "darwin"), mock.patch.object(
+            module, "run_bounded", return_value=acl_output
+        ), mock.patch.object(
+            module,
+            "_trusted_macos_acl_principals",
+            return_value=frozenset({"user:trusted"}),
+        ):
+            module._validate_acl_boundary((path,))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS ACL integration test")
+    def test_rust_ingest_validator_macos_acl_integration_matches_trust_policy(
+        self,
+    ) -> None:
+        import pwd
+
+        module = load_script("adapter_process")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            validator = self.create_rust_validator(workspace)
+            current_user = pwd.getpwuid(os.geteuid()).pw_name
+            try:
+                for entry in (
+                    "group:everyone deny delete",
+                    f"user:{current_user} allow write",
+                ):
+                    subprocess.run(
+                        ["chmod", "+a", entry, str(workspace)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                module.trusted_rust_ingest_validator(validator, workspace)
+
+                subprocess.run(
+                    ["chmod", "+a", "group:everyone allow write", str(workspace)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "must not grant mutation access"
+                ):
+                    module.trusted_rust_ingest_validator(validator, workspace)
+            finally:
+                subprocess.run(
+                    ["chmod", "-RN", str(workspace)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+    def test_rust_ingest_validator_rejects_unknown_macos_acl_syntax(self) -> None:
+        module = load_script("adapter_process")
+        path = Path("/trusted")
+        for entry in (
+            " 0: group:staff allow future_permission",
+            " 0: group:staff audit read",
+            " 0: unsupported-principal allow read",
+        ):
+            with self.subTest(entry=entry):
+                acl_output = subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=f"{entry}\n", stderr=""
+                )
+                with mock.patch.object(
+                    module.sys, "platform", "darwin"
+                ), mock.patch.object(
+                    module, "run_bounded", return_value=acl_output
+                ), mock.patch.object(
+                    module, "_trusted_macos_acl_principals", return_value=frozenset()
+                ), self.assertRaisesRegex(RuntimeError, "ACL state is unsupported"):
+                    module._validate_acl_boundary((path,))
 
     def test_adapter_ingest_requires_an_explicit_validator_argument(self) -> None:
         for script in ("validate_adapter_samples", "validate_adapter_contract"):
@@ -2876,7 +2980,7 @@ class CiPlatformGateTests(unittest.TestCase):
         linux_test = next(
             line.strip()
             for line in job.splitlines()
-            if line.strip().startswith("run: cargo test ")
+            if line.strip().startswith("cargo test ")
             and "-p netdiag-cli" in line
         )
         for command in [clippy, linux_test]:
@@ -2907,6 +3011,25 @@ class CiPlatformGateTests(unittest.TestCase):
         self.assertIn(
             "cargo clippy --locked -p netdiag-platform --target wasm32-wasip1 --all-targets --all-features -- -D warnings",
             job,
+        )
+        for fragment in (
+            "mktemp -d /tmp/netdiag-platform-security.XXXXXX",
+            'chmod 700 "$trusted_root"',
+            'git clone --quiet --no-local "$GITHUB_WORKSPACE" "$trusted_root/repo"',
+            '[[ "$actual_sha" == "$EXPECTED_SHA" ]]',
+            'rm -rf -- "$trusted_root"',
+        ):
+            self.assertIn(fragment, job)
+
+    def test_strict_ci_installs_rustfmt_before_the_quality_gate(self) -> None:
+        ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        rust_job = ci_workflow.split("  rust:\n", 1)[1]
+        self.assertIn("components: rustfmt", rust_job)
+        self.assertLess(
+            rust_job.index("components: rustfmt"),
+            rust_job.index("scripts/check_rust_quality.sh strict"),
         )
 
     def test_platform_warnings_and_native_dependencies_fail_closed(self) -> None:

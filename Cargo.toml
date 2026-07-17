@@ -35,7 +35,7 @@ linfa = { version = "0.8.1", features = ["serde"] }
 linfa-logistic = { version = "0.8.1", features = ["serde"] }
 muda = { version = "0.19.1", default-features = false }
 ndarray = { version = "0.16", features = ["serde"] }
-opentelemetry-proto = { version = "0.31.0", features = ["gen-tonic", "metrics"] }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic", "metrics"] }
 pcap = "2.4.0"
 petgraph = "0.8.3"
 prost = "0.14.3"

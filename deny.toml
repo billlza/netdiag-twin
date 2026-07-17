@@ -33,6 +33,11 @@ ignore = true
 multiple-versions = "deny"
 wildcards = "allow"
 highlight = "all"
+# RustSec did not yet index GHSA-w9wp-h8wv-79jx when v0.5.3 was prepared.
+# Keep the affected SDK range banned independently of the advisory database.
+deny = [
+    { name = "opentelemetry_sdk", version = "<=0.32.0" },
+]
 skip = [
     { crate = "bitflags@1.3.2", reason = "Transitive through pcap/CoreGraphics; retained until upstream moves to bitflags 2.x." },
     { crate = "block2@0.5.1", reason = "Transitive through accesskit/winit objc2 0.5 stack; app UI also needs objc2 0.6 via current macOS crates." },
@@ -76,6 +81,10 @@ skip = [
     { crate = "windows_x86_64_msvc@0.36.1", reason = "Transitive Windows target crate retained beside newer windows target crates until upstream convergence." },
     { crate = "wit-bindgen@0.51.0", reason = "Transitive WASM/component dependency retained beside wit-bindgen 0.57 until upstream convergence." },
 ]
+
+[[bans.features]]
+name = "opentelemetry-proto"
+deny = ["default", "full", "internal-logs", "logs", "trace", "with-serde", "zpages"]
 
 [sources]
 unknown-registry = "deny"

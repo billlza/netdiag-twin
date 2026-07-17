@@ -368,16 +368,106 @@ rm -rf "$ARTIFACTS"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(tuple(result.stdout.splitlines()), samples[:2])
 
-    def test_architecture_budgeted_sources_must_exist_in_the_git_index(self) -> None:
-        guard_body = (REPO_ROOT / "scripts/check_architecture_guard.sh").read_text(
-            encoding="utf-8"
+    def test_architecture_guard_rejects_budgeted_sources_only_in_worktree(
+        self,
+    ) -> None:
+        bash = shutil.which("bash")
+        path = os.environ.get("PATH")
+        self.assertIsNotNone(bash)
+        self.assertIsNotNone(path)
+        sources = (
+            Path("crates/netdiag-core/src/storage/atomic_file/target/binding.rs"),
+            Path("crates/netdiag-core/src/storage/atomic_file/target/path.rs"),
         )
-        self.assertIn(
-            'git -C "$ROOT" ls-files --error-unmatch -- "$path"', guard_body
-        )
-        self.assertIn(
-            'architecture guard failed: $path is absent from the Git index', guard_body
-        )
+        for source in sources:
+            self.assertTrue((REPO_ROOT / source).is_file())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            git_environment = {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": path,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONUTF8": "1",
+            }
+
+            source_arguments = [source.as_posix() for source in sources]
+            real_source_entries = subprocess.run(
+                ["git", "ls-files", "--stage", "-z", "--", *source_arguments],
+                cwd=REPO_ROOT,
+                env=git_environment,
+                check=True,
+                capture_output=True,
+            ).stdout
+            for source in sources:
+                stage_zero_entry = (
+                    b" 0\t" + os.fsencode(source.as_posix()) + b"\0"
+                )
+                self.assertEqual(real_source_entries.count(stage_zero_entry), 1)
+            temporary_index = str(Path(tmp).resolve() / "index")
+            temporary_git_environment = {
+                **git_environment,
+                "GIT_INDEX_FILE": temporary_index,
+                "NETDIAG_PYTHON_EXECUTABLE": str(Path(sys.executable).resolve()),
+            }
+            subprocess.run(
+                ["git", "read-tree", "HEAD"],
+                cwd=REPO_ROOT,
+                env=temporary_git_environment,
+                check=True,
+                capture_output=True,
+            )
+            temporary_source_entries = subprocess.run(
+                ["git", "ls-files", "--stage", "-z", "--", *source_arguments],
+                cwd=REPO_ROOT,
+                env=temporary_git_environment,
+                check=True,
+                capture_output=True,
+            ).stdout
+            for source in sources:
+                stage_zero_entry = (
+                    b" 0\t" + os.fsencode(source.as_posix()) + b"\0"
+                )
+                self.assertEqual(temporary_source_entries.count(stage_zero_entry), 1)
+            subprocess.run(
+                ["git", "update-index", "--force-remove", "--", *source_arguments],
+                cwd=REPO_ROOT,
+                env=temporary_git_environment,
+                check=True,
+                capture_output=True,
+            )
+            boundary = load_script("adapter_process")
+            result = boundary.run_bounded(
+                [str(bash), str(SCRIPTS / "check_architecture_guard.sh")],
+                cwd=REPO_ROOT,
+                timeout_seconds=120.0,
+                stdout_limit_bytes=2 * 1024 * 1024,
+                stderr_limit_bytes=2 * 1024 * 1024,
+                environment=temporary_git_environment,
+            )
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            expected_stderr = "".join(
+                f"architecture guard failed: {source.as_posix()} is absent "
+                "from the Git index\n"
+                for source in sources
+            )
+            self.assertEqual(result.stderr, expected_stderr)
+            for source in sources:
+                self.assertNotIn(f"{source.as_posix()}:", result.stdout)
+                self.assertTrue((REPO_ROOT / source).is_file())
+            current_source_entries = subprocess.run(
+                ["git", "ls-files", "--stage", "-z", "--", *source_arguments],
+                cwd=REPO_ROOT,
+                env=git_environment,
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual(current_source_entries, real_source_entries)
 
     def test_architecture_guard_fails_once_when_ripgrep_is_missing(self) -> None:
         bash = shutil.which("bash")

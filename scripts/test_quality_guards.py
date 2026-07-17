@@ -92,6 +92,27 @@ class StrictJsonBoundaryTests(unittest.TestCase):
 
 
 class ReleaseGateHygieneTests(unittest.TestCase):
+    def run_hygiene_with_ci(self, ci_body: str) -> tuple[int, str, str]:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            workflow_directory = Path(tmp) / "workflows"
+            workflow_directory.mkdir()
+            for name in ("release.yml", "platform-security.yml"):
+                (workflow_directory / name).write_text(
+                    (REPO_ROOT / ".github" / "workflows" / name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            (workflow_directory / "ci.yml").write_text(
+                ci_body,
+                encoding="utf-8",
+            )
+            module.WORKFLOW_DIRECTORY = workflow_directory
+            module.RELEASE_WORKFLOW = workflow_directory / "release.yml"
+            module.CI_WORKFLOW = workflow_directory / "ci.yml"
+            return run_main(module)
+
     def test_perf_script_hygiene_rejects_injectable_recursive_cleanup(self) -> None:
         module = load_script("check_release_gate_hygiene")
         dangerous = """\
@@ -171,39 +192,535 @@ rm -rf "$ARTIFACTS"
         self.assertNotEqual(code, 0)
         self.assertIn("must install rustfmt and clippy", stdout + stderr)
 
-    def test_workflow_hygiene_requires_pinned_ripgrep_for_the_strict_gate(
+    def test_ci_pinned_ripgrep_contract_mutations_fail_closed(self) -> None:
+        ci_body = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        baseline_code, baseline_stdout, baseline_stderr = self.run_hygiene_with_ci(
+            ci_body
+        )
+        self.assertEqual(
+            baseline_code,
+            0,
+            baseline_stdout + baseline_stderr,
+        )
+
+        def mutate_job(
+            body: str,
+            job_name: str,
+            original: str,
+            replacement: str,
+        ) -> str:
+            match = re.search(
+                rf"(?ms)^  {re.escape(job_name)}:\n.*?"
+                r"(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                body,
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            job_body = match.group(0)
+            self.assertIn(original, job_body)
+            mutated_job = job_body.replace(original, replacement, 1)
+            return body[: match.start()] + mutated_job + body[match.end() :]
+
+        def append_job_key(body: str, job_name: str, key: str) -> str:
+            match = re.search(
+                rf"(?ms)^  {re.escape(job_name)}:\n.*?"
+                r"(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                body,
+            )
+            self.assertIsNotNone(match)
+            assert match is not None
+            mutated_job = match.group(0).rstrip() + "\n" + key + "\n\n"
+            return body[: match.start()] + mutated_job + body[match.end() :]
+
+        def commented(line: str) -> str:
+            indentation = line[: len(line) - len(line.lstrip())]
+            return indentation + "# " + line.lstrip()
+
+        toolchain_action = (
+            "      - uses: dtolnay/rust-toolchain@"
+            "4be7066ada62dd38de10e7b70166bc74ed198c30 "
+            "# stable action, 2026-06-30"
+        )
+        installer_call = (
+            '          scripts/install_pinned_ripgrep.sh "$ripgrep_root"'
+        )
+        path_export = (
+            '          printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'
+        )
+        workflow_consumer = (
+            ".venv-jsonschema/bin/python -W error::ResourceWarning "
+            "scripts/test_quality_guards.py"
+        )
+        job_contracts = (
+            (
+                "workflow-hygiene",
+                "    runs-on: ubuntu-24.04",
+                "      - name: Install pinned ripgrep for runtime guards",
+                "      - name: Run Python quality guard tests",
+                workflow_consumer,
+            ),
+            (
+                "rust",
+                "    runs-on: macos-14",
+                "      - name: Install pinned ripgrep for strict guards",
+                "      - name: Strict Rust quality gate",
+                "scripts/check_rust_quality.sh strict",
+            ),
+        )
+        github_false = "$" + "{{ false }}"
+        custom_shell = "shell: bash -c 'bash \"$1\" || true' -- {0}"
+        mutations: list[tuple[str, str, str]] = []
+        for (
+            job_name,
+            job_marker,
+            installer_step,
+            consumer_step,
+            consumer_command,
+        ) in job_contracts:
+            consumer_run = f"        run: {consumer_command}"
+            for label, active_line in (
+                ("toolchain comment", toolchain_action),
+                ("installer comment", installer_call),
+                ("PATH comment", path_export),
+                ("consumer comment", consumer_run),
+            ):
+                mutations.append(
+                    (
+                        f"{job_name} {label}",
+                        mutate_job(
+                            ci_body,
+                            job_name,
+                            active_line,
+                            commented(active_line),
+                        ),
+                        job_name,
+                    )
+                )
+
+            for step_label, step_marker in (
+                ("toolchain", toolchain_action),
+                ("installer", installer_step),
+                ("consumer", consumer_step),
+            ):
+                for field in (
+                    f"if: {github_false}",
+                    "continue-on-error: true",
+                    custom_shell,
+                ):
+                    mutations.append(
+                        (
+                            f"{job_name} {step_label} {field}",
+                            mutate_job(
+                                ci_body,
+                                job_name,
+                                step_marker,
+                                step_marker + "\n        " + field,
+                            ),
+                            job_name,
+                        )
+                    )
+
+            masked_consumer = (
+                "        run: |\n"
+                "          set +e\n"
+                f"          {consumer_command}\n"
+                "          true"
+            )
+            mutations.append(
+                (
+                    f"{job_name} masked consumer",
+                    mutate_job(
+                        ci_body,
+                        job_name,
+                        consumer_run,
+                        masked_consumer,
+                    ),
+                    job_name,
+                )
+            )
+            mutations.append(
+                (
+                    f"{job_name} extra post-export command",
+                    mutate_job(
+                        ci_body,
+                        job_name,
+                        path_export,
+                        path_export + '\n          rm -f "$ripgrep_bin_dir/rg"',
+                    ),
+                    job_name,
+                )
+            )
+            intervening_step = (
+                "      - name: Tamper with pinned ripgrep\n"
+                '        run: rm -f "$RUNNER_TEMP/netdiag-ripgrep/bin/rg"\n'
+            )
+            mutations.append(
+                (
+                    f"{job_name} intervening tamper step",
+                    mutate_job(
+                        ci_body,
+                        job_name,
+                        consumer_step,
+                        intervening_step + consumer_step,
+                    ),
+                    job_name,
+                )
+            )
+
+            late_export = mutate_job(
+                ci_body,
+                job_name,
+                path_export,
+                "",
+            )
+            late_export_step = (
+                "      - name: Export pinned ripgrep path late\n"
+                "        run: |\n"
+                "          set -euo pipefail\n"
+                '          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"\n'
+                '          ripgrep_bin_dir="$ripgrep_root/bin"\n'
+                + path_export
+                + "\n"
+            )
+            late_export = mutate_job(
+                late_export,
+                job_name,
+                consumer_step,
+                late_export_step + consumer_step,
+            )
+            mutations.append(
+                (f"{job_name} late PATH export", late_export, job_name)
+            )
+            mutations.extend(
+                (
+                    (
+                        f"{job_name} conditional job",
+                        mutate_job(
+                            ci_body,
+                            job_name,
+                            job_marker,
+                            job_marker + f"\n    if: {github_false}",
+                        ),
+                        job_name,
+                    ),
+                    (
+                        f"{job_name} job shell override",
+                        mutate_job(
+                            ci_body,
+                            job_name,
+                            job_marker,
+                            job_marker
+                            + "\n    defaults:\n      run:\n"
+                            + "        "
+                            + custom_shell,
+                        ),
+                        job_name,
+                    ),
+                )
+            )
+            for label, job_key in (
+                ("post-steps condition", f"    if: {github_false}"),
+                ("post-steps ignore", "    continue-on-error: true"),
+                (
+                    "post-steps shell override",
+                    "    defaults:\n      run:\n        " + custom_shell,
+                ),
+                (
+                    "post-steps environment",
+                    "    env:\n      CARGO_HOME: untrusted",
+                ),
+            ):
+                mutations.append(
+                    (
+                        f"{job_name} {label}",
+                        append_job_key(ci_body, job_name, job_key),
+                        job_name,
+                    )
+                )
+
+        workflow_level_mutations = (
+            (
+                "workflow shell override",
+                "defaults:\n  run:\n    " + custom_shell + "\n",
+            ),
+            (
+                "workflow environment block",
+                "env:\n  RUSTUP_TOOLCHAIN: stable\n"
+                "  CARGO_HOME: untrusted\n",
+            ),
+            (
+                "workflow environment mapping",
+                "env: {RUSTUP_TOOLCHAIN: stable, CARGO_HOME: untrusted}\n",
+            ),
+            (
+                "workflow spaced environment",
+                "env :\n  RUSTUP_TOOLCHAIN: stable\n",
+            ),
+            (
+                "workflow quoted environment",
+                '"env":\n  CARGO_HOME: untrusted\n',
+            ),
+            (
+                "workflow quoted defaults",
+                "'defaults':\n  run:\n    " + custom_shell + "\n",
+            ),
+        )
+        for label, insertion in workflow_level_mutations:
+            mutations.append(
+                (
+                    label,
+                    ci_body.replace("jobs:\n", insertion + "jobs:\n", 1),
+                    "reviewed workflow trigger, permissions, and jobs prefix",
+                )
+            )
+        for label, suffix in (
+            (
+                "post-jobs workflow environment",
+                "env:\n  RUSTUP_TOOLCHAIN: stable\n",
+            ),
+            (
+                "post-jobs quoted workflow environment",
+                '"env": {CARGO_HOME: untrusted}\n',
+            ),
+            (
+                "post-jobs quoted workflow defaults",
+                "'defaults':\n  run:\n    " + custom_shell + "\n",
+            ),
+        ):
+            mutations.append(
+                (
+                    label,
+                    ci_body.rstrip() + "\n" + suffix,
+                    "only the reviewed top-level workflow mappings",
+                )
+            )
+
+        for label, mutated_ci, expected_failure in mutations:
+            with self.subTest(label=label):
+                code, stdout, stderr = self.run_hygiene_with_ci(mutated_ci)
+                self.assertNotEqual(code, 0)
+                self.assertIn(expected_failure, stdout + stderr)
+
+    def test_pinned_ripgrep_installer_mutations_fail_closed(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        installer_body = (
+            REPO_ROOT / "scripts" / "install_pinned_ripgrep.sh"
+        ).read_text(encoding="utf-8")
+        baseline_failures: list[str] = []
+        module.validate_pinned_ripgrep_installer_body(
+            installer_body, baseline_failures
+        )
+        self.assertEqual(baseline_failures, [])
+        mutations = (
+            ("shebang", "#!/usr/bin/env bash", "#!/bin/sh"),
+            ("version", 'RIPGREP_VERSION="15.2.0"', 'RIPGREP_VERSION="15.2.1"'),
+            ("lock", " --locked", ""),
+            ("absolute root", '"$ripgrep_root" != /*', '"$ripgrep_root" == /*'),
+            ("explicit exit", "  exit 2\n", "",),
+            (
+                "comment-only contract",
+                'readonly RIPGREP_VERSION="15.2.0"',
+                '# readonly RIPGREP_VERSION="15.2.0"\nreadonly RIPGREP_VERSION="15.2.1"',
+            ),
+            (
+                "stdout pollution",
+                'installed_version_output="$("$ripgrep_executable" --version)"',
+                'printf \'%s\\n\' "untrusted-path"\n'
+                'installed_version_output="$("$ripgrep_executable" --version)"',
+            ),
+        )
+        for name, original, replacement in mutations:
+            with self.subTest(name=name):
+                self.assertIn(original, installer_body)
+                failures: list[str] = []
+                module.validate_pinned_ripgrep_installer_body(
+                    installer_body.replace(original, replacement, 1), failures
+                )
+                self.assertTrue(failures)
+
+        install = (
+            'cargo install ripgrep --version "$RIPGREP_VERSION" --locked '
+            '--quiet --root "$ripgrep_root"'
+        )
+        version_capture = (
+            'installed_version_output="$("$ripgrep_executable" --version)"'
+        )
+        reordered = (
+            installer_body.replace(install, "__INSTALL__", 1)
+            .replace(version_capture, install, 1)
+            .replace("__INSTALL__", version_capture, 1)
+        )
+        failures = []
+        module.validate_pinned_ripgrep_installer_body(reordered, failures)
+        self.assertTrue(
+            any("reviewed fail-closed command sequence" in failure for failure in failures)
+        )
+
+        failures = []
+        module.validate_pinned_ripgrep_installer_body(
+            installer_body + '\nrm -f "$ripgrep_executable"\n', failures
+        )
+        self.assertTrue(
+            any("reviewed fail-closed command sequence" in failure for failure in failures)
+        )
+
+    def test_pinned_ripgrep_installer_must_be_executable(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        installer_body = (
+            REPO_ROOT / "scripts" / "install_pinned_ripgrep.sh"
+        ).read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            installer = Path(tmp) / "install_pinned_ripgrep.sh"
+            installer.write_text(installer_body, encoding="utf-8")
+            installer.chmod(0o644)
+            module.PINNED_RIPGREP_INSTALLER = installer
+            failures: list[str] = []
+            module.validate_pinned_ripgrep_installer(failures)
+
+        self.assertTrue(any("owner-executable" in failure for failure in failures))
+
+    def test_pinned_ripgrep_installer_path_failures_are_explicit(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "missing-installer"
+            module.PINNED_RIPGREP_INSTALLER = missing
+            failures: list[str] = []
+            module.validate_pinned_ripgrep_installer(failures)
+            self.assertTrue(
+                any("metadata is unavailable" in failure for failure in failures)
+            )
+
+            target = root / "target-installer"
+            target.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            target.chmod(0o755)
+            link = root / "installer-link"
+            link.symlink_to(target)
+            module.PINNED_RIPGREP_INSTALLER = link
+            failures = []
+            module.validate_pinned_ripgrep_installer(failures)
+            self.assertTrue(
+                any("owner-executable" in failure for failure in failures)
+            )
+
+            invalid_utf8 = root / "invalid-utf8-installer"
+            invalid_utf8.write_bytes(b"\xff")
+            invalid_utf8.chmod(0o755)
+            module.PINNED_RIPGREP_INSTALLER = invalid_utf8
+            failures = []
+            module.validate_pinned_ripgrep_installer(failures)
+            self.assertTrue(
+                any("not readable UTF-8" in failure for failure in failures)
+            )
+
+    def test_pinned_ripgrep_installer_git_index_mutations_fail_closed(
         self,
     ) -> None:
         module = load_script("check_release_gate_hygiene")
+        relative_path = "scripts/install_pinned_ripgrep.sh"
         with tempfile.TemporaryDirectory() as tmp:
-            workflow_directory = Path(tmp) / "workflows"
-            workflow_directory.mkdir()
-            for name in ("release.yml", "platform-security.yml"):
-                (workflow_directory / name).write_text(
-                    (REPO_ROOT / ".github/workflows" / name).read_text(
-                        encoding="utf-8"
-                    ),
-                    encoding="utf-8",
-                )
-            ci_body = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
-                encoding="utf-8"
-            )
-            install = (
-                '          cargo install ripgrep --version "$RIPGREP_VERSION" '
-                '--locked --quiet --root "$ripgrep_root"\n'
-            )
-            self.assertIn(install, ci_body)
-            (workflow_directory / "ci.yml").write_text(
-                ci_body.replace(install, "", 1),
-                encoding="utf-8",
-            )
-            module.WORKFLOW_DIRECTORY = workflow_directory
-            module.RELEASE_WORKFLOW = workflow_directory / "release.yml"
-            module.CI_WORKFLOW = workflow_directory / "ci.yml"
-            code, stdout, stderr = run_main(module)
+            index_path = str((Path(tmp) / "index").resolve())
+            executable_path = os.environ.get("PATH")
+            self.assertIsNotNone(executable_path)
+            environment = {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_INDEX_FILE": index_path,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": executable_path or "",
+            }
 
-        self.assertNotEqual(code, 0)
-        self.assertIn("must install and verify pinned ripgrep", stdout + stderr)
+            def run_git(*arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", *arguments],
+                    cwd=REPO_ROOT,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="strict",
+                    timeout=10,
+                )
+                return completed.stdout
+
+            run_git("read-tree", "HEAD")
+            run_git("add", "--", relative_path)
+            failures: list[str] = []
+            module.validate_pinned_ripgrep_installer_index(
+                failures, index_file=index_path
+            )
+            self.assertEqual(failures, [])
+
+            run_git("update-index", "--force-remove", "--", relative_path)
+            failures = []
+            module.validate_pinned_ripgrep_installer_index(
+                failures, index_file=index_path
+            )
+            self.assertTrue(
+                any("stage-0 100755" in failure for failure in failures)
+            )
+
+            run_git("add", "--", relative_path)
+            run_git("update-index", "--chmod=-x", "--", relative_path)
+            failures = []
+            module.validate_pinned_ripgrep_installer_index(
+                failures, index_file=index_path
+            )
+            self.assertTrue(
+                any("stage-0 100755" in failure for failure in failures)
+            )
+
+            replacement_blob = run_git(
+                "rev-parse",
+                "HEAD:.gitignore",
+            ).strip()
+            run_git(
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100755",
+                replacement_blob,
+                relative_path,
+            )
+            failures = []
+            module.validate_pinned_ripgrep_installer_index(
+                failures, index_file=index_path
+            )
+            self.assertTrue(
+                any("must match the worktree" in failure for failure in failures)
+            )
+
+    def test_pinned_ripgrep_index_ignores_ambient_git_overrides(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "git-trace.log"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(Path(tmp) / "wrong-git-dir"),
+                    "GIT_INDEX_FILE": str(Path(tmp) / "wrong-index"),
+                    "GIT_TRACE": str(trace_path),
+                    "GIT_WORK_TREE": tmp,
+                },
+                clear=False,
+            ):
+                failures: list[str] = []
+                module.validate_pinned_ripgrep_installer_index(failures)
+
+            self.assertEqual(failures, [])
+            self.assertFalse(trace_path.exists())
+
+        failures = []
+        module.validate_pinned_ripgrep_installer_index(
+            failures, index_file="relative-index"
+        )
+        self.assertTrue(any("absolute single-line" in item for item in failures))
 
     def test_workflow_hygiene_rejects_untrusted_platform_checkout_roots(self) -> None:
         module = load_script("check_release_gate_hygiene")
@@ -3393,39 +3910,6 @@ class CiPlatformGateTests(unittest.TestCase):
             rust_job.index("components: rustfmt, clippy"),
             rust_job.index("scripts/check_rust_quality.sh strict"),
         )
-
-    def test_strict_ci_installs_pinned_ripgrep_before_the_quality_gate(self) -> None:
-        ci_workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
-            encoding="utf-8"
-        )
-        rust_job = ci_workflow.split("  rust:\n", 1)[1]
-        version = 'RIPGREP_VERSION: "15.2.0"'
-        root = 'ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"'
-        install = (
-            'cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet '
-            '--root "$ripgrep_root"'
-        )
-        presence = 'ripgrep_executable="$ripgrep_bin_dir/rg"'
-        version_capture = (
-            'installed_version_output="$("$ripgrep_executable" --version)"'
-        )
-        version_check = '"ripgrep $RIPGREP_VERSION"'
-        path_export = 'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'
-        strict_gate = "scripts/check_rust_quality.sh strict"
-        self.assertIn(version, rust_job)
-        self.assertIn(root, rust_job)
-        self.assertIn(install, rust_job)
-        self.assertIn(presence, rust_job)
-        self.assertIn(version_capture, rust_job)
-        self.assertIn(version_check, rust_job)
-        self.assertIn(path_export, rust_job)
-        self.assertLess(rust_job.index(version), rust_job.index(root))
-        self.assertLess(rust_job.index(root), rust_job.index(install))
-        self.assertLess(rust_job.index(install), rust_job.index(presence))
-        self.assertLess(rust_job.index(presence), rust_job.index(version_capture))
-        self.assertLess(rust_job.index(version_capture), rust_job.index(version_check))
-        self.assertLess(rust_job.index(version_check), rust_job.index(path_export))
-        self.assertLess(rust_job.index(path_export), rust_job.index(strict_gate))
 
     def test_platform_warnings_and_native_dependencies_fail_closed(self) -> None:
         job = self.platform_job()

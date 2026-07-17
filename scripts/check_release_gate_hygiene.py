@@ -7,12 +7,16 @@ import ast
 import os
 import re
 import shlex
+import stat
+import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
 QUALITY_SCRIPT = ROOT / "scripts" / "check_rust_quality.sh"
 ARCHITECTURE_GUARD_SCRIPT = ROOT / "scripts" / "check_architecture_guard.sh"
+PINNED_RIPGREP_INSTALLER = ROOT / "scripts" / "install_pinned_ripgrep.sh"
 PACKAGE_SCRIPT = ROOT / "scripts" / "package_macos_app.sh"
 PERF_SCRIPT = ROOT / "scripts" / "check_perf_budget.sh"
 BENCHMARK_SOURCE = ROOT / "crates" / "netdiag-core" / "src" / "benchmark.rs"
@@ -73,6 +77,10 @@ ACTION_USE = re.compile(r"(?m)^\s*(?:-\s*)?uses:\s*([^\s#]+)")
 PINNED_ACTION_REF = re.compile(r"[0-9a-f]{40}")
 SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Z][A-Z0-9_]*)\s*\}\}")
 VARIABLE_REFERENCE = re.compile(r"\$\{\{\s*vars\.([A-Z][A-Z0-9_]*)\s*\}\}")
+PINNED_RUST_TOOLCHAIN_ACTION = (
+    "uses: dtolnay/rust-toolchain@"
+    "4be7066ada62dd38de10e7b70166bc74ed198c30"
+)
 
 
 def strip_shell_comment(line: str) -> str:
@@ -146,6 +154,14 @@ def uncommented_body(body: str) -> str:
     return "\n".join(strip_shell_comment(line) for line in body.splitlines())
 
 
+def active_lines(body: str) -> tuple[str, ...]:
+    return tuple(
+        line.strip()
+        for line in uncommented_body(body).splitlines()
+        if line.strip()
+    )
+
+
 def validate_perf_script_body(body: str, failures: list[str]) -> None:
     active_body = uncommented_body(body)
     if re.search(r"(?m)^\s*(?:command\s+)?rm(?:\s|$)", active_body):
@@ -156,6 +172,254 @@ def validate_perf_script_body(body: str, failures: list[str]) -> None:
 
 def validate_perf_script_hygiene(failures: list[str]) -> None:
     validate_perf_script_body(PERF_SCRIPT.read_text(encoding="utf-8"), failures)
+
+
+def validate_pinned_ripgrep_installer_body(
+    body: str, failures: list[str]
+) -> None:
+    source_lines = body.splitlines()
+    if not source_lines or source_lines[0] != "#!/usr/bin/env bash":
+        failures.append(
+            "pinned ripgrep installer must use the reviewed Bash interpreter"
+        )
+    actual_lines = active_lines(body)
+    expected_active_lines = (
+        "set -euo pipefail",
+        'readonly RIPGREP_VERSION="15.2.0"',
+        "if (( $# != 1 )); then",
+        'echo "usage: install_pinned_ripgrep.sh <absolute-install-root>" >&2',
+        "exit 2",
+        "fi",
+        'ripgrep_root="$1"',
+        'if [[ -z "$ripgrep_root" || "$ripgrep_root" != /* || '
+        '"$ripgrep_root" == *$\'\\n\'* || "$ripgrep_root" == *$\'\\r\'* ]]; then',
+        'echo "ripgrep installation root must be an absolute single-line path" >&2',
+        "exit 2",
+        "fi",
+        'if [[ -e "$ripgrep_root" || -L "$ripgrep_root" ]]; then',
+        'echo "isolated ripgrep installation root already exists" >&2',
+        "exit 2",
+        "fi",
+        'cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet --root "$ripgrep_root"',
+        'ripgrep_bin_dir="$ripgrep_root/bin"',
+        'ripgrep_executable="$ripgrep_bin_dir/rg"',
+        'if [[ -z "$ripgrep_executable" || "$ripgrep_executable" != /* || '
+        '-L "$ripgrep_executable" || ! -f "$ripgrep_executable" || '
+        '! -x "$ripgrep_executable" ]]; then',
+        'echo "installed ripgrep is not an absolute regular executable" >&2',
+        "exit 2",
+        "fi",
+        'installed_version_output="$("$ripgrep_executable" --version)"',
+        'if [[ "${installed_version_output%%$\'\\n\'*}" != '
+        '"ripgrep $RIPGREP_VERSION" ]]; then',
+        'echo "installed ripgrep version does not match the pinned version" >&2',
+        "exit 2",
+        "fi",
+    )
+    if actual_lines != expected_active_lines:
+        failures.append(
+            "pinned ripgrep installer must match the reviewed fail-closed command sequence"
+        )
+
+
+def validate_pinned_ripgrep_installer_index(
+    failures: list[str], *, index_file: str | None = None
+) -> None:
+    try:
+        relative_path = PINNED_RIPGREP_INSTALLER.relative_to(ROOT).as_posix()
+    except ValueError:
+        failures.append("pinned ripgrep installer must remain inside the repository")
+        return
+
+    executable_path = os.environ.get("PATH")
+    if not executable_path:
+        failures.append("pinned ripgrep installer Git-index check requires PATH")
+        return
+    environment = {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": executable_path,
+    }
+    if index_file is not None:
+        if (
+            not os.path.isabs(index_file)
+            or "\n" in index_file
+            or "\r" in index_file
+        ):
+            failures.append(
+                "pinned ripgrep installer test index must be an absolute single-line path"
+            )
+            return
+        environment["GIT_INDEX_FILE"] = index_file
+
+    def run_git(arguments: list[str]) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return subprocess.run(
+                ["git", *arguments],
+                cwd=ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+            failures.append(
+                "pinned ripgrep installer Git-index check failed to execute: "
+                f"{type(error).__name__}"
+            )
+            return None
+
+    index_entry = run_git(
+        ["ls-files", "--stage", "--error-unmatch", "--", relative_path]
+    )
+    if index_entry is None:
+        return
+    expected_entry = re.compile(
+        rf"^100755 [0-9a-f]{{40}}(?:[0-9a-f]{{24}})? 0\t{re.escape(relative_path)}$"
+    )
+    entries = index_entry.stdout.splitlines()
+    if (
+        index_entry.returncode != 0
+        or len(entries) != 1
+        or expected_entry.fullmatch(entries[0]) is None
+    ):
+        failures.append(
+            "pinned ripgrep installer must have one stage-0 100755 Git-index entry"
+        )
+        return
+
+    worktree_match = run_git(
+        ["diff", "--quiet", "--no-ext-diff", "--no-textconv", "--", relative_path]
+    )
+    if worktree_match is None:
+        return
+    if worktree_match.returncode == 1:
+        failures.append(
+            "pinned ripgrep installer Git-index content must match the worktree"
+        )
+    elif worktree_match.returncode != 0:
+        failures.append(
+            "pinned ripgrep installer Git-index comparison failed with status "
+            f"{worktree_match.returncode}"
+        )
+
+
+def validate_pinned_ripgrep_installer(failures: list[str]) -> None:
+    try:
+        metadata = PINNED_RIPGREP_INSTALLER.lstat()
+    except OSError as error:
+        failures.append(
+            "pinned ripgrep installer metadata is unavailable: "
+            f"{type(error).__name__}"
+        )
+        return
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        PINNED_RIPGREP_INSTALLER.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or mode & stat.S_IXUSR == 0
+        or mode & 0o022 != 0
+    ):
+        failures.append(
+            "pinned ripgrep installer must be a non-group/world-writable regular "
+            "owner-executable file"
+        )
+        return
+    try:
+        body = PINNED_RIPGREP_INSTALLER.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        failures.append(
+            "pinned ripgrep installer is not readable UTF-8: "
+            f"{type(error).__name__}"
+        )
+        return
+    validate_pinned_ripgrep_installer_body(body, failures)
+
+
+class ExactCiStepContract(NamedTuple):
+    label: str
+    marker: str
+    lines: tuple[str, ...]
+
+
+class PinnedRipgrepCiJobContract(NamedTuple):
+    job_name: str
+    job_prefix: tuple[str, ...]
+    steps: tuple[ExactCiStepContract, ...]
+
+
+def validate_ci_pinned_ripgrep(
+    ci_body: str,
+    contract: PinnedRipgrepCiJobContract,
+    failures: list[str],
+) -> None:
+    job_body = yaml_job_body(ci_body, contract.job_name)
+    if job_body is None:
+        failures.append(f"CI must define the protected {contract.job_name} job")
+        return
+    job_lines = active_lines(job_body)
+    try:
+        steps_index = job_lines.index("steps:")
+    except ValueError:
+        failures.append(
+            f"{contract.job_name} must define its reviewed unconditional job prefix"
+        )
+        return
+    if job_lines[: steps_index + 1] != contract.job_prefix:
+        failures.append(
+            f"{contract.job_name} must keep its reviewed unconditional job prefix"
+        )
+    active_job_body = uncommented_body(job_body)
+    steps_line = re.search(r"(?m)^    steps\s*:\s*$", active_job_body)
+    if steps_line is None:
+        failures.append(f"{contract.job_name} must define one reviewed steps mapping")
+        return
+    if re.search(
+        r"(?m)^    \S[^:\n]*\s*:", active_job_body[steps_line.end() :]
+    ):
+        failures.append(
+            f"{contract.job_name} must not define job keys after its steps mapping"
+        )
+
+    actual_steps = tuple(active_lines(body) for body in yaml_step_bodies(job_body))
+    positions: list[int] = []
+    for expected_step in contract.steps:
+        matching_positions = [
+            index
+            for index, actual_step in enumerate(actual_steps)
+            if expected_step.marker in actual_step
+        ]
+        if len(matching_positions) != 1:
+            failures.append(
+                f"{contract.job_name} must define one exact {expected_step.label} step"
+            )
+            continue
+        position = matching_positions[0]
+        positions.append(position)
+        if actual_steps[position] != expected_step.lines:
+            failures.append(
+                f"{contract.job_name} must keep its {expected_step.label} step exact "
+                "and unconditional"
+            )
+    if len(positions) == len(contract.steps) and positions != sorted(positions):
+        failures.append(
+            f"{contract.job_name} must order toolchain, ripgrep, then quality consumer"
+        )
+    elif (
+        len(positions) == len(contract.steps)
+        and positions[-1] != positions[-2] + 1
+    ):
+        failures.append(
+            f"{contract.job_name} must run its quality consumer immediately after "
+            "pinned ripgrep installation"
+        )
 
 
 def shell_function_body(body: str, name: str) -> str | None:
@@ -227,6 +491,22 @@ def yaml_job_body(body: str, name: str) -> str | None:
         body,
     )
     return None if match is None else match.group("body")
+
+
+def yaml_step_bodies(job_body: str) -> list[str]:
+    """Return top-level step bodies from a job without evaluating YAML."""
+
+    step_starts = list(re.finditer(r"(?m)^      - \S", job_body))
+    return [
+        job_body[
+            match.start() : (
+                step_starts[index + 1].start()
+                if index + 1 < len(step_starts)
+                else len(job_body)
+            )
+        ]
+        for index, match in enumerate(step_starts)
+    ]
 
 
 def validate_schema_requirements(failures: list[str]) -> None:
@@ -463,6 +743,38 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
     benchmark_body = "\n".join(
         source.read_text(encoding="utf-8") for source in benchmark_sources
     )
+    validate_pinned_ripgrep_installer_index(failures)
+    validate_pinned_ripgrep_installer(failures)
+    active_ci_body = uncommented_body(ci_body)
+    top_level_lines = tuple(
+        line.strip()
+        for line in active_ci_body.splitlines()
+        if line.strip() and not line[0].isspace()
+    )
+    if top_level_lines != ("name: CI", "on:", "permissions:", "jobs:"):
+        failures.append(
+            "CI must define only the reviewed top-level workflow mappings"
+        )
+    ci_lines = active_lines(ci_body)
+    try:
+        jobs_index = ci_lines.index("jobs:")
+    except ValueError:
+        failures.append("CI must define the reviewed top-level jobs mapping")
+    else:
+        expected_ci_prefix = (
+            "name: CI",
+            "on:",
+            "push:",
+            'branches: ["main"]',
+            "pull_request:",
+            "permissions:",
+            "contents: read",
+            "jobs:",
+        )
+        if ci_lines[: jobs_index + 1] != expected_ci_prefix:
+            failures.append(
+                "CI must keep its reviewed workflow trigger, permissions, and jobs prefix"
+            )
 
     for workflow in sorted(WORKFLOW_DIRECTORY.glob("*.yml")):
         body = workflow.read_text(encoding="utf-8")
@@ -862,56 +1174,100 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         failures.append(
             "strict CI must install rustfmt and clippy before running the quality gate"
         )
-    ripgrep_version = 'RIPGREP_VERSION: "15.2.0"'
-    ripgrep_install = (
-        'cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet --root "$ripgrep_root"'
+    toolchain_action = f"- {PINNED_RUST_TOOLCHAIN_ACTION}"
+    installer_call = 'scripts/install_pinned_ripgrep.sh "$ripgrep_root"'
+    installer_tail = (
+        'ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"',
+        installer_call,
+        'ripgrep_bin_dir="$ripgrep_root/bin"',
+        'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"',
     )
-    ripgrep_root = 'ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"'
-    ripgrep_presence = 'ripgrep_executable="$ripgrep_bin_dir/rg"'
-    ripgrep_version_capture = (
-        'installed_version_output="$("$ripgrep_executable" --version)"'
+    workflow_consumer = (
+        ".venv-jsonschema/bin/python -W error::ResourceWarning "
+        "scripts/test_quality_guards.py"
     )
-    ripgrep_version_check = '"ripgrep $RIPGREP_VERSION"'
-    ripgrep_path_export = 'printf \'%s\\n\' "$ripgrep_bin_dir" >> "$GITHUB_PATH"'
-    strict_quality_command = "scripts/check_rust_quality.sh strict"
-    for fragment in (
-        ripgrep_version,
-        ripgrep_root,
-        ripgrep_install,
-        ripgrep_presence,
-        ripgrep_version_capture,
-        ripgrep_version_check,
-        ripgrep_path_export,
-    ):
-        if fragment not in rust_ci_body:
-            failures.append(
-                f"strict CI must install and verify pinned ripgrep before running the quality gate: {fragment}"
-            )
-    if all(
-        fragment in rust_ci_body
-        for fragment in (
-            ripgrep_version,
-            ripgrep_root,
-            ripgrep_install,
-            ripgrep_presence,
-            ripgrep_version_capture,
-            ripgrep_version_check,
-            ripgrep_path_export,
-            strict_quality_command,
-        )
-    ) and not (
-        rust_ci_body.index(ripgrep_version)
-        < rust_ci_body.index(ripgrep_root)
-        < rust_ci_body.index(ripgrep_install)
-        < rust_ci_body.index(ripgrep_presence)
-        < rust_ci_body.index(ripgrep_version_capture)
-        < rust_ci_body.index(ripgrep_version_check)
-        < rust_ci_body.index(ripgrep_path_export)
-        < rust_ci_body.index(strict_quality_command)
-    ):
-        failures.append(
-            "strict CI must install and verify pinned ripgrep before running the quality gate"
-        )
+    rust_consumer = "scripts/check_rust_quality.sh strict"
+    ci_ripgrep_contracts = (
+        PinnedRipgrepCiJobContract(
+            job_name="workflow-hygiene",
+            job_prefix=(
+                "runs-on: ubuntu-24.04",
+                "timeout-minutes: 15",
+                "env:",
+                'ACTIONLINT_REVISION: "03d0035246f3e81f36aed592ffb4bebf33a03106"',
+                'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"',
+                "steps:",
+            ),
+            steps=(
+                ExactCiStepContract(
+                    "pinned Rust toolchain",
+                    toolchain_action,
+                    (toolchain_action, "with:", "toolchain: 1.95.0"),
+                ),
+                ExactCiStepContract(
+                    "pinned ripgrep installer",
+                    installer_call,
+                    (
+                        "- name: Install pinned ripgrep for runtime guards",
+                        "run: |",
+                        "set -euo pipefail",
+                        *installer_tail,
+                    ),
+                ),
+                ExactCiStepContract(
+                    "Python quality consumer",
+                    f"run: {workflow_consumer}",
+                    (
+                        "- name: Run Python quality guard tests",
+                        f"run: {workflow_consumer}",
+                    ),
+                ),
+            ),
+        ),
+        PinnedRipgrepCiJobContract(
+            job_name="rust",
+            job_prefix=(
+                "runs-on: macos-14",
+                "timeout-minutes: 90",
+                "env:",
+                'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"',
+                "steps:",
+            ),
+            steps=(
+                ExactCiStepContract(
+                    "pinned Rust toolchain",
+                    toolchain_action,
+                    (
+                        toolchain_action,
+                        "with:",
+                        "toolchain: 1.95.0",
+                        "components: rustfmt, clippy",
+                    ),
+                ),
+                ExactCiStepContract(
+                    "pinned ripgrep installer",
+                    installer_call,
+                    (
+                        "- name: Install pinned ripgrep for strict guards",
+                        "run: |",
+                        "set -euo pipefail",
+                        *installer_tail,
+                    ),
+                ),
+                ExactCiStepContract(
+                    "strict quality consumer",
+                    f"run: {rust_consumer}",
+                    (
+                        "- name: Strict Rust quality gate",
+                        "id: strict_quality",
+                        f"run: {rust_consumer}",
+                    ),
+                ),
+            ),
+        ),
+    )
+    for contract in ci_ripgrep_contracts:
+        validate_ci_pinned_ripgrep(ci_body, contract, failures)
     for fragment in (
         '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]',
         "validate_trusted_ancestor() {",

@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+        with:
+          toolchain: 1.95.0
       - name: Install Python quality dependencies
         run: |
           python3 -m venv --clear --copies .venv-jsonschema
@@ -36,7 +39,15 @@ jobs:
           "$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml
           python3 scripts/check_release_gate_hygiene.py
           python3 scripts/check_docs_workflow_hygiene.py
-          .venv-jsonschema/bin/python -W error::ResourceWarning scripts/test_quality_guards.py
+      - name: Install pinned ripgrep for runtime guards
+        run: |
+          set -euo pipefail
+          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"
+          scripts/install_pinned_ripgrep.sh "$ripgrep_root"
+          ripgrep_bin_dir="$ripgrep_root/bin"
+          printf '%s\n' "$ripgrep_bin_dir" >> "$GITHUB_PATH"
+      - name: Run Python quality guard tests
+        run: .venv-jsonschema/bin/python -W error::ResourceWarning scripts/test_quality_guards.py
 
   adapter-schema:
     runs-on: macos-14
@@ -89,7 +100,6 @@ jobs:
           CARGO_LLVM_COV_VERSION: "0.8.7"
           CARGO_MACHETE_VERSION: "0.9.2"
           CARGO_NEXTEST_VERSION: "0.9.136"
-          RIPGREP_VERSION: "15.2.0"
         run: |
           set -euo pipefail
           rustup component add llvm-tools-preview
@@ -97,24 +107,6 @@ jobs:
           cargo install cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION" --locked --quiet
           cargo install cargo-deny --version "$CARGO_DENY_VERSION" --locked --quiet
           cargo install cargo-machete --version "$CARGO_MACHETE_VERSION" --locked --quiet
-          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"
-          if [[ -e "$ripgrep_root" || -L "$ripgrep_root" ]]; then
-            echo "isolated ripgrep installation root already exists" >&2
-            exit 2
-          fi
-          cargo install ripgrep --version "$RIPGREP_VERSION" --locked --quiet --root "$ripgrep_root"
-          ripgrep_bin_dir="$ripgrep_root/bin"
-          ripgrep_executable="$ripgrep_bin_dir/rg"
-          if [[ -z "$ripgrep_executable" || "$ripgrep_executable" != /* || -L "$ripgrep_executable" || ! -f "$ripgrep_executable" || ! -x "$ripgrep_executable" ]]; then
-            echo "installed ripgrep is not an absolute regular executable" >&2
-            exit 2
-          fi
-          installed_version_output="$("$ripgrep_executable" --version)"
-          if [[ "${installed_version_output%%$'\n'*}" != "ripgrep $RIPGREP_VERSION" ]]; then
-            echo "installed ripgrep version does not match the pinned version" >&2
-            exit 2
-          fi
-          printf '%s\n' "$ripgrep_bin_dir" >> "$GITHUB_PATH"
       - name: Bind vendored patches to published source archives
         run: |
           mkdir -p target/upstream-crates
@@ -125,6 +117,13 @@ jobs:
             --output target/upstream-crates/wayland-scanner-0.31.10.crate \
             https://static.crates.io/crates/wayland-scanner/wayland-scanner-0.31.10.crate
           python3 scripts/check_patch_contract_hygiene.py --archive-dir target/upstream-crates
+      - name: Install pinned ripgrep for strict guards
+        run: |
+          set -euo pipefail
+          ripgrep_root="$RUNNER_TEMP/netdiag-ripgrep"
+          scripts/install_pinned_ripgrep.sh "$ripgrep_root"
+          ripgrep_bin_dir="$ripgrep_root/bin"
+          printf '%s\n' "$ripgrep_bin_dir" >> "$GITHUB_PATH"
       - name: Strict Rust quality gate
         id: strict_quality
         run: scripts/check_rust_quality.sh strict

@@ -517,23 +517,10 @@ fn system_counter_delta_to_result(
             "quic_blocked_ratio",
             "system counters do not expose QUIC policy state",
         ),
-        fallback_warning(
-            "timeout_events",
-            "system counters do not observe request timeouts",
-        ),
-        fallback_warning(
-            "retry_events",
-            "system counters do not observe request retries",
-        ),
-        fallback_warning(
-            "dns_failure_events",
-            "system counters do not expose DNS outcomes",
-        ),
-        fallback_warning(
-            "tls_failure_events",
-            "system counters do not expose TLS outcomes",
-        ),
     ]);
+    ingest
+        .warnings
+        .extend(unobserved_event_warnings("system counters"));
     replace_metric_provenance(&mut ingest, "system_counters");
     set_metric_provenance(
         &mut ingest,
@@ -619,6 +606,18 @@ fn fallback_warning(column: &str, reason: impl Into<String>) -> IngestWarning {
         reason: reason.into(),
         fallback: "0.0".to_string(),
     }
+}
+
+fn unobserved_event_warnings(source: &str) -> [IngestWarning; 4] {
+    [
+        ("timeout_events", "request timeouts"),
+        ("retry_events", "request retries"),
+        ("dns_failure_events", "DNS failure outcomes"),
+        ("tls_failure_events", "TLS failure outcomes"),
+    ]
+    .map(|(column, measurement)| {
+        fallback_warning(column, format!("{source} do not observe {measurement}"))
+    })
 }
 
 fn fallback_warnings_for_missing_events(
@@ -886,23 +885,10 @@ fn packet_stats_to_result(
             "quic_blocked_ratio",
             "pcap capture can observe UDP/443 but cannot prove QUIC policy blocking",
         ),
-        fallback_warning(
-            "timeout_events",
-            "packet counters do not correlate request timeouts",
-        ),
-        fallback_warning(
-            "retry_events",
-            "packet counters do not correlate request retries",
-        ),
-        fallback_warning(
-            "dns_failure_events",
-            "DNS packet hints do not classify DNS failure outcomes",
-        ),
-        fallback_warning(
-            "tls_failure_events",
-            "TLS packet hints do not classify TLS failure outcomes",
-        ),
     ]);
+    ingest
+        .warnings
+        .extend(unobserved_event_warnings("native pcap counters"));
     replace_metric_provenance(&mut ingest, "native_pcap");
     set_metric_provenance(
         &mut ingest,

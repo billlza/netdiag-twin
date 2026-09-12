@@ -223,6 +223,11 @@ jobs:
           set -euo pipefail
           actual_sha="$(git rev-parse HEAD)"
           [[ "$actual_sha" == "$RELEASE_SHA" ]] || (echo "compile checkout mismatch: expected=$RELEASE_SHA actual=$actual_sha" >&2 && exit 2)
+      - name: Isolate Rustup installation
+        run: |
+          set -euo pipefail
+          netdiag_rustup_root="$(mktemp -d "$RUNNER_TEMP/netdiag-rustup.XXXXXX")"
+          printf 'RUSTUP_HOME=%s\n' "$netdiag_rustup_root" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1

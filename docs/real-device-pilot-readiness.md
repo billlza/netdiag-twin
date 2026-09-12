@@ -2,7 +2,7 @@
 
 Real-device pilot proof: `pending_lab_access`.
 
-The v0.5.3 quality gates prove the software path with CI-safe adapters, local
+The v0.5.4 quality gates prove the software path with CI-safe adapters, local
 trace samples, benchmark artifacts, calibration artifacts, and model promotion
 gates. They do not prove that NetDiag Twin has connected to a physical lab
 device in this environment.

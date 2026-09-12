@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="netdiag_patch_contract">
+  <copyright>NetDiag parser contract &amp; security regression fixture.</copyright>
+  <interface name="netdiag_patch_contract" version="1">
+    <description summary="Patched XML parser contract">
+      Exercises escaped XML 1.0 content through the vendored scanner.
+    </description>
+    <request name="ping">
+      <description summary="No-op request">Carries no arguments.</description>
+    </request>
+  </interface>
+</protocol>

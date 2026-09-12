@@ -29,7 +29,7 @@ jobs:
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -213,7 +213,7 @@ jobs:
     steps:
       - name: Silence Git default branch hint
         run: git config --global init.defaultBranch main
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -223,9 +223,9 @@ jobs:
           set -euo pipefail
           actual_sha="$(git rev-parse HEAD)"
           [[ "$actual_sha" == "$RELEASE_SHA" ]] || (echo "compile checkout mismatch: expected=$RELEASE_SHA actual=$actual_sha" >&2 && exit 2)
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable action, 2026-06-30
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: 1.95.0
+          toolchain: 1.98.1
       - name: Build and seal unsigned release binary
         run: |
           set -euo pipefail
@@ -277,7 +277,7 @@ jobs:
     steps:
       - name: Silence Git default branch hint
         run: git config --global init.defaultBranch main
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -500,7 +500,7 @@ jobs:
             echo "missing required release-signing secret: SPARKLE_PRIVATE_KEY" >&2
             exit 2
           fi
-          appcast_tool="target/sparkle-2.7.1/bin/generate_appcast"
+          appcast_tool="target/sparkle-2.9.6/bin/generate_appcast"
           test -x "$appcast_tool" || (echo "missing Sparkle generate_appcast tool at $appcast_tool" >&2 && exit 2)
 
           rm -f target/release/appcast.xml
@@ -627,7 +627,7 @@ jobs:
       RELEASE_DMG_FILENAME: ${{ needs.macos_build.outputs.release_dmg_filename }}
       RELEASE_ARTIFACT_NAME: ${{ needs.macos_build.outputs.release_artifact_name }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -736,7 +736,7 @@ jobs:
       SOURCE_DIR: target/release-source
     steps:
       - name: Checkout immutable release source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           path: ${{ env.SOURCE_DIR }}
@@ -848,7 +848,7 @@ jobs:
           path: target/pages
       - name: Deploy appcast to Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
       - name: Validate published appcast
         run: |
           set -euo pipefail
@@ -897,7 +897,7 @@ jobs:
       TAP_DIR: target/homebrew-tap
     steps:
       - name: Checkout immutable release source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           path: ${{ env.SOURCE_DIR }}
@@ -911,7 +911,7 @@ jobs:
       - name: Verify release artifact
         run: (cd target/release && shasum -a 256 -c SHA256SUMS)
       - name: Checkout Homebrew tap without credentials
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: billlza/homebrew-netdiag-twin
           ref: main
@@ -966,7 +966,7 @@ jobs:
       TAP_DIR: target/homebrew-tap
     steps:
       - name: Checkout immutable release source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           path: ${{ env.SOURCE_DIR }}

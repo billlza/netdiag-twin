@@ -31,12 +31,13 @@ impl FileRecord {
     pub(super) fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             byte_len: bytes.len() as u64,
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: crate::digest_encoding::hex_digest(Sha256::digest(bytes)),
         }
     }
 
     pub(super) fn matches(&self, bytes: &[u8]) -> bool {
-        self.byte_len == bytes.len() as u64 && self.sha256 == format!("{:x}", Sha256::digest(bytes))
+        self.byte_len == bytes.len() as u64
+            && self.sha256 == crate::digest_encoding::hex_digest(Sha256::digest(bytes))
     }
 }
 

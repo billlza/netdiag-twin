@@ -18,7 +18,7 @@ impl<W: Write> DigestWriter<W> {
 
     pub(super) fn finish(mut self, path: &Path) -> Result<String> {
         self.inner.flush().with_path(path)?;
-        Ok(format!("{:x}", self.digest.finalize()))
+        Ok(crate::digest_encoding::hex_digest(self.digest.finalize()))
     }
 }
 

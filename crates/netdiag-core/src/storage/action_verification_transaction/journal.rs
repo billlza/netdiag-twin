@@ -375,7 +375,7 @@ fn validate_hash(description: &str, hash: &str) -> Result<()> {
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::digest_encoding::hex_digest(Sha256::digest(bytes))
 }
 
 #[cfg(test)]

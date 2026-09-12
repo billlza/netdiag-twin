@@ -28,10 +28,22 @@ verifies the pinned 15.2.0 release.
 
 The strict gate additionally requires:
 
-- `cargo-nextest` 0.9.136
-- `cargo-llvm-cov` 0.8.7
-- `cargo-deny` 0.19.6
+- `cargo-nextest` 0.9.144
+- `cargo-llvm-cov` 0.9.1
+- `cargo-deny` 0.20.2
 - `cargo-machete` 0.9.2
+
+On macOS, nextest runs one test process at a time. Rust's Darwin pipe creation
+sets close-on-exec in a separate operation, so concurrent runner starts can
+inherit another test's output pipe. Tests with no child processes reproduced
+`LEAK-FAIL` under parallel starts; the same 46-test group passed five serial
+stress iterations. In-test concurrency, locks, cancellation, and subprocess
+cleanup are still exercised. The 200 ms leak timeout still fails the run, with
+no retries or leak overrides; Linux and Windows retain their existing scheduling.
+See [Rust's pipe implementation](https://github.com/rust-lang/rust/blob/1.98.1/library/std/src/sys/pipe/unix.rs)
+and [nextest's capture implementation](https://github.com/nextest-rs/nextest/blob/cargo-nextest-0.9.144/nextest-runner/src/test_command/imp.rs),
+which uses those pipes. [Nextest's leak semantics](https://nexte.st/docs/features/leaky-tests/)
+explain why an inherited output writer keeps an exited test open.
 
 ## Fast Gate
 
@@ -83,7 +95,8 @@ The strict gate adds:
   per-file floor for the credential lifecycle, secret storage, API-test status,
   and destructive-action confirmation modules, cross-checked against both the
   library and binary dep-info
-- `cargo deny fetch db`, then `cargo deny --locked check --hide-inclusion-graph --disable-fetch`
+- `cargo fetch --locked`, `cargo deny fetch db`, then
+  `cargo deny --locked --offline check --hide-inclusion-graph`
 - `cargo machete`
 - Generic Lab Kit adapter contract validation
 - Lab calibration, followed by release benchmark generation with the calibrated
@@ -115,8 +128,10 @@ files, missing files, symlinks, content drift, duplicate manifest keys, and any
 change under a published `tests/` directory. When original `.crate` files are
 available, `python3 scripts/check_patch_contract_hygiene.py --archive-dir DIR`
 also verifies their raw SHA-256 and archive inventory without network access.
-The restored Wayland scanner test assets execute directly, and both their test
-run and warning-denied Clippy are required by the strict gate.
+The upstream Wayland scanner 0.31.11 now uses quick-xml 0.41, so its local
+patch has been removed. The retained workspace dependency contract verifies
+XML 1.0 escaped content and the generated interface API against the upstream
+crate in both tests and warning-denied Clippy.
 
 The strict release gate enforces at least 90% line coverage for every
 llvm-cov-reportable production file in the Pilot, CLI, and executable-code or

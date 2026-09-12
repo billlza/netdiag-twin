@@ -35,7 +35,7 @@ impl RunPublicationJournal {
             run_id: manifest.run_id.clone(),
             staging_name,
             directory_identity,
-            manifest_sha256: format!("{:x}", Sha256::digest(manifest_bytes)),
+            manifest_sha256: crate::digest_encoding::hex_digest(Sha256::digest(manifest_bytes)),
             index_entry: index_entry(manifest, status),
         }
     }
@@ -69,7 +69,7 @@ impl RunPublicationJournal {
     }
 
     pub(super) fn validate_manifest(&self, bytes: &[u8]) -> Result<RunManifest> {
-        if self.manifest_sha256 != format!("{:x}", Sha256::digest(bytes)) {
+        if self.manifest_sha256 != crate::digest_encoding::hex_digest(Sha256::digest(bytes)) {
             return Err(NetdiagError::InvalidTrace(
                 "journaled run manifest content changed".to_string(),
             ));

@@ -1,3 +1,4 @@
+use crate::digest_encoding::hex_digest;
 use crate::error::{IoContext, Result};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -15,12 +16,4 @@ pub(super) fn hash_reader(reader: &mut File, path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex_digest(hasher.finalize()))
-}
-
-pub(super) fn hex_digest(digest: impl AsRef<[u8]>) -> String {
-    digest
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

@@ -26,8 +26,10 @@ impl CliBearerBindings {
             anyhow::bail!("each --bearer-binding requires exactly four values");
         }
         self.values
-            .chunks_exact(BINDING_FIELDS)
-            .map(binding_from_values)
+            .as_chunks::<BINDING_FIELDS>()
+            .0
+            .iter()
+            .map(|values| binding_from_values(values.as_slice()))
             .collect::<anyhow::Result<Vec<_>>>()
             .and_then(|bindings| BearerEnvironmentBindings::new(bindings).map_err(Into::into))
     }

@@ -1,5 +1,6 @@
 use crate::dataset::rows::{DatasetSummary, read_dataset_summary_from_reader};
-use crate::dataset::split_publication::plan::{PartitionPlan, hex_digest};
+use crate::dataset::split_publication::plan::PartitionPlan;
+use crate::digest_encoding::hex_digest;
 use crate::error::{IoContext, NetdiagError, Result};
 use sha2::{Digest, Sha256};
 use std::fs::File;

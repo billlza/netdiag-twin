@@ -73,6 +73,64 @@ fn netstat_counter_delta_allows_quiet_interfaces() {
 }
 
 #[test]
+fn netstat_parser_uses_link_totals_instead_of_address_alias_rows() {
+    let counters = parse_netstat_counters(
+        "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+         en0 1500 <Link#4> aa:bb:cc:dd:ee:ff 10 1 1000 20 2 2000 0\n\
+         en0 1500 192.0.2 192.0.2.10 10 - 1000 20 - 2000 -\n\
+         en0 1500 fe80::%en0/64 fe80::1%en0 10 - 1000 20 - 2000 -\n",
+    )
+    .expect("address-family rows are not interface counter totals");
+
+    assert_eq!(counters.len(), 1);
+    assert_eq!(
+        counters["en0"],
+        InterfaceCounters {
+            bytes: 3000,
+            packets: 30,
+            errors: 3,
+        }
+    );
+}
+
+#[test]
+fn netstat_parser_preserves_columns_when_link_address_is_blank() {
+    let counters = parse_netstat_counters(
+        "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
+         lo0 16384 <Link#1>                  10 1 1000 20 2 2000 0\n",
+    )
+    .expect("loopback has no link-layer address");
+
+    assert_eq!(
+        counters["lo0"],
+        InterfaceCounters {
+            bytes: 3000,
+            packets: 30,
+            errors: 3,
+        }
+    );
+}
+
+#[test]
+fn netstat_parser_requires_link_totals_and_complete_unambiguous_counters() {
+    let header = "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n";
+    for row in [
+        "en0 1500 192.0.2 192.0.2.10 10 - 1000 20 - 2000 -\n",
+        "en0 1500 <Link#4> aa 10 0 1000 20\n",
+        "en0 1500 <Link#bad> aa 10 0 1000 20 0 2000 0\n",
+    ] {
+        assert!(parse_netstat_counters(&format!("{header}{row}")).is_err());
+    }
+    assert!(
+        parse_netstat_counters(
+            "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Ibytes\n\
+         en0 1500 <Link#4> aa 10 0 1000 20 0 2000 1000\n"
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn netstat_counter_delta_reports_unknown_interface() {
     let before = parse_netstat_counters(
         "Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll\n\
@@ -270,8 +328,31 @@ fn system_counter_delta_to_result_marks_quality_without_netstat() {
         MetricQuality::Measured
     );
     assert_eq!(
-        quality(&loaded.ingest, "retransmission_rate"),
-        MetricQuality::Fallback
+        quality(&loaded.ingest, "packet_loss_rate"),
+        MetricQuality::Estimated
+    );
+    for metric in [
+        "latency_ms",
+        "jitter_ms",
+        "retransmission_rate",
+        "quic_blocked_ratio",
+        "timeout_events",
+        "retry_events",
+        "dns_failure_events",
+        "tls_failure_events",
+    ] {
+        assert_eq!(
+            quality(&loaded.ingest, metric),
+            MetricQuality::Fallback,
+            "{metric}"
+        );
+    }
+    assert!(
+        loaded
+            .ingest
+            .warnings
+            .iter()
+            .any(|warning| { warning.column == "latency_ms" && warning.fallback == "0.1" })
     );
     assert_eq!(loaded.provenance["interface"], "en0");
 }

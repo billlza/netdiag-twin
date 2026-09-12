@@ -68,5 +68,5 @@ pub(super) fn read_required_file(path: &Path, max_bytes: u64, kind: &str) -> Res
 pub(super) fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    crate::digest_encoding::hex_digest(hasher.finalize())
 }

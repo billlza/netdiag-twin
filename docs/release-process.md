@@ -11,6 +11,10 @@
 
 不要手动改 DMG、appcast 或 Homebrew cask。它们必须由 release workflow 生成。
 
+下一版定为 **0.5.4**，要求解决所有现有已知 bug。准备该版本候选前，必须核对
+[0.5.4 版本计划与缺陷台账](v0.5.4-plan.md)：所有历史事项完成复核、所有已确认
+缺陷修复并验证后才能发布；下面的 CI、打包和签名门禁不能替代逐项缺陷关闭证据。
+
 ## 0. 发布前条件
 
 确认本机和 GitHub 仓库满足这些条件：
@@ -23,7 +27,7 @@
 - 版本号遵循 SemVer，例如 `0.3.2`，tag 使用 `v0.3.2`。
 - 真实实验室设备证明当前为 `pending_lab_access` /
   `not_validated`。在拿到设备并生成 reviewed evidence manifest 前，不得把
-  v0.5.3 描述为已通过 physical lab-device validation。
+  v0.5.4 描述为已通过 physical lab-device validation。
 
 Release workflow 只接受 `v*` annotated tag 的 push，不提供手工触发入口。发布凭据必须按
 用途存放在受保护的 GitHub Environments 中，不能保留仓库级副本：
@@ -268,7 +272,7 @@ git push origin "v<semver>"
 独立要求 `isImmutable=true`，并验证 Release 与每项资产的 attestation。若设置检查失败，
 不得创建或推送 tag。
 
-示例 tag：`v0.5.3`。
+示例 tag：`v0.5.4`。
 
 推送前再次确认 tag commit 仍是远端 main tip：
 

@@ -1,6 +1,7 @@
 use crate::dataset::DatasetPartition;
 use crate::dataset::rows::{DatasetRow, label_distribution};
 use crate::dataset::trusted_root::TrustedDatasetRoot;
+use crate::digest_encoding::hex_digest;
 use crate::error::{NetdiagError, Result};
 use crate::storage::BoundAtomicFileTarget;
 use serde::{Deserialize, Serialize};
@@ -129,12 +130,4 @@ fn partition_identity(rows: &[DatasetRow]) -> Result<(u64, String)> {
         hasher.update(b"\n");
     }
     Ok((byte_len, hex_digest(hasher.finalize())))
-}
-
-pub(super) fn hex_digest(digest: impl AsRef<[u8]>) -> String {
-    digest
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

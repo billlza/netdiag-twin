@@ -43,7 +43,7 @@ fn concurrent_no_clobber_publish_has_one_creator_and_one_existing_result() {
     let root = tempfile::tempdir().expect("tempdir");
     let target = bound_target(root.path(), "state.json");
     let barrier = Arc::new(Barrier::new(2));
-    let handles = [b'a', b'b'].map(|byte| {
+    let handles = (*b"ab").map(|byte| {
         let target = target.clone();
         let barrier = Arc::clone(&barrier);
         std::thread::spawn(move || {

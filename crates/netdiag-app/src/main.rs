@@ -12,8 +12,8 @@ use netdiag_app::credential_lifecycle::{
 };
 use netdiag_app::data_source::{SimScenario, SourceMode, SourceSnapshot, native_pcap_source};
 use netdiag_app::layout::{
-    HEADER_ACTION_HEIGHT, HEADER_ACTION_WIDTH, OVERVIEW_MIN_CONTENT_HEIGHT, SUMMARY_CARD_HEIGHT,
-    overview_content_height, summary_card_rects,
+    HEADER_ACTION_HEIGHT, HEADER_ACTION_WIDTH, SUMMARY_CARD_HEIGHT, show_overview,
+    summary_card_rects,
 };
 #[cfg(target_os = "macos")]
 use netdiag_app::secrets::KeychainSecretStore;
@@ -1569,25 +1569,7 @@ impl NetDiagApp {
     }
 
     fn render_overview(&mut self, ui: &mut egui::Ui) {
-        let bounds = ui.max_rect();
-        if bounds.height() < OVERVIEW_MIN_CONTENT_HEIGHT {
-            egui::ScrollArea::vertical()
-                .id_salt("overview_scroll")
-                .auto_shrink([false, false])
-                .show_viewport(ui, |ui, _| {
-                    ui.set_min_size(Vec2::new(
-                        bounds.width(),
-                        overview_content_height(bounds.height()),
-                    ));
-                    let content = Rect::from_min_size(
-                        bounds.min,
-                        Vec2::new(bounds.width(), overview_content_height(bounds.height())),
-                    );
-                    self.render_overview_layout(ui, content);
-                });
-            return;
-        }
-        self.render_overview_layout(ui, bounds);
+        show_overview(ui, |ui, bounds| self.render_overview_layout(ui, bounds));
     }
 
     fn render_overview_layout(&mut self, ui: &mut egui::Ui, bounds: Rect) {

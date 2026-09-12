@@ -1,4 +1,4 @@
-use super::digest::hex_digest;
+use crate::digest_encoding::hex_digest;
 use crate::error::{IoContext, NetdiagError, Result};
 use sha2::{Digest, Sha256};
 use std::fs::File;

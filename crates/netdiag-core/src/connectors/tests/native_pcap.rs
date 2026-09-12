@@ -30,6 +30,37 @@ fn native_pcap_stats_keep_observed_values_and_warn_on_missing_fields() {
 
     assert_eq!(loaded.ingest.records[0].throughput_mbps, 0.032);
     assert_eq!(loaded.ingest.records[0].retransmission_rate, 25.0);
+    assert_eq!(
+        quality(&loaded.ingest, "throughput_mbps"),
+        MetricQuality::Measured
+    );
+    assert_eq!(
+        quality(&loaded.ingest, "retransmission_rate"),
+        MetricQuality::Estimated
+    );
+    for metric in [
+        "latency_ms",
+        "jitter_ms",
+        "packet_loss_rate",
+        "quic_blocked_ratio",
+        "timeout_events",
+        "retry_events",
+        "dns_failure_events",
+        "tls_failure_events",
+    ] {
+        assert_eq!(
+            quality(&loaded.ingest, metric),
+            MetricQuality::Fallback,
+            "{metric}"
+        );
+    }
+    assert!(
+        loaded
+            .ingest
+            .warnings
+            .iter()
+            .any(|warning| { warning.column == "latency_ms" && warning.fallback == "0.1" })
+    );
     assert!(
         loaded
             .ingest

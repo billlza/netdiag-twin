@@ -5,6 +5,7 @@ mod bounded_process;
 pub mod connectors;
 pub use connectors::authentication;
 pub mod dataset;
+mod digest_encoding;
 pub mod error;
 pub mod evidence_bundle;
 mod feature_schema;

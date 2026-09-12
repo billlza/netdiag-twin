@@ -764,8 +764,11 @@ fn write_default_lock_path_digest_if_requested(target: &Path) {
     for unit in lock_path.as_os_str().encode_wide() {
         hasher.update(unit.to_le_bytes());
     }
-    std::fs::write(marker, format!("{:x}", hasher.finalize()))
-        .expect("write default lock path digest");
+    std::fs::write(
+        marker,
+        crate::digest_encoding::hex_digest(hasher.finalize()),
+    )
+    .expect("write default lock path digest");
 }
 
 fn wait_for_path(path: &Path, timeout: Duration) {

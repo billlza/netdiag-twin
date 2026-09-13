@@ -216,6 +216,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
+          components: rustfmt, clippy, llvm-tools-preview
       - name: Build and seal unsigned release binary
         run: |
           set -euo pipefail
@@ -923,11 +924,20 @@ jobs:
           bash "$SOURCE_DIR/scripts/render_homebrew_cask.sh" \
             "$RELEASE_VERSION" "$dmg_sha256" "$cask_file"
           ruby -c "$cask_file"
+          git -C "$TAP_DIR" add -- Casks/netdiag-twin.rb
+          if ! git -C "$TAP_DIR" diff --cached --quiet; then
+            git -C "$TAP_DIR" -c user.name="NetDiag Twin Release" \
+              -c user.email="release@netdiag-twin.invalid" \
+              commit -m "Prepare NetDiag Twin $RELEASE_VERSION cask audit"
+          fi
           if brew tap | grep -Fqx billlza/netdiag-twin; then
             brew untap billlza/netdiag-twin
           fi
           brew tap --custom-remote billlza/netdiag-twin "$(cd "$TAP_DIR" && pwd)"
+          audited_cask="$(brew --repository billlza/netdiag-twin)/Casks/netdiag-twin.rb"
+          cmp -- "$cask_file" "$audited_cask"
           brew audit --cask --strict --tap billlza/netdiag-twin netdiag-twin
+          cmp -- "$cask_file" "$audited_cask"
           {
             printf 'tap_parent_sha=%s\n' "$tap_parent_sha"
             printf 'cask_sha256=%s\n' "$(shasum -a 256 "$cask_file" | awk '{print $1}')"

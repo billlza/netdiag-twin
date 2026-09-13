@@ -45,7 +45,8 @@ reqwest = { version = "0.13.5", default-features = false, features = ["blocking"
 rfd = "0.17.2"
 rustix = { version = "1.1.4", features = ["event", "fs", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# Preserve persisted model parameters and thresholds across JSON reads and writes.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
 skrifa = "0.47.0"

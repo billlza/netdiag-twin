@@ -81,8 +81,20 @@ not change existing permissions automatically.
 
 Artifact-root migration deliberately does not make a flat v0.5.2
 `netdiag-model-manifest/v1` model readable. Runtime readers continue to reject
-v1. After claiming the root, replace that model through an explicit serialized
-writer, for example with a reviewed training dataset:
+v1. After backing up and claiming the root, adopt the existing model without
+retraining it:
+
+```bash
+cargo run -p netdiag-cli -- model migrate \
+  --model-dir /path/to/artifacts/model
+```
+
+This command preserves the exact model bytes and training metadata, publishes a
+hash-bound v2 generation, and invalidates promotion evidence bound to the old
+manifest. Running it again validates and returns the current generation without
+republishing. It does not claim new training or device-validation evidence.
+JSON floating-point values retain their exact `f64` values across reads and
+writes. To deliberately replace the model with a reviewed training dataset, use:
 
 ```bash
 cargo run -p netdiag-cli -- train \

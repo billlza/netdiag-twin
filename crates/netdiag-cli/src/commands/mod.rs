@@ -4,6 +4,7 @@ mod bearer_source_kind;
 pub mod benchmark;
 pub(crate) mod collect;
 pub(crate) mod collect_auth;
+pub(crate) mod model;
 pub mod pilot;
 pub mod reliability;
 pub(crate) mod twin;

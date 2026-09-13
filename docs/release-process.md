@@ -61,8 +61,12 @@ HOMEBREW_TAP_TOKEN
 
 - `github-pages`：允许 `v*` tag 的部署，并由 Pages job 记录 deployment URL。
 
-迁移时必须由凭据持有人把敏感值重新录入环境 Secrets，并把公开标识重新录入环境
-Variables；GitHub API 只能列出 Secret 元数据，不能读取现有值。环境级设置验证无误后，
+迁移已有仓库 Secret 时，可以由凭据持有人重新录入，也可以在经过核对的一次性 GitHub
+Actions 任务内，把现有值用目标环境的 GitHub public key 重新加密。后一种方式只传递
+GitHub 能解密的 sealed-box 密文，不把明文输出到日志、artifact 或本机，也不向 runner
+注入管理员 token。核对任务的精确提交、目标仓库/环境及 key ID 后，再通过本机管理身份
+写入对应环境；公开标识存入环境 Variables。GitHub API 本身仍不能读回现有 Secret。
+环境级设置验证无误后，
 删除所有同名仓库级 Secret，避免其他 workflow 绕过环境部署限制读取凭据。不要先删仓库级
 Secret：没有可恢复明文时会造成发布凭据永久丢失。
 

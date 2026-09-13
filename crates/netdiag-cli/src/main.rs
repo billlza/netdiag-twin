@@ -167,6 +167,7 @@ enum Command {
         artifacts: PathBuf,
     },
     ArtifactRoot(commands::artifact_root::ArtifactRootArgs),
+    Model(commands::model::ModelArgs),
     Collect(commands::collect::CollectCommand),
     Reliability {
         #[command(subcommand)]
@@ -830,6 +831,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             );
         }
         Command::ArtifactRoot(command) => commands::artifact_root::run(command)?,
+        Command::Model(command) => commands::model::run(command)?,
         Command::Collect(command) => commands::collect::run(command)?,
         Command::Reliability { command } => commands::reliability::run(command)?,
         Command::Benchmark { command } => commands::benchmark::run(command)?,

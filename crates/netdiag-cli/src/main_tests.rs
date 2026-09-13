@@ -12,6 +12,8 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
+mod model_migration_tests;
+
 fn sample(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../data/samples")

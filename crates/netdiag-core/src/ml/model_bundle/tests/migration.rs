@@ -2,6 +2,8 @@ use super::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+mod adoption;
+
 fn write_legacy_v1_bundle(
     model_dir: &Path,
     model: &RustMlModel,

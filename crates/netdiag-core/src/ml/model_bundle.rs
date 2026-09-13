@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use migration::migrate_legacy_model_bundle;
 pub(super) use migration::validate_for_artifact_root_migration;
 
 const MAX_CURRENT_DESCRIPTOR_BYTES: u64 = 4 * 1024;

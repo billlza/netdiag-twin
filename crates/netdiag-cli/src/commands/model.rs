@@ -1,6 +1,10 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
-use std::path::PathBuf;
+use netdiag_core::ml::{
+    MODEL_CURRENT_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model_bundle_identity,
+};
+use netdiag_core::models::ModelManifest;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Args)]
 pub(crate) struct ModelArgs {
@@ -36,4 +40,31 @@ pub(crate) fn run(args: ModelArgs) -> anyhow::Result<()> {
         }))?
     );
     Ok(())
+}
+
+pub(crate) fn training_output(
+    dataset: &Path,
+    model_dir: &Path,
+    manifest: ModelManifest,
+) -> anyhow::Result<serde_json::Value> {
+    let identity = load_existing_model_bundle_identity(model_dir)
+        .context("trained model generation could not be revalidated")?;
+    Ok(serde_json::json!({
+        "status": "trained",
+        "dataset": dataset,
+        "model_dir": model_dir,
+        "model_file": manifest.model_file,
+        "manifest_file": MODEL_MANIFEST_FILE_NAME,
+        "current_descriptor": MODEL_CURRENT_FILE_NAME,
+        "generation": identity.generation,
+        "model_file_hash_sha256": identity.model_file_hash_sha256,
+        "model_manifest_hash_sha256": identity.model_manifest_hash_sha256,
+        "labels": manifest.labels,
+        "training_examples": manifest.training_examples,
+        "dataset_hash_sha256": manifest.dataset_hash_sha256,
+        "training_config": manifest.training_config,
+        "training_gate": manifest.training_gate,
+        "evaluation": manifest.evaluation,
+        "uncertainty_thresholds": manifest.uncertainty_thresholds,
+    }))
 }

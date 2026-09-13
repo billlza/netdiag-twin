@@ -16,13 +16,9 @@ use netdiag_core::lab::{
     validate_lab_run, verify_action_with_options,
 };
 use netdiag_core::ml::{
-    MODEL_CURRENT_FILE_NAME, MODEL_MANIFEST_FILE_NAME, TrainingOptions,
-    export_feedback_training_dataset, load_existing_model_bundle_identity,
-    train_model_from_jsonl_with_options,
+    TrainingOptions, export_feedback_training_dataset, train_model_from_jsonl_with_options,
 };
-use netdiag_core::models::{
-    ConnectorHealthStatus, FaultLabel, HilState, ModelManifest, RunHistoryFilter,
-};
+use netdiag_core::models::{ConnectorHealthStatus, FaultLabel, HilState, RunHistoryFilter};
 use netdiag_core::perf_budget::{
     build_perf_budget, compare_perf_budget, ensure_budget_has_measurements, load_perf_budget,
     run_perf_measurements_sampled, save_perf_budget,
@@ -36,11 +32,12 @@ use netdiag_core::twin::{
     calibrate_topology_from_runs, export_topology, validate_policy_action_for_topology,
     validate_policy_action_shape, validate_topology_model,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 mod commands;
 use commands::bearer_bindings::CliBearerBindings;
+use commands::model::training_output;
 use commands::twin::{format_for_path, read_policy, read_topology, run_whatif, run_whatif_policy};
 
 #[derive(Debug, Parser)]
@@ -885,33 +882,6 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn training_output(
-    dataset: &Path,
-    model_dir: &Path,
-    manifest: ModelManifest,
-) -> anyhow::Result<serde_json::Value> {
-    let identity = load_existing_model_bundle_identity(model_dir)
-        .context("trained model generation could not be revalidated")?;
-    Ok(serde_json::json!({
-        "status": "trained",
-        "dataset": dataset,
-        "model_dir": model_dir,
-        "model_file": manifest.model_file,
-        "manifest_file": MODEL_MANIFEST_FILE_NAME,
-        "current_descriptor": MODEL_CURRENT_FILE_NAME,
-        "generation": identity.generation,
-        "model_file_hash_sha256": identity.model_file_hash_sha256,
-        "model_manifest_hash_sha256": identity.model_manifest_hash_sha256,
-        "labels": manifest.labels,
-        "training_examples": manifest.training_examples,
-        "dataset_hash_sha256": manifest.dataset_hash_sha256,
-        "training_config": manifest.training_config,
-        "training_gate": manifest.training_gate,
-        "evaluation": manifest.evaluation,
-        "uncertainty_thresholds": manifest.uncertainty_thresholds,
-    }))
 }
 
 fn parse_quality_filter(value: Option<&str>) -> anyhow::Result<Option<ConnectorHealthStatus>> {

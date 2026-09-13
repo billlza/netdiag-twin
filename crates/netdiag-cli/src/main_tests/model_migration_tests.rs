@@ -1,6 +1,9 @@
 #![cfg(test)]
 
 use super::*;
+use netdiag_core::ml::{
+    MODEL_CURRENT_FILE_NAME, MODEL_MANIFEST_FILE_NAME, load_existing_model_bundle_identity,
+};
 
 #[test]
 fn model_migrate_preserves_a_legacy_bundle_and_supports_normal_diagnosis() {

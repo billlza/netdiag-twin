@@ -334,7 +334,8 @@ Release workflow 会依次执行：
     响应丢失显示失败，只要 macOS 构建成功，verifier 仍会运行。
 13. verifier 成功后发布 GitHub Pages appcast，并用 cache-busting 有界轮询，直到公开文件与
     已验证 artifact 逐字节一致。
-14. verifier 成功后，通过 `release-homebrew` 环境部署规则并校验、更新 Homebrew cask；公开
+14. verifier 成功后，在无发布凭据的审核任务中提交临时 cask 候选，确保 Homebrew 克隆
+    取得新版本，并在严格审核前后逐字节核对实际 cask；通过 `release-homebrew` 环境部署规则后更新 cask。公开
     tap checkout 使用只读 job token，Homebrew PAT 只在最终 push 步骤暴露。push 后重新读取
     远端 branch SHA，浅克隆该精确提交，并逐字节复验 cask。
 

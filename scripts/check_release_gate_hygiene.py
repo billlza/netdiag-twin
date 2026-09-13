@@ -979,6 +979,23 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
             failures.append(
                 "macos_build signing job must not mutate its immutable checkout"
             )
+    audit_body = uncommented_body(yaml_job_body(release_body, "homebrew_audit") or "")
+    audit_contract = (
+        'git -C "$TAP_DIR" add -- Casks/netdiag-twin.rb',
+        'commit -m "Prepare NetDiag Twin $RELEASE_VERSION cask audit"',
+        'brew tap --custom-remote billlza/netdiag-twin "$(cd "$TAP_DIR" && pwd)"',
+        'audited_cask="$(brew --repository billlza/netdiag-twin)/Casks/netdiag-twin.rb"',
+        'cmp -- "$cask_file" "$audited_cask"',
+        'brew audit --cask --strict --tap billlza/netdiag-twin netdiag-twin',
+        'cmp -- "$cask_file" "$audited_cask"',
+    )
+    position = 0
+    for fragment in audit_contract:
+        found = audit_body.find(fragment, position)
+        if found < 0:
+            failures.append("homebrew_audit must audit the committed candidate and verify its bytes")
+            break
+        position = found + len(fragment)
     publish_homebrew_body = yaml_job_body(release_body, "publish_homebrew")
     if publish_homebrew_body is None:
         failures.append("release workflow must define a publish_homebrew job")

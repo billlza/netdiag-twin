@@ -1669,6 +1669,64 @@ rm -rf "$ARTIFACTS"
                 self.assertNotEqual(code, 0)
                 self.assertIn("exactly verify the remote tap", output)
 
+    def test_homebrew_audit_requires_candidate_binding(self) -> None:
+        for fragment in (
+            'git -C "$TAP_DIR" add -- Casks/netdiag-twin.rb',
+            'commit -m "Prepare NetDiag Twin $RELEASE_VERSION cask audit"',
+            'audited_cask="$(brew --repository billlza/netdiag-twin)/Casks/netdiag-twin.rb"',
+            'cmp -- "$cask_file" "$audited_cask"',
+        ):
+            with self.subTest(fragment=fragment):
+                code, output = self.run_workflow_guard(
+                    lambda body, fragment=fragment: body.replace(fragment, "", 1)
+                )
+                self.assertNotEqual(code, 0)
+                self.assertIn("must audit the committed candidate", output)
+
+    def test_homebrew_audit_clone_contains_the_rendered_candidate(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text()
+        job = module.yaml_job_body(workflow, "homebrew_audit")
+        audit = next(body for body in module.yaml_run_bodies(job) if "brew audit" in body)
+        prepare = audit.split('ruby -c "$cask_file"\n', 1)[1].split("if brew tap |", 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tap = root / "tap"
+            tap.mkdir()
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(tap), *arguments], check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "--initial-branch=main")
+            git("config", "user.name", "Release Test")
+            git("config", "user.email", "release-test@example.invalid")
+            cask = tap / "Casks/netdiag-twin.rb"
+            cask.parent.mkdir()
+            cask.write_text('cask "netdiag-twin" do\n  version "0.5.2"\nend\n')
+            git("add", "--", "Casks/netdiag-twin.rb")
+            git("commit", "-m", "Initial cask")
+            original_head = git("rev-parse", "HEAD")
+            subprocess.run(
+                ["bash", str(REPO_ROOT / "scripts/render_homebrew_cask.sh"),
+                 "0.5.4", "a" * 64, str(cask)],
+                check=True, capture_output=True, text=True,
+            )
+            expected = cask.read_bytes()
+            environment = {**os.environ, "TAP_DIR": str(tap), "RELEASE_VERSION": "0.5.4"}
+            for attempt in range(2):
+                subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", prepare], env=environment,
+                    check=True, capture_output=True, text=True,
+                )
+                clone = root / f"clone-{attempt}"
+                git("clone", "--quiet", str(tap), str(clone))
+                self.assertEqual((clone / "Casks/netdiag-twin.rb").read_bytes(), expected)
+                self.assertEqual(git("rev-parse", "HEAD^"), original_head)
+                self.assertEqual(git("status", "--porcelain"), "")
+
     def test_homebrew_renderer_is_deterministic_and_rejects_unsafe_inputs(self) -> None:
         renderer = REPO_ROOT / "scripts/render_homebrew_cask.sh"
         digest = "a" * 64

@@ -509,6 +509,31 @@ def yaml_step_bodies(job_body: str) -> list[str]:
     ]
 
 
+def validate_mac_compile_toolchain(
+    job_body: str, job_name: str, failures: list[str]
+) -> None:
+    steps = yaml_step_bodies(job_body)
+    installers = [
+        index for index, step in enumerate(steps)
+        if PINNED_RUST_TOOLCHAIN_ACTION in uncommented_body(step)
+    ]
+    required = "components: rustfmt, clippy, llvm-tools-preview"
+    if len(installers) != 1 or required not in active_lines(steps[installers[0]]):
+        failures.append(
+            f"{job_name} must explicitly install all workspace Rust components before Cargo"
+        )
+        return
+    cargo_steps = [
+        index for index, step in enumerate(steps)
+        if any(
+            logical_cargo_commands(body)
+            for body in yaml_run_bodies(step)
+        )
+    ]
+    if not cargo_steps or installers[0] >= min(cargo_steps):
+        failures.append(f"{job_name} must finish Rust component setup before Cargo")
+
+
 def validate_schema_requirements(failures: list[str]) -> None:
     expected_input = (
         "jsonschema[format-nongpl]==4.26.0\n"
@@ -914,6 +939,7 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         )
     macos_compile_body = yaml_job_body(release_body, "macos_compile")
     macos_build_body = yaml_job_body(release_body, "macos_build")
+    validate_mac_compile_toolchain(macos_compile_body or "", "macos_compile", failures)
     for job_name, job_body in (
         ("macos_compile", macos_compile_body),
         ("macos_build", macos_build_body),
@@ -1107,6 +1133,7 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
             "CI schema environments must install the reviewed binary-only hash lock exactly"
         )
     adapter_schema_body = yaml_job_body(ci_body, "adapter-schema") or ""
+    validate_mac_compile_toolchain(adapter_schema_body, "adapter-schema", failures)
     required_adapter_schema_fragments = (
         "CARGO_TARGET_DIR: ${{ github.workspace }}/target/adapter-validator",
         "cargo build --locked --quiet -p netdiag-cli --bin netdiag-cli",

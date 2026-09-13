@@ -69,6 +69,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.1
+          components: rustfmt, clippy, llvm-tools-preview
       - name: Install Python schema validator
         run: |
           python3 -m venv --clear --copies .venv-jsonschema

@@ -181,7 +181,7 @@ rm -rf "$ARTIFACTS"
                 encoding="utf-8"
             )
             (workflow_directory / "ci.yml").write_text(
-                ci_body.replace("components: rustfmt, clippy", "components: rustfmt", 1),
+                ci_body.replace("components: rustfmt, clippy\n", "components: rustfmt\n", 1),
                 encoding="utf-8",
             )
             module.WORKFLOW_DIRECTORY = workflow_directory
@@ -191,6 +191,33 @@ rm -rf "$ARTIFACTS"
 
         self.assertNotEqual(code, 0)
         self.assertIn("must install rustfmt and clippy", stdout + stderr)
+
+    def test_mac_compile_jobs_install_every_component_before_cargo(self) -> None:
+        module = load_script("check_release_gate_hygiene")
+        required = "components: rustfmt, clippy, llvm-tools-preview"
+        for filename, job in (("ci.yml", "adapter-schema"), ("release.yml", "macos_compile")):
+            workflow = (REPO_ROOT / ".github/workflows" / filename).read_text()
+            body = module.yaml_job_body(workflow, job)
+            self.assertIsNotNone(body)
+            failures: list[str] = []
+            module.validate_mac_compile_toolchain(body, job, failures)
+            self.assertEqual(failures, [])
+            for missing in ("rustfmt", "clippy", "llvm-tools-preview"):
+                remaining = [name for name in ("rustfmt", "clippy", "llvm-tools-preview") if name != missing]
+                with self.subTest(job=job, missing=missing):
+                    failures = []
+                    changed = body.replace(required, "components: " + ", ".join(remaining), 1)
+                    module.validate_mac_compile_toolchain(changed, job, failures)
+                    self.assertTrue(failures)
+            failures = []
+            module.validate_mac_compile_toolchain(body.replace(required, "# " + required, 1), job, failures)
+            self.assertTrue(failures)
+            steps = module.yaml_step_bodies(body)
+            installer = next(step for step in steps if module.PINNED_RUST_TOOLCHAIN_ACTION in step)
+            reordered = "".join(step for step in steps if step != installer) + installer
+            failures = []
+            module.validate_mac_compile_toolchain(reordered, job, failures)
+            self.assertTrue(failures)
 
     def test_ci_pinned_ripgrep_contract_mutations_fail_closed(self) -> None:
         ci_body = (REPO_ROOT / ".github/workflows/ci.yml").read_text(

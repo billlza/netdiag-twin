@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 const LEGACY_MODEL_MANIFEST_SCHEMA: &str = "netdiag-model-manifest/v1";
 
+mod adoption;
+pub use adoption::migrate_legacy_model_bundle;
+
 pub(super) struct PublicationSource {
     pub(super) model: RustMlModel,
     pub(super) manifest: ModelManifest,

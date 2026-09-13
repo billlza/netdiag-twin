@@ -583,9 +583,7 @@ fn resolve_artifact_path(location: &RunLocation, value: &str) -> Result<PathBuf>
     }
     let raw = PathBuf::from(value);
     if raw.is_absolute() {
-        return Err(NetdiagError::InvalidTrace(format!(
-            "manifest artifact path must be relative: {value}"
-        )));
+        return resolve_stored_path(&location.run_dir, value);
     }
     if raw
         .components()

@@ -1,5 +1,43 @@
 use super::*;
 
+#[test]
+fn historical_window_percentiles_remain_unrecorded() {
+    let stats: WindowLatencyStats = serde_json::from_str(r#"{"mean":20.0,"p95":35.0,"std":5.0}"#)
+        .expect("historical summary with unrecorded percentiles");
+    let serialized = serde_json::to_value(stats).expect("serialize historical summary");
+    assert!(serialized["p50"].is_null());
+    assert!(serialized["p99"].is_null());
+    assert_eq!(serialized["mean"], 20.0);
+    assert_eq!(serialized["p95"], 35.0);
+}
+
+#[test]
+fn historical_window_compatibility_rejects_corrupt_statistics() {
+    for invalid in [
+        r#"{"p95":35.0,"std":5.0}"#,
+        r#"{"mean":20.0,"std":5.0}"#,
+        r#"{"mean":20.0,"p95":35.0}"#,
+        r#"{"mean":20.0,"p95":35.0,"std":5.0,"p50":"20"}"#,
+        r#"{"mean":20.0,"p95":35.0,"std":5.0,"p99":{}}"#,
+    ] {
+        serde_json::from_str::<WindowLatencyStats>(invalid)
+            .expect_err("missing required or invalid present statistics must fail");
+    }
+}
+
+#[test]
+fn new_windows_record_exact_percentiles() {
+    let mut first = record(0);
+    let mut second = record(1);
+    first.latency_ms = 10.0;
+    second.latency_ms = 30.0;
+    let summary = summarize_telemetry(&[first, second], 5).expect("new telemetry");
+    let stats = serde_json::to_value(&summary.windows[0].latency_ms).expect("new statistics");
+    assert_eq!(stats["p50"], 20.0);
+    assert_eq!(stats["p95"], 29.0);
+    assert_eq!(stats["p99"], 29.8);
+}
+
 fn record(timestamp_seconds: i64) -> TraceRecord {
     TraceRecord {
         timestamp: Utc

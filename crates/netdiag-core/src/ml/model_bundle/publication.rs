@@ -51,7 +51,7 @@ pub(super) fn publish_locked_with(
     publish_locked_with_bytes(model_dir, model, None, manifest, publish_current)
 }
 
-fn publish_locked_with_bytes(
+pub(super) fn publish_locked_with_bytes(
     model_dir: &Path,
     model: &RustMlModel,
     model_bytes: Option<&[u8]>,

@@ -61,23 +61,13 @@ run_python_quality_guards() {
 run_patch_contracts() {
   cargo metadata --locked --offline --no-deps --format-version 1 \
     --manifest-path third_party/argmin-0.11.0/Cargo.toml >/dev/null
-  cargo metadata --locked --offline --no-deps --format-version 1 \
-    --manifest-path third_party/wayland-scanner-0.31.10/Cargo.toml >/dev/null
-  cargo test --locked --offline \
-    --target-dir target/patch-contracts/wayland-scanner-upstream \
-    --manifest-path third_party/wayland-scanner-0.31.10/Cargo.toml \
-    --all-targets --all-features
-  cargo clippy --locked --offline \
-    --target-dir target/patch-contracts/wayland-scanner-upstream \
-    --manifest-path third_party/wayland-scanner-0.31.10/Cargo.toml \
-    --all-targets --all-features -- -D warnings
   cargo test --locked -p netdiag-argmin-patch-contract \
     --all-targets --all-features
   cargo clippy --locked -p netdiag-argmin-patch-contract \
     --all-targets --all-features -- -D warnings
-  cargo test --locked -p netdiag-wayland-scanner-patch-contract \
+  cargo test --locked -p netdiag-wayland-scanner-contract \
     --all-targets --all-features
-  cargo clippy --locked -p netdiag-wayland-scanner-patch-contract \
+  cargo clippy --locked -p netdiag-wayland-scanner-contract \
     --all-targets --all-features -- -D warnings
 }
 
@@ -85,6 +75,8 @@ run_cargo_deny_clean() {
   local fetch_output
   local output
 
+  # cargo-deny 0.20's offline mode covers crate sources as well as advisories.
+  cargo fetch --locked
   if ! fetch_output="$(cargo deny fetch db 2>&1)"; then
     printf '%s\n' "$fetch_output" >&2
     return 1
@@ -96,7 +88,7 @@ run_cargo_deny_clean() {
     return 1
   fi
 
-  if ! output="$(cargo deny --locked check --hide-inclusion-graph --disable-fetch 2>&1)"; then
+  if ! output="$(cargo deny --locked --offline check --hide-inclusion-graph 2>&1)"; then
     printf '%s\n' "$output" >&2
     return 1
   fi

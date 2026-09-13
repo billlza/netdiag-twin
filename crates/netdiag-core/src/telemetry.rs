@@ -119,10 +119,10 @@ pub fn aggregate_by_window(
                 end_ts,
                 count: chunk.len(),
                 latency_ms: WindowLatencyStats {
-                    p50: quantile(&latency, 0.50),
+                    p50: Some(quantile(&latency, 0.50)),
                     mean: mean(latency.iter().copied()),
                     p95: quantile(&latency, 0.95),
-                    p99: quantile(&latency, 0.99),
+                    p99: Some(quantile(&latency, 0.99)),
                     std: stddev(&latency),
                 },
                 jitter_ms: distribution(&jitter),

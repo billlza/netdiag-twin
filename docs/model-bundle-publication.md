@@ -106,6 +106,19 @@ model bytes into a retained v2 generation whose manifest binds their SHA-256,
 writes the requested replacement as another complete v2 generation, and
 atomically publishes `current.json` as the commit point.
 
+`netdiag model migrate --model-dir <directory>` explicitly adopts the existing
+model through that same writer. Both the retained and selected generations keep
+the exact source model bytes; training metadata is preserved and no training or
+synthetic replacement occurs. The manifest schema and model hash are updated;
+an omitted legacy label distribution remains unrecorded as an empty map.
+Promotion evidence for the former manifest is invalidated. An already valid
+current generation is returned without publication, making a completed migration
+idempotent. The command rejects invalid or incomplete sources and requires the
+existing private-directory permissions; it never changes permissions itself.
+It fails before model or lock-file I/O on platforms without durable publication.
+The JSON reader enables precise floating-point round trips so thresholds do not
+shift when a manifest is read and serialized into a generation.
+
 Until that pointer commit succeeds, the v1 model, manifest, and any recognized
 promotion-gate file remain unchanged. A pre-commit interruption can leave only
 bounded, unreferenced generation directories; the next locked writer validates

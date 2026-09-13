@@ -62,6 +62,8 @@ pub struct AppSettings {
     #[serde(default = "default_artifacts_root")]
     pub artifacts_root: PathBuf,
     #[serde(default)]
+    pub artifacts_root_user_selected: bool,
+    #[serde(default)]
     pub what_if: WhatIfSettings,
     #[serde(default)]
     pub startup: StartupSettings,
@@ -80,6 +82,7 @@ impl Default for AppSettings {
             bearer_credentials: Vec::new(),
             credential_cleanup: CredentialCleanupJournal::default(),
             artifacts_root: default_artifacts_root(),
+            artifacts_root_user_selected: false,
             what_if: WhatIfSettings::default(),
             startup: StartupSettings::default(),
         }
@@ -627,13 +630,16 @@ pub fn default_artifacts_root() -> PathBuf {
 }
 
 pub fn normalize_bundle_settings(settings: &mut AppSettings) -> bool {
-    if !is_running_from_app_bundle()
-        || !artifacts_root_points_to_workspace(&settings.artifacts_root)
-    {
+    if !is_running_from_app_bundle() || !bundle_artifacts_root_needs_migration(settings) {
         return false;
     }
     settings.artifacts_root = app_support_artifacts_root();
     true
+}
+
+fn bundle_artifacts_root_needs_migration(settings: &AppSettings) -> bool {
+    !settings.artifacts_root_user_selected
+        && artifacts_root_points_to_workspace(&settings.artifacts_root)
 }
 
 fn app_support_artifacts_root() -> PathBuf {
@@ -666,7 +672,9 @@ fn find_workspace_root(start: &Path) -> Option<PathBuf> {
 
 fn artifacts_root_points_to_workspace(path: &Path) -> bool {
     path.file_name().is_some_and(|name| name == "artifacts")
-        && path.parent().and_then(find_workspace_root).is_some()
+        && path.parent().is_some_and(|parent| {
+            parent.join("Cargo.toml").is_file() && parent.join("crates").is_dir()
+        })
 }
 
 fn is_running_from_app_bundle() -> bool {

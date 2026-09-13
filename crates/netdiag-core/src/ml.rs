@@ -547,6 +547,8 @@ pub(crate) fn validate_model_bundle_for_artifact_root_migration(model_dir: &Path
     model_bundle::validate_for_artifact_root_migration(model_dir)
 }
 
+pub use model_bundle::migrate_legacy_model_bundle;
+
 /// Publishes a manifest-only update as a new immutable generation if the
 /// caller's source manifest is still current.
 pub fn replace_model_manifest_if_current(
@@ -1407,7 +1409,7 @@ fn validate_model_manifest(
 fn validate_model_manifest_metadata(manifest: &ModelManifest, model: &RustMlModel) -> Result<()> {
     if manifest.schema_version != MODEL_MANIFEST_SCHEMA {
         return Err(NetdiagError::Ml(format!(
-            "unsupported model manifest schema {}; expected {MODEL_MANIFEST_SCHEMA}; retrain or explicitly rebuild the model bundle",
+            "unsupported model manifest schema {}; expected {MODEL_MANIFEST_SCHEMA}; use netdiag model migrate --model-dir <directory> for a complete legacy bundle, or retrain or explicitly rebuild the model bundle",
             manifest.schema_version
         )));
     }

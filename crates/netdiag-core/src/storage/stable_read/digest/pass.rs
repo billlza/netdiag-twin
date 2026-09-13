@@ -32,5 +32,5 @@ pub(super) fn hash_pass(
     if bytes != declared_bytes {
         return Err(changed(path));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::digest_encoding::hex_digest(hasher.finalize()))
 }

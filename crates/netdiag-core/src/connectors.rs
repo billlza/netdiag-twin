@@ -35,6 +35,8 @@ mod prometheus;
 mod prometheus_mapping;
 mod prometheus_matrix;
 mod resource_budget;
+#[cfg(any(target_os = "macos", test))]
+mod system_counters_parser;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod system_counters_process;
 mod validation;
@@ -64,6 +66,8 @@ pub use probe::{
 pub use prometheus::{load_prometheus_exposition, load_prometheus_query_range};
 pub use prometheus_mapping::load_prometheus_mapping_file;
 use resource_budget::NetworkSourceBudget;
+#[cfg(any(target_os = "macos", test))]
+use system_counters_parser::parse_netstat_counters;
 #[cfg(all(test, target_os = "macos"))]
 use system_counters_process::NETSTAT_PROGRAM;
 #[cfg(target_os = "macos")]
@@ -500,7 +504,10 @@ fn system_counter_delta_to_result(
         config.sample.clone(),
     )?;
     ingest.warnings.extend([
-        fallback_warning("latency_ms", "system counters do not expose RTT"),
+        IngestWarning {
+            fallback: "0.1".to_string(),
+            ..fallback_warning("latency_ms", "system counters do not expose RTT")
+        },
         fallback_warning("jitter_ms", "system counters do not expose jitter"),
         fallback_warning(
             "retransmission_rate",
@@ -511,13 +518,16 @@ fn system_counter_delta_to_result(
             "system counters do not expose QUIC policy state",
         ),
     ]);
+    ingest
+        .warnings
+        .extend(unobserved_event_warnings("system counters"));
     replace_metric_provenance(&mut ingest, "system_counters");
     set_metric_provenance(
         &mut ingest,
         "packet_loss_rate",
-        MetricQuality::Measured,
+        MetricQuality::Estimated,
         "system_counters",
-        "derived from interface error counters",
+        "interface error ratio is a proxy, not an end-to-end packet loss measurement",
     );
     set_metric_provenance(
         &mut ingest,
@@ -596,6 +606,18 @@ fn fallback_warning(column: &str, reason: impl Into<String>) -> IngestWarning {
         reason: reason.into(),
         fallback: "0.0".to_string(),
     }
+}
+
+fn unobserved_event_warnings(source: &str) -> [IngestWarning; 4] {
+    [
+        ("timeout_events", "request timeouts"),
+        ("retry_events", "request retries"),
+        ("dns_failure_events", "DNS failure outcomes"),
+        ("tls_failure_events", "TLS failure outcomes"),
+    ]
+    .map(|(column, measurement)| {
+        fallback_warning(column, format!("{source} do not observe {measurement}"))
+    })
 }
 
 fn fallback_warnings_for_missing_events(
@@ -844,10 +866,13 @@ fn packet_stats_to_result(
         sample.to_string(),
     )?;
     ingest.warnings.extend([
-        fallback_warning(
-            "latency_ms",
-            "pcap capture does not directly expose RTT without request/response correlation",
-        ),
+        IngestWarning {
+            fallback: "0.1".to_string(),
+            ..fallback_warning(
+                "latency_ms",
+                "pcap capture does not directly expose RTT without request/response correlation",
+            )
+        },
         fallback_warning(
             "jitter_ms",
             "pcap capture does not directly expose jitter without RTT correlation",
@@ -861,6 +886,9 @@ fn packet_stats_to_result(
             "pcap capture can observe UDP/443 but cannot prove QUIC policy blocking",
         ),
     ]);
+    ingest
+        .warnings
+        .extend(unobserved_event_warnings("native pcap counters"));
     replace_metric_provenance(&mut ingest, "native_pcap");
     set_metric_provenance(
         &mut ingest,
@@ -965,93 +993,6 @@ fn read_netstat_counters(_control: &CaptureControl) -> Result<BTreeMap<String, I
     Err(NetdiagError::Connector(
         "system counters are supported only on macOS".to_string(),
     ))
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_netstat_counters(text: &str) -> Result<BTreeMap<String, InterfaceCounters>> {
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let header = lines
-        .next()
-        .ok_or_else(|| NetdiagError::Connector("netstat output is empty".to_string()))?;
-    let columns = header.split_whitespace().collect::<Vec<_>>();
-    let index = |name: &str| {
-        columns
-            .iter()
-            .position(|column| *column == name)
-            .ok_or_else(|| NetdiagError::Connector(format!("netstat missing {name} column")))
-    };
-    let name_idx = index("Name")?;
-    let ipkts_idx = index("Ipkts")?;
-    let ierrs_idx = index("Ierrs")?;
-    let ibytes_idx = index("Ibytes")?;
-    let opkts_idx = index("Opkts")?;
-    let oerrs_idx = index("Oerrs")?;
-    let obytes_idx = index("Obytes")?;
-    let mut counters = BTreeMap::<String, InterfaceCounters>::new();
-    for (row_index, line) in lines.enumerate() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() <= obytes_idx {
-            return Err(NetdiagError::Connector(format!(
-                "netstat row {} is missing required counter columns",
-                row_index + 2
-            )));
-        }
-        let name = fields[name_idx].to_string();
-        let parsed = InterfaceCounters {
-            bytes: checked_counter_pair(
-                &name,
-                "bytes",
-                parse_u64_field(fields[ibytes_idx])?,
-                parse_u64_field(fields[obytes_idx])?,
-            )?,
-            packets: checked_counter_pair(
-                &name,
-                "packets",
-                parse_u64_field(fields[ipkts_idx])?,
-                parse_u64_field(fields[opkts_idx])?,
-            )?,
-            errors: checked_counter_pair(
-                &name,
-                "errors",
-                parse_u64_field(fields[ierrs_idx])?,
-                parse_u64_field(fields[oerrs_idx])?,
-            )?,
-        };
-        if let Some(current) = counters.insert(name.clone(), parsed)
-            && current != parsed
-        {
-            return Err(NetdiagError::Connector(format!(
-                "netstat emitted inconsistent duplicate counters for interface {name}"
-            )));
-        }
-    }
-    if counters.is_empty() {
-        return Err(NetdiagError::Connector(
-            "netstat output contained no interface counters".to_string(),
-        ));
-    }
-    Ok(counters)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_u64_field(value: &str) -> Result<u64> {
-    if value == "-" {
-        return Err(NetdiagError::Connector(
-            "netstat counter is unavailable (`-`)".to_string(),
-        ));
-    }
-    value
-        .parse::<u64>()
-        .map_err(|_| NetdiagError::Connector(format!("invalid netstat counter: {value}")))
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn checked_counter_pair(interface: &str, kind: &str, incoming: u64, outgoing: u64) -> Result<u64> {
-    incoming.checked_add(outgoing).ok_or_else(|| {
-        NetdiagError::Connector(format!(
-            "netstat {kind} counter overflowed for interface {interface}"
-        ))
-    })
 }
 
 fn diff_counters(

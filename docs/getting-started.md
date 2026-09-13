@@ -1,6 +1,6 @@
 # Getting Started
 
-This guide describes the stable v0.5.3 platform contract for SRE and platform
+This guide describes the v0.5.4 candidate platform contract for SRE and platform
 teams: how telemetry becomes canonical `TraceRecord` rows, how live adapters
 map into the same pipeline, how ML abstention is reported, and where diagnosis,
 what-if, post-action verification, recommendation, and human-review artifacts
@@ -8,7 +8,7 @@ are written.
 
 ### Platform mutation contract
 
-The v0.5.3 desktop release targets macOS, and crash-consistent artifact mutation
+The v0.5.4 desktop release targets macOS, and crash-consistent artifact mutation
 currently requires the audited Unix directory durability boundary. Windows can
 inspect and validate datasets and read a complete existing model bundle, but it
 does not publish dataset splits/registrations, train or rebuild model bundles,
@@ -40,7 +40,7 @@ cargo run -p netdiag-cli -- evidence <run_id> --artifacts /tmp/netdiag-artifacts
 cargo run -p netdiag-cli -- compare <run_id_a> <run_id_b> --artifacts /tmp/netdiag-artifacts
 ```
 
-Every v0.5.3 artifact root has a durable product-ownership marker. Commands that
+Every v0.5.4 artifact root has a durable product-ownership marker. Commands that
 operate on an artifact root claim a new empty root automatically. Before a
 standalone command such as `train` writes a model subdirectory into a new root,
 initialize that empty root explicitly. Existing non-empty roots are never
@@ -64,10 +64,37 @@ roots without a verifiable product artifact are rejected before the ownership
 marker is published. Migration does not move, rewrite, or delete existing
 artifacts.
 
+Historical reports may omit window P50/P99 while retaining mean, P95 and
+standard deviation. Missing percentiles remain unrecorded and leave chart gaps;
+new analyses still compute every percentile. Legacy absolute index and manifest
+paths are readable only within the exact current artifact root and run directory,
+respectively. Parent traversal, sibling roots and symlink escapes remain errors.
+Copying an old root to a different location does not authorize rebasing its paths.
+An artifact root chosen through **Choose Folder** remains selected after restart,
+including a root inside a development workspace. Only an unselected historical
+workspace-default root is automatically moved to the Application Support setting;
+this changes the setting, not the artifact files.
+An existing model directory must also meet the private-directory requirement
+(0700 on Unix). If migration reports a directory-mode error, verify ownership
+of that specific directory and correct its mode before retrying. Migration does
+not change existing permissions automatically.
+
 Artifact-root migration deliberately does not make a flat v0.5.2
 `netdiag-model-manifest/v1` model readable. Runtime readers continue to reject
-v1. After claiming the root, replace that model through an explicit serialized
-writer, for example with a reviewed training dataset:
+v1. After backing up and claiming the root, adopt the existing model without
+retraining it:
+
+```bash
+cargo run -p netdiag-cli -- model migrate \
+  --model-dir /path/to/artifacts/model
+```
+
+This command preserves the exact model bytes and training metadata, publishes a
+hash-bound v2 generation, and invalidates promotion evidence bound to the old
+manifest. Running it again validates and returns the current generation without
+republishing. It does not claim new training or device-validation evidence.
+JSON floating-point values retain their exact `f64` values across reads and
+writes. To deliberately replace the model with a reviewed training dataset, use:
 
 ```bash
 cargo run -p netdiag-cli -- train \
@@ -89,7 +116,7 @@ Run the core golden contract tests:
 cargo test -p netdiag-core --test golden
 ```
 
-Run the v0.5.3 reliability and benchmark gates:
+Run the v0.5.4 reliability and benchmark gates:
 
 ```bash
 python3 -m venv --clear --copies .venv-jsonschema
@@ -251,7 +278,7 @@ records a warning and uses `0.0`.
 
 ## OTLP gRPC
 
-NetDiag v0.5.3 can run a local OTLP Metrics gRPC receiver and wait for one
+NetDiag v0.5.4 can run a local OTLP Metrics gRPC receiver and wait for one
 metrics export. It is a receiver, not a Prometheus-style pull API: an
 OpenTelemetry Collector, lab gateway, or application must push metrics into the
 bind address.
@@ -282,7 +309,7 @@ resource-exhausted error without evicting earlier evidence.
 
 ## pcap And Native Capture
 
-NetDiag v0.5.3 includes Rust-native packet capture support through `pcap` and
+NetDiag v0.5.4 includes Rust-native packet capture support through `pcap` and
 `etherparse`. It can read a classic `.pcap` file or capture from a live
 interface. File imports reject pcapng, symbolic links/reparse points, unstable
 files, unsupported link types, malformed timestamps, truncated packet bodies,
@@ -311,6 +338,12 @@ packet capture alone, such as end-to-end packet loss or QUIC policy blocking,
 are recorded as warnings with fallback values rather than presented as measured
 facts.
 
+The current parser does not correlate request timeouts/retries or decode DNS/TLS
+failure outcomes; those four event metrics are explicit zero fallbacks. TCP
+retransmissions remain estimated from repeated sequence observations, while
+throughput is measured from captured bytes. RTT uses the disclosed 0.1 ms
+placeholder required by the trace schema, not a latency measurement.
+
 All native pcap entry points use the same packet bound: `packet_limit` must be
 between 1 and 10000. Values outside that range fail before source access.
 
@@ -331,6 +364,8 @@ On macOS, the system counters connector samples `netstat -ibn` before and after
 a short interval and converts interface byte/error deltas into throughput and
 drop evidence. `interval_secs` must be between 1 and 10; invalid values fail
 before platform access and are never clamped.
+The interface error ratio is an estimated loss proxy, not measured end-to-end
+packet loss. Only the throughput metric is marked measured.
 
 ```bash
 cargo run -p netdiag-cli -- collect \
@@ -340,8 +375,15 @@ cargo run -p netdiag-cli -- collect \
   --diagnose
 ```
 
-RTT, jitter, retransmission, and QUIC policy state are not exposed by interface
-counters, so NetDiag records explicit warnings for those fallback fields.
+RTT, jitter, retransmission, QUIC policy state, request timeouts/retries, and
+DNS/TLS outcomes are not exposed by interface counters. NetDiag marks all eight
+fields as explicit fallbacks; their placeholder values are not measured events.
+
+The collector reads each interface's `<Link#...>` total row once. IPv4/IPv6
+address rows are not additional interface totals; their unavailable error fields
+are not treated as zero. Blank link-layer addresses on loopback/tunnel rows do
+not shift numeric columns. Missing, malformed, overflowing, or inconsistent
+required counters in a link-total row still fail explicitly.
 
 ## Artifacts
 
@@ -660,7 +702,7 @@ split, or remove the entire incomplete directory when you
 deliberately abandon that transaction.
 
 `dataset split` and `dataset register` require Unix directory `fsync` semantics
-in v0.5.3. Windows supports the read-only `inspect`, `validate`, and `compare`
+in v0.5.4. Windows supports the read-only `inspect`, `validate`, and `compare`
 commands; mutation commands fail before creating the requested output path. The
 bundled benchmark's trusted Python schema-validation subprocess is Unix-only and
 fails explicitly on Windows before spawning a validator.

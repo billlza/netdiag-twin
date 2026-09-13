@@ -437,11 +437,11 @@ fn view_item(
 }
 
 fn cmd(key: Code) -> Accelerator {
-    Accelerator::new(Some(CMD_OR_CTRL), key)
+    Accelerator::new(CMD_OR_CTRL, key)
 }
 
 fn cmd_shift(key: Code) -> Accelerator {
-    Accelerator::new(Some(CMD_OR_CTRL | Modifiers::SHIFT), key)
+    Accelerator::new(CMD_OR_CTRL | Modifiers::SHIFT, key)
 }
 
 #[derive(Clone, Copy)]

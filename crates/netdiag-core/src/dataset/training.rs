@@ -83,7 +83,7 @@ mod tests {
         let path = root.path().join("training.jsonl");
         let original = row(10.0);
         fs::write(&path, &original).expect("original dataset");
-        let expected_hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+        let expected_hash = crate::digest_encoding::hex_digest(Sha256::digest(original.as_bytes()));
 
         let prepared = prepare_with_hook(&path, || {
             fs::write(&path, row(99.0)).expect("replacement dataset");

@@ -1,0 +1,13 @@
+[package]
+name = "netdiag-wayland-scanner-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+wayland-backend = "0.3.17"
+wayland-scanner = "=0.31.11"
+
+[lints]
+workspace = true

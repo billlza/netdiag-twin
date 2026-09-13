@@ -18,7 +18,12 @@ regression checks, platform incident evidence bundles, lab gates for adapter or
 telemetry-source changes, and calibrated unknown/OOD checks before a model is
 trusted in a real environment.
 
-v0.5.3 hardens typed, crash-consistent publication for the audited dataset,
+The next planned release is **v0.5.4**, with all existing known bugs required to
+be fixed and verified before release. The [v0.5.4 plan and issue register](docs/v0.5.4-plan.md)
+track the initial inventory, pending triage, and closure evidence. This is a
+release requirement; the bug review and release validation are still incomplete.
+
+v0.5.3 hardened typed, crash-consistent publication for the audited dataset,
 model, HIL, and run transaction boundaries, filesystem trust boundaries,
 bounded evidence/model validation, native Windows security contracts, and the
 signed release supply chain. Release publication now waits for the Linux full
@@ -337,7 +342,7 @@ discarding an incomplete split.
 Dataset inspection, validation, comparison, and existing-bundle reads remain
 available on Windows. Dataset split/register, model training or rebuild, HIL
 review, and workflows that publish new run directories require the audited Unix
-directory durability boundary in v0.5.3. On Windows they return a typed
+directory durability boundary in v0.5.4. On Windows they return a typed
 `NotPublished` error before creating an output hierarchy; a no-op flush is never
 reported as success. The bundled benchmark's trusted Python schema validators
 also fail closed on non-Unix platforms before a child process is spawned; this

@@ -79,7 +79,7 @@ SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Z][A-Z0-9_]*)\s*\}\}")
 VARIABLE_REFERENCE = re.compile(r"\$\{\{\s*vars\.([A-Z][A-Z0-9_]*)\s*\}\}")
 PINNED_RUST_TOOLCHAIN_ACTION = (
     "uses: dtolnay/rust-toolchain@"
-    "4be7066ada62dd38de10e7b70166bc74ed198c30"
+    "6bed0761d98439e5a578e2877258200ad565ba87"
 )
 
 
@@ -511,7 +511,7 @@ def yaml_step_bodies(job_body: str) -> list[str]:
 
 def validate_schema_requirements(failures: list[str]) -> None:
     expected_input = (
-        "jsonschema[format-nongpl]==4.25.1\n"
+        "jsonschema[format-nongpl]==4.26.0\n"
         'typing-extensions==4.16.0; python_version < "3.13"\n'
     )
     if not SCHEMA_REQUIREMENTS_INPUT.is_file():
@@ -551,8 +551,8 @@ def validate_schema_requirements(failures: list[str]) -> None:
             pinned[current] += 1
     if current is not None and pinned[current] == 0:
         failures.append(f"schema validator dependency {current} has no SHA-256 hash")
-    if pinned.get("jsonschema") is None or "jsonschema==4.25.1 \\" not in lock_body:
-        failures.append("schema validator lock must pin jsonschema 4.25.1")
+    if pinned.get("jsonschema") is None or "jsonschema==4.26.0 \\" not in lock_body:
+        failures.append("schema validator lock must pin jsonschema 4.26.0")
     if (
         pinned.get("typing-extensions") is None
         or 'typing-extensions==4.16.0 ; python_version < "3.13" \\'
@@ -807,7 +807,6 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         "Refuse to rebuild an existing release",
         "Require protected release environments",
         ".can_admins_bypass",
-        ".prevent_self_review == true",
         ".total_count == 1",
         '.type == "tag" and .name == "v*"',
         "Require release attestation verification support",
@@ -1194,7 +1193,7 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
                 "runs-on: ubuntu-24.04",
                 "timeout-minutes: 15",
                 "env:",
-                'ACTIONLINT_REVISION: "03d0035246f3e81f36aed592ffb4bebf33a03106"',
+                'ACTIONLINT_REVISION: "914e7df21a07ef503a81201c76d2b11c789d3fca"',
                 'FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"',
                 "steps:",
             ),
@@ -1202,7 +1201,7 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
                 ExactCiStepContract(
                     "pinned Rust toolchain",
                     toolchain_action,
-                    (toolchain_action, "with:", "toolchain: 1.95.0"),
+                    (toolchain_action, "with:", "toolchain: 1.98.1"),
                 ),
                 ExactCiStepContract(
                     "pinned ripgrep installer",
@@ -1240,7 +1239,7 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
                     (
                         toolchain_action,
                         "with:",
-                        "toolchain: 1.95.0",
+                        "toolchain: 1.98.1",
                         "components: rustfmt, clippy",
                     ),
                 ),

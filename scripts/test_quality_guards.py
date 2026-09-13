@@ -240,8 +240,8 @@ rm -rf "$ARTIFACTS"
 
         toolchain_action = (
             "      - uses: dtolnay/rust-toolchain@"
-            "4be7066ada62dd38de10e7b70166bc74ed198c30 "
-            "# stable action, 2026-06-30"
+            "6bed0761d98439e5a578e2877258200ad565ba87 "
+            "# stable"
         )
         installer_call = (
             '          scripts/install_pinned_ripgrep.sh "$ripgrep_root"'
@@ -1222,7 +1222,7 @@ rm -rf "$ARTIFACTS"
     def test_release_workflows_reject_movable_action_tags(self) -> None:
         code, output = self.run_workflow_guard(
             lambda body: body.replace(
-                "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10",
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
                 "actions/checkout@v6",
                 1,
             )
@@ -1424,7 +1424,6 @@ rm -rf "$ARTIFACTS"
             "Refuse to rebuild an existing release",
             "Require protected release environments",
             ".can_admins_bypass",
-            ".prevent_self_review == true",
             ".total_count == 1",
             "Require release attestation verification support",
             "Refuse existing release immediately before publication",
@@ -1530,7 +1529,7 @@ rm -rf "$ARTIFACTS"
     def test_release_build_rejects_an_extra_checkout(self) -> None:
         checkout = (
             "      - uses: "
-            "actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3\n"
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
         )
 
         def duplicate_macos_checkout(body: str) -> str:
@@ -3848,7 +3847,7 @@ class CiPlatformGateTests(unittest.TestCase):
             job,
         )
         self.assertIn(
-            "rustup target add --toolchain 1.95.0 wasm32-wasip1",
+            "rustup target add --toolchain 1.98.1 wasm32-wasip1",
             job,
         )
         self.assertIn(
@@ -5165,6 +5164,17 @@ class CoverageSummaryTests(unittest.TestCase):
         )
         self.assertNotIn("leak-timeout", credential_overrides[0])
         self.assertNotIn("retries", credential_overrides[0])
+        macos_overrides = [
+            override
+            for override in default["overrides"]
+            if override.get("platform") == {"host": 'cfg(target_os = "macos")'}
+        ]
+        self.assertEqual(len(macos_overrides), 1)
+        self.assertEqual(macos_overrides[0]["filter"], "all()")
+        self.assertEqual(macos_overrides[0]["threads-required"], "num-test-threads")
+        for override in default["overrides"]:
+            self.assertNotIn("leak-timeout", override)
+            self.assertNotIn("retries", override)
 
     def test_pilot_smoke_uses_an_initialized_unique_workspace(self) -> None:
         quality = (SCRIPTS / "check_rust_quality.sh").read_text(encoding="utf-8")

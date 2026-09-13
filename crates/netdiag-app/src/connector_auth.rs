@@ -4,6 +4,9 @@ use anyhow::{Result, bail};
 use netdiag_core::authentication::{BearerSourceKind, ValidatedBearerToken, canonical_http_origin};
 use netdiag_core::connectors::validate_http_connector_bearer_endpoint;
 
+mod settings_scope;
+pub use settings_scope::live_api_settings_bearer_scope;
+
 pub fn bearer_scope_for_endpoint(
     profile_id: &str,
     source_kind: BearerSourceKind,
@@ -60,5 +63,35 @@ fn bearer_source_kind(profile: &SourceProfile) -> Result<BearerSourceKind> {
             "source profile cannot use bearer authentication with {}",
             kind.stable_name()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unconfigured_live_api_form_has_no_credential_scope() {
+        for empty in ["", "   "] {
+            assert_eq!(
+                live_api_settings_bearer_scope(empty).expect("unconfigured form"),
+                None
+            );
+            bearer_scope_for_endpoint("legacy_live_api", BearerSourceKind::HttpJson, empty)
+                .expect_err("runtime and credential writes must still reject an empty endpoint");
+        }
+    }
+
+    #[test]
+    fn configured_live_api_forms_keep_origin_validation() {
+        let endpoint = "https://example.com/trace";
+        let expected =
+            bearer_scope_for_endpoint("legacy_live_api", BearerSourceKind::HttpJson, endpoint)
+                .expect("valid endpoint");
+        assert_eq!(
+            live_api_settings_bearer_scope(endpoint).expect("configured form"),
+            Some(expected)
+        );
+        live_api_settings_bearer_scope("not a URL").expect_err("invalid configured endpoint");
     }
 }

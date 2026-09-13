@@ -59,7 +59,7 @@ pub(super) fn namespace_path() -> Result<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(b"netdiag-twin-coordination-principal/v1\0");
     hasher.update(sid);
-    let principal = format!("{:x}", hasher.finalize());
+    let principal = crate::digest_encoding::hex_digest(hasher.finalize());
     let root = netdiag_platform::current_user_local_app_data_path().map_err(|source| {
         NetdiagError::WindowsCoordinationLocalAppData {
             context: COORDINATION_ROOT_CONTEXT,

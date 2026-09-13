@@ -246,7 +246,7 @@ A model should become active for real pilots only after:
 - The promoted manifest records dataset hash, model hash, training gate, and
   evaluation summary.
 
-The v0.5.3 gate enforces known-label coverage, explicit OOD benchmark preflight
+The v0.5.4 gate enforces known-label coverage, explicit OOD benchmark preflight
 coverage, and behavior-level OOD calibration. Promotion requires a fresh
 `lab_calibration_report.json` whose model manifest hash, model file hash,
 dataset hash, and calibrated thresholds match the bundle being promoted. The

@@ -1,6 +1,14 @@
 [profile.default]
 leak-timeout = { period = "200ms", result = "fail" }
 
+# Darwin's pipe()/fcntl(FD_CLOEXEC) sequence can leak a runner-created pipe
+# into another test during concurrent process starts. Serialize test processes
+# on macOS; concurrency exercised inside each test and leak detection stay on.
+[[profile.default.overrides]]
+platform = { host = 'cfg(target_os = "macos")' }
+filter = 'all()'
+threads-required = "num-test-threads"
+
 [[profile.default.overrides]]
 filter = 'package(netdiag-app) & test(/^credential_lifecycle::/)'
 threads-required = "num-test-threads"

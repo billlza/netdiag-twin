@@ -134,6 +134,20 @@ fn model_rebuild_fails_before_creating_the_model_directory() {
 }
 
 #[test]
+fn model_migration_fails_before_any_model_or_lock_file_io() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let model_dir = root.path().join("model-that-must-not-exist");
+    let error = netdiag_core::ml::migrate_legacy_model_bundle(&model_dir)
+        .expect_err("model migration requires durable directory publication");
+    assert_eq!(
+        error.atomic_publish_phase(),
+        Some(AtomicPublishPhase::NotPublished)
+    );
+    assert!(!model_dir.exists());
+    assert_eq!(std::fs::read_dir(root.path()).expect("root").count(), 0);
+}
+
+#[test]
 fn dataset_split_fails_before_reading_input_or_creating_output() {
     let root = tempfile::tempdir().expect("temporary root");
     let output_dir = root.path().join("split-output-that-must-not-exist");

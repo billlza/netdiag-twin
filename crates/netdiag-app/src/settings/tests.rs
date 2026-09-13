@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod api;
+mod artifacts;
 mod store;
 mod strict_json;
 
@@ -33,6 +34,7 @@ fn defaults_are_product_safe() {
     );
     assert_eq!(settings.data_connectors.website_probe.targets.len(), 3);
     assert!(settings.artifacts_root.ends_with("artifacts"));
+    assert!(!settings.artifacts_root_user_selected);
     assert_eq!(settings.what_if.topology, "line");
     assert_eq!(settings.what_if.action, "reroute_path_b");
     assert_eq!(settings.startup.default_tab, StartupTab::Overview);
@@ -246,6 +248,7 @@ fn save_and_load_round_trips_without_token() {
         bearer_credentials: Vec::new(),
         credential_cleanup: CredentialCleanupJournal::default(),
         artifacts_root: PathBuf::from("/tmp/netdiag-artifacts"),
+        artifacts_root_user_selected: true,
         what_if: WhatIfSettings {
             topology: "mesh".to_string(),
             action: "isolate_node_c".to_string(),

@@ -23,12 +23,26 @@ pub fn resolve_stored_path(artifact_root: &Path, value: &str) -> Result<PathBuf>
             "stored artifact path is empty".to_string(),
         ));
     }
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
+    let raw = PathBuf::from(value);
+    if raw
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
         return Err(NetdiagError::InvalidTrace(format!(
-            "stored artifact path must be relative to the artifact root: {value}"
+            "stored artifact path escapes the artifact root: {value}"
         )));
     }
+    if raw.is_absolute() {
+        // Older writers stored absolute paths. Resolve system aliases using
+        // the same canonical confinement checks as relative paths, never by
+        // rebasing an external root or discarding leading path components.
+        if path_status(&raw)?.exists() {
+            return ensure_existing_path_is_confined(artifact_root, raw);
+        }
+        ensure_nonexistent_path_is_confined(artifact_root, &raw)?;
+        return Ok(raw);
+    }
+    let path = raw;
     if path.components().any(|component| {
         matches!(
             component,

@@ -214,6 +214,18 @@ rm -rf "$ARTIFACTS"
             self.assertTrue(failures)
             steps = module.yaml_step_bodies(body)
             installer = next(step for step in steps if module.PINNED_RUST_TOOLCHAIN_ACTION in step)
+            for mutation in (
+                installer.replace("        with:\n", "        if: ${{ false }}\n        with:\n", 1),
+                installer.replace("        with:\n", "        continue-on-error: true\n        with:\n", 1),
+                installer.replace("        with:\n", "        env:\n", 1),
+                installer.replace("          components:", "        env:\n          components:", 1),
+                installer.replace("          components:", "        components:", 1),
+                installer + "        with:\n          components: rustfmt\n",
+            ):
+                with self.subTest(job=job, changed_step=mutation):
+                    failures = []
+                    module.validate_mac_compile_toolchain(body.replace(installer, mutation, 1), job, failures)
+                    self.assertTrue(failures)
             reordered = "".join(step for step in steps if step != installer) + installer
             failures = []
             module.validate_mac_compile_toolchain(reordered, job, failures)

@@ -517,10 +517,21 @@ def validate_mac_compile_toolchain(
         index for index, step in enumerate(steps)
         if PINNED_RUST_TOOLCHAIN_ACTION in uncommented_body(step)
     ]
-    required = "components: rustfmt, clippy, llvm-tools-preview"
-    if len(installers) != 1 or required not in active_lines(steps[installers[0]]):
+    required = (
+        f"      - {PINNED_RUST_TOOLCHAIN_ACTION}",
+        "        with:",
+        "          toolchain: 1.98.1",
+        "          components: rustfmt, clippy, llvm-tools-preview",
+    )
+    actual = () if len(installers) != 1 else tuple(
+        line.rstrip()
+        for line in uncommented_body(steps[installers[0]]).splitlines()
+        if line.strip()
+    )
+    if actual != required:
         failures.append(
-            f"{job_name} must explicitly install all workspace Rust components before Cargo"
+            f"{job_name} must explicitly install all workspace Rust components before Cargo "
+            "in an exact, unconditional action step"
         )
         return
     cargo_steps = [

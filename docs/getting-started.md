@@ -64,6 +64,21 @@ roots without a verifiable product artifact are rejected before the ownership
 marker is published. Migration does not move, rewrite, or delete existing
 artifacts.
 
+Historical reports may omit window P50/P99 while retaining mean, P95 and
+standard deviation. Missing percentiles remain unrecorded and leave chart gaps;
+new analyses still compute every percentile. Legacy absolute index and manifest
+paths are readable only within the exact current artifact root and run directory,
+respectively. Parent traversal, sibling roots and symlink escapes remain errors.
+Copying an old root to a different location does not authorize rebasing its paths.
+An artifact root chosen through **Choose Folder** remains selected after restart,
+including a root inside a development workspace. Only an unselected historical
+workspace-default root is automatically moved to the Application Support setting;
+this changes the setting, not the artifact files.
+An existing model directory must also meet the private-directory requirement
+(0700 on Unix). If migration reports a directory-mode error, verify ownership
+of that specific directory and correct its mode before retrying. Migration does
+not change existing permissions automatically.
+
 Artifact-root migration deliberately does not make a flat v0.5.2
 `netdiag-model-manifest/v1` model readable. Runtime readers continue to reject
 v1. After claiming the root, replace that model through an explicit serialized

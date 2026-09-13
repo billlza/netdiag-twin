@@ -383,6 +383,48 @@ fn manifest_run_id_must_match_its_directory() {
 }
 
 #[test]
+fn legacy_absolute_paths_are_bound_to_the_current_root() {
+    let parent = tempfile::tempdir().expect("temporary parent");
+    let root = parent.path().join("artifacts");
+    let sibling = parent.path().join("artifacts-other");
+    fs::create_dir(&root).expect("artifact root");
+    fs::create_dir(&sibling).expect("sibling root");
+    let owned_file = root.join("report.json");
+    fs::write(&owned_file, b"{}").expect("owned file");
+    let resolved = resolve_stored_path(&root, owned_file.to_str().expect("path"))
+        .expect("confined absolute legacy path");
+    assert_eq!(resolved, owned_file);
+    for external in [
+        sibling.join("report.json"),
+        root.join("../outside.json"),
+        parent.path().join("missing/file.json"),
+    ] {
+        resolve_stored_path(&root, external.to_str().expect("path"))
+            .expect_err("sibling roots, parent traversal and external missing files must fail");
+    }
+    assert_eq!(
+        resolve_stored_path(&root, root.join("missing.json").to_str().expect("path"))
+            .expect("optional missing artifact within root"),
+        root.join("missing.json")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_absolute_paths_reject_symlink_escapes_for_existing_and_missing_files() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().expect("artifact root");
+    let outside = tempfile::tempdir().expect("outside root");
+    fs::write(outside.path().join("report.json"), b"{}").expect("external file");
+    symlink(outside.path(), root.path().join("redirect")).expect("redirect fixture");
+    for name in ["report.json", "missing.json"] {
+        let path = root.path().join("redirect").join(name);
+        resolve_stored_path(root.path(), path.to_str().expect("path"))
+            .expect_err("an absolute path must not follow an external symlink");
+    }
+}
+
+#[test]
 fn manifest_artifact_paths_cannot_escape_the_run_directory() {
     let temp = tempfile::tempdir().expect("tempdir");
     let result = crate::diagnose_file(

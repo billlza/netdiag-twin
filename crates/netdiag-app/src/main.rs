@@ -3,7 +3,7 @@ use eframe::egui::{
     Sense, Stroke, UiBuilder, Vec2,
 };
 use egui_remixicon::icons;
-use netdiag_app::connector_auth::{bearer_scope_for_endpoint, profile_bearer_scope};
+use netdiag_app::connector_auth::{live_api_settings_bearer_scope, profile_bearer_scope};
 use netdiag_app::credential_lifecycle::{
     LegacyCredentialMigration, delete_bearer_credentials, delete_live_api_credentials,
     has_stale_active_binding, legacy_live_api_binding, migrate_legacy_live_api_credential,
@@ -24,10 +24,11 @@ use netdiag_app::settings::{
     self, AppSettings, BearerCredentialOwner, ConnectorAuthentication, ConnectorKind,
     DefaultSource, LanguageSetting, SettingsStore, StartupTab,
 };
-use netdiag_app::trend::{LatencyMetric, TrendRange, latency_trend_points};
+use netdiag_app::trend::{
+    LatencyMetric, TrendRange, latency_trend_points, recorded_trend_segments,
+};
 use netdiag_app::updater::{UpdateCheckOutcome, sparkle_check_for_updates, sparkle_status};
 use netdiag_app::view_model::{DashboardViewModel, format_bytes};
-use netdiag_core::authentication::BearerSourceKind;
 use netdiag_core::connectors::{
     CaptureControl, CaptureProgress, NativePcapConfig, OtlpGrpcReceiverConfig, OtlpReceiverSession,
     OtlpShutdownOutcome, SystemCountersConfig, load_native_pcap_with_control,
@@ -199,6 +200,7 @@ enum Text {
     LastUpdate,
     AnalysisId,
     NoMetrics,
+    UnrecordedWindowPercentiles,
     NoDiagnosis,
     NoComparison,
     NoFlowMetadata,
@@ -2851,24 +2853,26 @@ impl NetDiagApp {
             self.persist_settings();
         }
 
-        let token_scope = bearer_scope_for_endpoint(
-            "legacy_live_api",
-            BearerSourceKind::HttpJson,
-            &self.settings.api.endpoint,
-        );
+        let token_scope = live_api_settings_bearer_scope(&self.settings.api.endpoint);
         let token_presence = token_scope
             .as_ref()
             .map_err(ToString::to_string)
             .map(|scope| {
-                self.live_api_token_presence
-                    .for_scope(self.secrets.as_ref(), scope)
-                    .clone()
+                scope.as_ref().map(|scope| {
+                    self.live_api_token_presence
+                        .for_scope(self.secrets.as_ref(), scope)
+                        .clone()
+                })
             });
         let stale_binding = legacy_live_api_binding(&self.settings.api.endpoint)
             .ok()
             .is_some_and(|desired| has_stale_active_binding(&self.settings, &desired));
         let (token_status, token_color) = match token_presence {
-            Ok(BearerSecretPresence::Present) => (
+            Ok(None) => (
+                tr(self.language, Text::ConfigureLiveApiFirst).to_string(),
+                MUTED,
+            ),
+            Ok(Some(BearerSecretPresence::Present)) => (
                 format!(
                     "{}: {}",
                     tr(self.language, Text::TokenStatus),
@@ -2876,11 +2880,11 @@ impl NetDiagApp {
                 ),
                 MUTED,
             ),
-            Ok(BearerSecretPresence::Missing) if stale_binding => (
+            Ok(Some(BearerSecretPresence::Missing)) if stale_binding => (
                 stale_bearer_credential_hint(self.language).to_string(),
                 ORANGE,
             ),
-            Ok(BearerSecretPresence::Missing) => (
+            Ok(Some(BearerSecretPresence::Missing)) => (
                 format!(
                     "{}: {}",
                     tr(self.language, Text::TokenStatus),
@@ -2888,10 +2892,11 @@ impl NetDiagApp {
                 ),
                 MUTED,
             ),
-            Ok(BearerSecretPresence::ReadFailed(error)) | Err(error) => (
+            Ok(Some(BearerSecretPresence::ReadFailed(error))) => (
                 format!("{}: {error}", tr(self.language, Text::KeychainError)),
                 RED,
             ),
+            Err(error) => (error, RED),
         };
         ui.label(RichText::new(token_status).size(12.0).color(token_color));
         ui.horizontal(|ui| {
@@ -2918,7 +2923,7 @@ impl NetDiagApp {
                 match result {
                     Ok(()) => {
                         self.pending_delete_token = false;
-                        if let Ok(scope) = token_scope.as_ref() {
+                        if let Ok(Some(scope)) = token_scope.as_ref() {
                             self.live_api_token_presence.mark_present(scope);
                         }
                         self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
@@ -2944,7 +2949,7 @@ impl NetDiagApp {
                     match result {
                         Ok(()) => {
                             self.pending_delete_token = false;
-                            if let Ok(scope) = token_scope.as_ref() {
+                            if let Ok(Some(scope)) = token_scope.as_ref() {
                                 self.live_api_token_presence.mark_missing(scope);
                             }
                             self.settings_notice = Some(tr(self.language, Text::Saved).to_string());
@@ -3674,6 +3679,7 @@ impl NetDiagApp {
                 self.pending_rebuild_model.clear();
                 self.model_cache_state = ModelCacheState::load(&path);
                 self.settings.artifacts_root = path.clone();
+                self.settings.artifacts_root_user_selected = true;
                 self.artifacts_root = path;
                 self.persist_settings();
                 self.start_diagnosis(false);
@@ -4133,32 +4139,35 @@ impl NetDiagApp {
                 .telemetry
                 .windows
                 .iter()
-                .map(|window| window.latency_ms.p95)
+                .map(|window| Some(window.latency_ms.p95))
                 .collect::<Vec<_>>();
             let jitter = result
                 .telemetry
                 .windows
                 .iter()
-                .map(|window| window.jitter_ms.std)
+                .map(|window| Some(window.jitter_ms.std))
                 .collect::<Vec<_>>();
             let loss = result
                 .telemetry
                 .windows
                 .iter()
-                .map(|window| window.packet_loss_rate)
+                .map(|window| Some(window.packet_loss_rate))
                 .collect::<Vec<_>>();
             let retrans = result
                 .telemetry
                 .windows
                 .iter()
-                .map(|window| window.retransmission_rate)
+                .map(|window| Some(window.retransmission_rate))
                 .collect::<Vec<_>>();
             let throughput = result
                 .telemetry
                 .windows
                 .iter()
-                .map(|window| window.throughput_mbps.mean)
+                .map(|window| Some(window.throughput_mbps.mean))
                 .collect::<Vec<_>>();
+            if latency_p50.iter().any(Option::is_none) {
+                ui.label(tr(self.language, Text::UnrecordedWindowPercentiles));
+            }
             let tile_w = ((ui.available_width() - 20.0) / 3.0).clamp(124.0, 156.0);
             egui::Grid::new("metric_grid")
                 .num_columns(3)
@@ -4253,6 +4262,9 @@ impl NetDiagApp {
                     )
                 })
                 .unwrap_or_default();
+            if points.iter().any(|point| point.value_ms.is_none()) {
+                ui.label(tr(self.language, Text::UnrecordedWindowPercentiles));
+            }
             ui.add_space(8.0);
             let chart_height = (ui.available_height() - 8.0).clamp(156.0, 320.0);
             draw_large_chart(ui, &points, self.trend_range, chart_height);
@@ -4273,25 +4285,7 @@ impl NetDiagApp {
                 .map(|event| event.evidence.symptom)
                 .unwrap_or(FaultLabel::Normal);
             let confidence = event.map(|event| event.evidence.confidence).unwrap_or(0.0);
-            let headline = fault_label_display(label, self.language);
-            ui.horizontal(|ui| {
-                alert_badge(ui, label);
-                ui.label(RichText::new(headline).size(17.0).strong().color(
-                    if label == FaultLabel::Normal {
-                        GREEN
-                    } else {
-                        RED
-                    },
-                ));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    confidence_chip(ui, confidence, label != FaultLabel::Normal);
-                    ui.label(
-                        RichText::new(tr(self.language, Text::Confidence))
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                });
-            });
+            diagnosis_heading(ui, self.language, label, confidence);
             ui.add_space(if compact { 8.0 } else { 12.0 });
             if let Some(event) = event {
                 ui.label(
@@ -5210,6 +5204,36 @@ fn artifact_root_for_result(result: &PipelineResult) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+fn diagnosis_heading(ui: &mut egui::Ui, language: Language, label: FaultLabel, confidence: f64) {
+    let headline = fault_label_display(label, language);
+    ui.horizontal(|ui| {
+        alert_badge(ui, label);
+        ui.label(RichText::new(headline).size(17.0).strong().color(
+            if label == FaultLabel::Normal {
+                GREEN
+            } else {
+                RED
+            },
+        ));
+    });
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(tr(language, Text::Confidence))
+                .size(11.0)
+                .color(MUTED),
+        );
+        confidence_badge(
+            ui,
+            confidence,
+            if label == FaultLabel::Normal {
+                GREEN
+            } else {
+                RED
+            },
+        );
+    });
+}
+
 fn status_cell(
     painter: &egui::Painter,
     rect: Rect,
@@ -5217,42 +5241,19 @@ fn status_cell(
     value: &str,
     value_color: Color32,
 ) {
-    let y = rect.center().y;
-    let label_w = if rect.width() >= 220.0 { 88.0 } else { 70.0 };
-    let value_chars = ((rect.width() - label_w - 10.0) / 7.0).max(6.0) as usize;
-    let value = truncate_middle(value, value_chars);
-    painter.text(
-        Pos2::new(rect.left(), y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(12.0),
-        MUTED,
-    );
-    painter.text(
-        Pos2::new(rect.left() + label_w, y),
-        Align2::LEFT_CENTER,
-        value,
-        FontId::proportional(12.0),
-        value_color,
-    );
-}
-
-fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
+    for (text, offset, color) in [(label, -9.0, MUTED), (value, 9.0, value_color)] {
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            text.to_string(),
+            FontId::proportional(12.0),
+            color,
+        );
+        job.wrap.max_width = (rect.width() - 8.0).max(0.0);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        let top = rect.center().y + offset - galley.size().y / 2.0;
+        painter.galley(Pos2::new(rect.left(), top), galley, color);
     }
-    let keep = max_chars.saturating_sub(1) / 2;
-    let start: String = value.chars().take(keep).collect();
-    let end: String = value
-        .chars()
-        .rev()
-        .take(keep)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{start}…{end}")
 }
 
 fn draw_background(ui: &mut egui::Ui, rect: Rect) {
@@ -5590,7 +5591,7 @@ fn metric_tile(
     label: &str,
     value: String,
     color: Color32,
-    points: &[f64],
+    points: &[Option<f64>],
     width: f32,
 ) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 86.0), Sense::hover());
@@ -5623,12 +5624,17 @@ fn metric_tile(
     draw_sparkline(ui, spark, points, color);
 }
 
-fn draw_sparkline(ui: &mut egui::Ui, rect: Rect, values: &[f64], color: Color32) {
+fn draw_sparkline(ui: &mut egui::Ui, rect: Rect, values: &[Option<f64>], color: Color32) {
     let rect = Rect::from_min_size(rect.min, Vec2::new(rect.width().max(80.0), 24.0));
     let painter = ui.painter();
     let points = scaled_points(rect, values);
     for pair in points.windows(2) {
-        painter.line_segment([pair[0], pair[1]], Stroke::new(1.5, color));
+        if let [Some(start), Some(end)] = pair {
+            painter.line_segment([*start, *end], Stroke::new(1.5, color));
+        }
+    }
+    for point in points.iter().flatten() {
+        painter.circle_filled(*point, 1.5, color);
     }
 }
 
@@ -5647,7 +5653,7 @@ fn draw_large_chart(
     let painter = ui.painter_at(rect);
     let max_value = points
         .iter()
-        .map(|point| point.value_ms)
+        .filter_map(|point| point.value_ms)
         .fold(0.0_f64, f64::max)
         .max(10.0);
     let y_max = nice_axis_max(max_value);
@@ -5679,8 +5685,12 @@ fn draw_large_chart(
             MUTED,
         );
     }
-    let scaled = scaled_trend_points(inner, points, range.seconds() as f64, y_max);
-    if scaled.len() >= 2 {
+    let x_max = points
+        .iter()
+        .map(|point| point.elapsed_s)
+        .fold(range.seconds() as f64, f64::max);
+    for segment in recorded_trend_segments(points) {
+        let scaled = scaled_trend_points(inner, segment, x_max, y_max);
         let base_y = inner.bottom();
         let mut area = Mesh::default();
         for pair in scaled.windows(2) {
@@ -5702,6 +5712,9 @@ fn draw_large_chart(
         for pair in scaled.windows(2) {
             painter.line_segment([pair[0], pair[1]], Stroke::new(2.0, PURPLE));
         }
+        for point in scaled {
+            painter.circle_filled(point, 2.0, PURPLE);
+        }
     }
 }
 
@@ -5711,20 +5724,18 @@ fn scaled_trend_points(
     range_seconds: f64,
     y_max: f64,
 ) -> Vec<Pos2> {
-    if points.len() < 2 {
-        return Vec::new();
-    }
     let x_max = points
         .iter()
         .map(|point| point.elapsed_s)
         .fold(range_seconds.max(1.0), f64::max);
     points
         .iter()
-        .map(|point| {
+        .filter_map(|point| {
+            let value_ms = point.value_ms?;
             let x = rect.left() + rect.width() * (point.elapsed_s / x_max).clamp(0.0, 1.0) as f32;
-            let y = rect.bottom()
-                - rect.height() * (point.value_ms / y_max.max(1.0)).clamp(0.0, 1.0) as f32;
-            Pos2::new(x, y)
+            let y =
+                rect.bottom() - rect.height() * (value_ms / y_max.max(1.0)).clamp(0.0, 1.0) as f32;
+            Some(Pos2::new(x, y))
         })
         .collect()
 }
@@ -5751,12 +5762,17 @@ fn format_time_tick(seconds: f64) -> String {
     }
 }
 
-fn scaled_points(rect: Rect, values: &[f64]) -> Vec<Pos2> {
-    if values.len() < 2 {
-        return Vec::new();
-    }
-    let min_value = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_value = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+fn scaled_points(rect: Rect, values: &[Option<f64>]) -> Vec<Option<Pos2>> {
+    let min_value = values
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let max_value = values
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
     if !min_value.is_finite() || !max_value.is_finite() {
         return Vec::new();
     }
@@ -5765,10 +5781,12 @@ fn scaled_points(rect: Rect, values: &[f64]) -> Vec<Pos2> {
         .iter()
         .enumerate()
         .map(|(idx, value)| {
-            let x = rect.left() + rect.width() * idx as f32 / (values.len() - 1) as f32;
-            let normalized = ((*value - min_value) / span).clamp(0.0, 1.0) as f32;
+            let value = (*value)?;
+            let x = rect.left()
+                + rect.width() * idx as f32 / values.len().saturating_sub(1).max(1) as f32;
+            let normalized = ((value - min_value) / span).clamp(0.0, 1.0) as f32;
             let y = rect.bottom() - rect.height() * normalized;
-            Pos2::new(x, y)
+            Some(Pos2::new(x, y))
         })
         .collect()
 }
@@ -5990,15 +6008,17 @@ fn comparison_box(
         .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_min_height(76.0);
-            ui.label(RichText::new(title).size(12.0).color(MUTED));
-            ui.label(RichText::new(label).size(16.0).strong().color(color));
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(confidence_label)
-                        .size(11.0)
-                        .color(Color32::BLACK),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let width = ui.available_width();
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.set_min_width(width);
+                ui.label(RichText::new(title).size(12.0).color(MUTED));
+                ui.label(RichText::new(label).size(16.0).strong().color(color));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(confidence_label)
+                            .size(11.0)
+                            .color(Color32::BLACK),
+                    );
                     confidence_badge(ui, confidence, color);
                 });
             });

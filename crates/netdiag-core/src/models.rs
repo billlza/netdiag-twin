@@ -567,10 +567,14 @@ impl Default for DistributionStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowLatencyStats {
-    pub p50: f64,
+    /// Some historical summaries did not record P50/P99. Absence is not zero
+    /// and cannot be reconstructed from the remaining aggregate statistics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50: Option<f64>,
     pub mean: f64,
     pub p95: f64,
-    pub p99: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99: Option<f64>,
     pub std: f64,
 }
 

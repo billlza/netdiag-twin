@@ -60,7 +60,14 @@ impl LatencyMetric {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrendPoint {
     pub elapsed_s: f64,
-    pub value_ms: f64,
+    pub value_ms: Option<f64>,
+}
+
+/// Missing observations divide the curve instead of joining unrelated samples.
+pub fn recorded_trend_segments(points: &[TrendPoint]) -> impl Iterator<Item = &[TrendPoint]> {
+    points
+        .split(|point| point.value_ms.is_none())
+        .filter(|segment| !segment.is_empty())
 }
 
 pub fn latency_trend_points(
@@ -87,7 +94,7 @@ pub fn latency_trend_points(
             elapsed_s: (window.start_ts - first_ts).num_milliseconds() as f64 / 1000.0,
             value_ms: match metric {
                 LatencyMetric::P50 => window.latency_ms.p50,
-                LatencyMetric::P95 => window.latency_ms.p95,
+                LatencyMetric::P95 => Some(window.latency_ms.p95),
                 LatencyMetric::P99 => window.latency_ms.p99,
             },
         })
@@ -109,13 +116,51 @@ mod tests {
 
         assert_eq!(points.len(), 7);
         assert_eq!(points[0].elapsed_s, 0.0);
-        assert_eq!(points[0].value_ms, 103.0);
-        assert_eq!(points.last().expect("last").value_ms, 109.0);
+        assert_eq!(points[0].value_ms, Some(103.0));
+        assert_eq!(points.last().expect("last").value_ms, Some(109.0));
     }
 
     #[test]
     fn trend_points_handle_empty_windows() {
         assert!(latency_trend_points(&[], TrendRange::TenSeconds, LatencyMetric::P95).is_empty());
+    }
+
+    #[test]
+    fn unrecorded_percentiles_preserve_time_and_break_the_curve() {
+        let mut windows = (0..5).map(window).collect::<Vec<_>>();
+        windows[0].latency_ms.p50 = None;
+        windows[2].latency_ms.p50 = None;
+        windows[4].latency_ms.p50 = None;
+        let points = latency_trend_points(&windows, TrendRange::ThirtySeconds, LatencyMetric::P50);
+
+        assert_eq!(points.len(), 5);
+        assert_eq!(points[0].value_ms, None);
+        assert_eq!(points[1].elapsed_s, 5.0);
+        let segments = recorded_trend_segments(&points).collect::<Vec<_>>();
+        assert_eq!(segments, vec![&points[1..2], &points[3..4]]);
+        assert_eq!(segments[0][0].value_ms, Some(51.0));
+        assert_eq!(segments[1][0].value_ms, Some(53.0));
+    }
+
+    #[test]
+    fn historical_windows_keep_p95_without_fabricating_p50_or_p99() {
+        let mut windows = (0..3).map(window).collect::<Vec<_>>();
+        for window in &mut windows {
+            window.latency_ms.p50 = None;
+            window.latency_ms.p99 = None;
+        }
+        for metric in [LatencyMetric::P50, LatencyMetric::P99] {
+            let points = latency_trend_points(&windows, TrendRange::ThirtySeconds, metric);
+            assert_eq!(points.len(), 3);
+            assert!(points.iter().all(|point| point.value_ms.is_none()));
+            assert!(recorded_trend_segments(&points).next().is_none());
+        }
+        let p95 = latency_trend_points(&windows, TrendRange::ThirtySeconds, LatencyMetric::P95);
+        assert_eq!(
+            recorded_trend_segments(&p95).collect::<Vec<_>>(),
+            vec![&p95[..]]
+        );
+        assert_eq!(p95[1].value_ms, Some(91.0));
     }
 
     fn window(idx: i64) -> TelemetryWindow {
@@ -129,10 +174,10 @@ mod tests {
             end_ts: start + Duration::seconds(5),
             count: 5,
             latency_ms: WindowLatencyStats {
-                p50: 50.0 + idx as f64,
+                p50: Some(50.0 + idx as f64),
                 mean: 70.0 + idx as f64,
                 p95: 90.0 + idx as f64,
-                p99: 100.0 + idx as f64,
+                p99: Some(100.0 + idx as f64),
                 std: 1.0,
             },
             jitter_ms: DistributionStats::default(),

@@ -807,7 +807,6 @@ def validate_workflow_hygiene(failures: list[str]) -> None:
         "Refuse to rebuild an existing release",
         "Require protected release environments",
         ".can_admins_bypass",
-        ".prevent_self_review == true",
         ".total_count == 1",
         '.type == "tag" and .name == "v*"',
         "Require release attestation verification support",

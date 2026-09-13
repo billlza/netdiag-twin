@@ -440,6 +440,98 @@ fn explicit_migration_accepts_a_lab_index_bound_to_published_artifacts() {
 }
 
 #[test]
+fn explicit_migration_preserves_reports_without_optional_window_percentiles() {
+    let root = tempfile::tempdir().expect("temporary artifact root");
+    let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/samples/normal.csv");
+    let result = crate::diagnose_file(sample, root.path(), None).expect("publish run fixture");
+    let report_path = root
+        .path()
+        .join("runs")
+        .join(&result.run_id)
+        .join("report.json");
+    let mut document: Value = crate::storage::read_json(&report_path).expect("report fixture");
+    for window in document["trace_summary"]["windows"]
+        .as_array_mut()
+        .expect("windows")
+    {
+        let latency = window["latency_ms"].as_object_mut().expect("latency stats");
+        latency.remove("p50");
+        latency.remove("p99");
+    }
+    let historical_bytes = serde_json::to_vec_pretty(&document).expect("historical report JSON");
+    fs::write(&report_path, &historical_bytes).expect("historical report fixture");
+    fs::remove_dir_all(root.path().join("model")).expect("remove independent model anchor");
+    fs::remove_file(root.path().join(OWNERSHIP_FILE_NAME)).expect("remove current marker fixture");
+
+    migrate_legacy_artifact_root(root.path()).expect("migrate a verifiable historical report");
+
+    assert!(root.path().join(OWNERSHIP_FILE_NAME).is_file());
+    assert_eq!(
+        fs::read(&report_path).expect("preserved report"),
+        historical_bytes
+    );
+    let report = crate::storage::read_report(root.path(), &result.run_id).expect("read history");
+    let stats = serde_json::to_value(&report.trace_summary.windows[0].latency_ms)
+        .expect("decoded historical window");
+    assert!(stats["p50"].is_null(), "missing P50 must not be invented");
+    assert!(stats["p99"].is_null(), "missing P99 must not be invented");
+    assert_eq!(
+        stats["p95"],
+        document["trace_summary"]["windows"][0]["latency_ms"]["p95"]
+    );
+    assert_eq!(
+        crate::storage::list_run_index(root.path())
+            .expect("history index")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn explicit_migration_preserves_confined_legacy_absolute_paths() {
+    let root = tempfile::tempdir().expect("temporary artifact root");
+    let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/samples/normal.csv");
+    let result = crate::diagnose_file(sample, root.path(), None).expect("publish run fixture");
+    let manifest_path = result.run_dir.join("manifest.json");
+    let mut manifest =
+        crate::storage::read_manifest(root.path(), &result.run_id).expect("manifest");
+    for artifact in crate::storage::run_artifacts(root.path(), &result.run_id).expect("artifacts") {
+        if artifact.key != "manifest" {
+            manifest.artifact_paths.insert(artifact.key, artifact.path);
+        }
+    }
+    crate::storage::save_json_atomic(&manifest_path, &manifest).expect("legacy manifest paths");
+    let index_path = root.path().join("run_index.json");
+    let mut index = crate::storage::list_run_index(root.path()).expect("index");
+    index[0].run_dir = result.run_dir.display().to_string();
+    crate::storage::save_json_atomic(&index_path, &index).expect("legacy index path");
+    let original_manifest = fs::read(&manifest_path).expect("manifest bytes");
+    let original_index = fs::read(&index_path).expect("index bytes");
+    fs::remove_dir_all(root.path().join("model")).expect("remove independent model anchor");
+    fs::remove_file(root.path().join(OWNERSHIP_FILE_NAME)).expect("remove current marker fixture");
+
+    migrate_legacy_artifact_root(root.path()).expect("migrate confined absolute paths");
+
+    assert_eq!(
+        fs::read(&manifest_path).expect("preserved manifest"),
+        original_manifest
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("preserved index"),
+        original_index
+    );
+    let history = crate::storage::list_run_history(root.path(), 20).expect("legacy history");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].run_id, result.run_id);
+    assert!(
+        crate::storage::run_artifacts(root.path(), &result.run_id)
+            .expect("legacy artifact paths")
+            .iter()
+            .all(|artifact| artifact.exists)
+    );
+}
+
+#[test]
 fn explicit_migration_recognizes_v0_5_2_model_without_enabling_runtime_reads() {
     let root = tempfile::tempdir().expect("temporary artifact root");
     let model_dir = root.path().join("model");

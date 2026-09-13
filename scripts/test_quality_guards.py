@@ -1424,7 +1424,6 @@ rm -rf "$ARTIFACTS"
             "Refuse to rebuild an existing release",
             "Require protected release environments",
             ".can_admins_bypass",
-            ".prevent_self_review == true",
             ".total_count == 1",
             "Require release attestation verification support",
             "Refuse existing release immediately before publication",

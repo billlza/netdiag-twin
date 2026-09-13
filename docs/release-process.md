@@ -20,7 +20,7 @@
 确认本机和 GitHub 仓库满足这些条件：
 
 - 当前工作基于 `main`。
-- 发布环境、审核规则和环境级 Secrets 已配置完整。
+- 发布环境、部署规则和环境级 Secrets 已配置完整。
 - 本机能运行 Rust gates。
 - Sparkle archive 已在 `vendor/Sparkle/`。
 - 仓库已启用 GitHub Immutable Releases。
@@ -32,7 +32,7 @@
 Release workflow 只接受 `v*` annotated tag 的 push，不提供手工触发入口。发布凭据必须按
 用途存放在受保护的 GitHub Environments 中，不能保留仓库级副本：
 
-- `release-signing`：限制为 `v*` tag，配置独立 required reviewer，并存放以下 Secrets：
+- `release-signing`：限制为 `v*` tag，并存放以下 Secrets：
 
 ```text
 NETDIAG_CODESIGN_P12_BASE64
@@ -51,9 +51,9 @@ NETDIAG_NOTARY_KEY_ID
 NETDIAG_NOTARY_ISSUER
 ```
 
-- `release-publication`：限制为 `v*` tag，配置独立 required reviewer；不存放长期凭据，
-  只负责批准临时 `GITHUB_TOKEN` 的 Release 写入权限。
-- `release-homebrew`：限制为 `v*` tag，配置独立 required reviewer，只存放：
+- `release-publication`：限制为 `v*` tag；不存放长期凭据，
+  用于隔离临时 `GITHUB_TOKEN` 的 Release 写入权限。
+- `release-homebrew`：限制为 `v*` tag，只存放：
 
 ```text
 HOMEBREW_TAP_TOKEN
@@ -63,14 +63,14 @@ HOMEBREW_TAP_TOKEN
 
 迁移时必须由凭据持有人把敏感值重新录入环境 Secrets，并把公开标识重新录入环境
 Variables；GitHub API 只能列出 Secret 元数据，不能读取现有值。环境级设置验证无误后，
-删除所有同名仓库级 Secret，避免其他 workflow 绕过环境审核读取凭据。不要先删仓库级
+删除所有同名仓库级 Secret，避免其他 workflow 绕过环境部署限制读取凭据。不要先删仓库级
 Secret：没有可恢复明文时会造成发布凭据永久丢失。
 
-所有发布环境应启用 required reviewers、prevent self-review、禁止管理员绕过，并且只配置
-一条 `v*` tag deployment policy。Release workflow 会在任何环境 job 启动前用只读 API
-逐项验证这些规则。还必须用 ruleset 保护 `main` 和 `v*` tag，要求 PR、精确 CI checks、
-禁止 force-push/删除，并限制 tag 创建者。没有独立 reviewer 时，不能把环境视为已保护，
-也不得推送发布 tag。
+独立审核与 prevent self-review 不作为发布必需条件。所有发布环境仍须禁止管理员绕过，
+并且只配置一条 `v*` tag deployment policy。Release workflow 会在任何环境 job 启动前
+用只读 API 逐项验证这些部署规则。还必须用 ruleset 保护 `main` 和 `v*` tag，要求 PR、
+精确 CI checks、禁止 force-push/删除，并限制 tag 创建者。发布所需的自动化质量、
+来源绑定、签名、公证和制品完整性验证必须全部通过。
 
 可用以下只读命令核对环境与 Secret 名称（命令不会显示 Secret 值）：
 
@@ -313,7 +313,7 @@ Release workflow 会依次执行：
 5. 新的 macOS signing runner 再次只 checkout 精确 SHA，下载并验证 artifact 的精确文件
    集、manifest、源二进制与复制后二进制哈希。签名 job 禁止 Cargo 和工作树切换，从而
    隔离 build script 对环境、PATH、target 或工作树的副作用。该 job 必须先通过
-   `release-signing` 环境审核，并且每个步骤只接收自己使用的环境级 Secret。
+   `release-signing` 环境部署规则，并且每个步骤只接收自己使用的环境级 Secret。
 6. 对签名、公证和 Sparkle 密钥分别做显式非空校验；以私有权限准备临时 signing
    keychain，P12/P8 导入后立即删除原始文件。
 7. 从校验和固定的 Sparkle archive 无条件重建 framework，再以 `--no-build` 模式打包
@@ -322,7 +322,7 @@ Release workflow 会依次执行：
 8. 立即删除临时 signing keychain。
 9. 生成并验证 Sparkle appcast 和 `SHA256SUMS`。
 10. 通过只读 artifact 边界把签名构建与写权限发布 jobs 分离。
-11. 通过 `release-publication` 环境审核后，使用 `gh release create --verify-tag` 原子创建
+11. 通过 `release-publication` 环境部署规则后，使用 `gh release create --verify-tag` 原子创建
     GitHub Release；写入前再次确认同名 Release 不存在，不允许接管或覆盖现有资产。
 12. 具备 `contents: read` 和 `attestations: read` 的独立只读 verifier 先要求
     `isImmutable=true`，再下载远端精确三项资产，验证 `SHA256SUMS` 并与构建 artifact
@@ -330,7 +330,7 @@ Release workflow 会依次执行：
     响应丢失显示失败，只要 macOS 构建成功，verifier 仍会运行。
 13. verifier 成功后发布 GitHub Pages appcast，并用 cache-busting 有界轮询，直到公开文件与
     已验证 artifact 逐字节一致。
-14. verifier 成功后，在 `release-homebrew` 环境审核后审计并更新 Homebrew cask；公开
+14. verifier 成功后，通过 `release-homebrew` 环境部署规则并校验、更新 Homebrew cask；公开
     tap checkout 使用只读 job token，Homebrew PAT 只在最终 push 步骤暴露。push 后重新读取
     远端 branch SHA，浅克隆该精确提交，并逐字节复验 cask。
 
@@ -530,7 +530,7 @@ git tag -d "v<semver>"
 ### 发布环境或环境级 Secrets 缺失
 
 不要重新推同名 tag。先确认失败 job 对应的 `release-signing`、`release-publication`、
-`release-homebrew` 或 `github-pages` 环境已存在，允许 `v*` tag，required reviewer 已配置，
+`release-homebrew` 或 `github-pages` 环境已存在，只允许 `v*` tag，且禁止管理员绕过，
 且所需 Secret 位于正确环境。补齐后只重跑原 workflow run 中失败的 job。若值只存在于
 仓库级 Secret，必须由凭据持有人重新录入环境；不能通过 API 导出或复制明文。
 

@@ -60,8 +60,10 @@ fn sample_rules_match_expected_business_labels() {
         let summary = summarize_ingest(&ingest, 5).expect("summary");
         assert_eq!(summary.windows.len(), 16, "{name}");
         let first_window = &summary.windows[0].latency_ms;
-        assert!(first_window.p50 <= first_window.p95, "{name}");
-        assert!(first_window.p95 <= first_window.p99, "{name}");
+        let p50 = first_window.p50.expect("new window P50");
+        let p99 = first_window.p99.expect("new window P99");
+        assert!(p50 <= first_window.p95, "{name}");
+        assert!(first_window.p95 <= p99, "{name}");
         let labels = diagnose_rules(&summary, "golden")
             .into_iter()
             .map(|event| event.evidence.symptom)

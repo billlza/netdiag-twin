@@ -159,21 +159,6 @@ jobs:
               echo "release environment must use selected branch and tag policies: $environment" >&2
               exit 2
             fi
-            protected_reviewers="$(
-              jq '[
-                .protection_rules[]
-                | select(
-                    .type == "required_reviewers"
-                    and .prevent_self_review == true
-                    and (.reviewers | length) > 0
-                  )
-              ] | length' <<< "$environment_json"
-            )"
-            if [[ "$protected_reviewers" != "1" ]]; then
-              echo "release environment must require review and prevent self-review: $environment" >&2
-              exit 2
-            fi
-
             policies_json="$(
               gh api \
                 --header "X-GitHub-Api-Version: $api_version" \

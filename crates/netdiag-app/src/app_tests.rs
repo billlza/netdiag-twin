@@ -2,6 +2,146 @@ use super::*;
 use netdiag_core::NetdiagError;
 use netdiag_core::twin::topology_model;
 
+fn rendered_text(mut render: impl FnMut(&mut egui::Ui)) -> Vec<(String, Rect, bool)> {
+    let context = egui::Context::default();
+    configure_fonts(&context);
+    let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+        with_rect(
+            ui,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(280.0, 240.0)),
+            &mut render,
+        );
+    });
+    output.textures_delta.clear();
+    output
+        .shapes
+        .iter()
+        .filter_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                Some((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                    text.galley.job.justify,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn compact_diagnosis_heading_does_not_overlap_confidence() {
+    let text =
+        rendered_text(|ui| diagnosis_heading(ui, Language::En, FaultLabel::Congestion, 0.86));
+    let headline = text
+        .iter()
+        .find(|(value, _, _)| value == "Congestion Detected")
+        .expect("headline")
+        .1;
+    let confidence = text
+        .iter()
+        .find(|(value, _, _)| value == "Confidence")
+        .expect("confidence")
+        .1;
+    assert!(
+        !headline.intersects(confidence),
+        "headline {headline:?} overlaps confidence {confidence:?}"
+    );
+}
+
+#[test]
+fn compact_status_cell_does_not_overlap_label_and_value() {
+    let bounds = Rect::from_min_size(Pos2::ZERO, Vec2::new(160.0, 58.0));
+    let text =
+        rendered_text(|ui| status_cell(ui.painter(), bounds, "System Status", "Review", ORANGE));
+    let label = text
+        .iter()
+        .find(|(value, _, _)| value == "System Status")
+        .expect("label")
+        .1;
+    let value = text
+        .iter()
+        .find(|(value, _, _)| value == "Review")
+        .expect("value")
+        .1;
+    assert!(
+        !label.intersects(value),
+        "label {label:?} overlaps value {value:?}"
+    );
+    assert!(bounds.contains_rect(label) && bounds.contains_rect(value));
+}
+
+#[test]
+fn comparison_labels_keep_natural_spacing_in_columns() {
+    let text = rendered_text(|ui| {
+        ui.columns(2, |columns| {
+            comparison_box(
+                &mut columns[0],
+                "Rule-based",
+                "Congestion Detected",
+                0.86,
+                BLUE,
+                "Confidence",
+            )
+        });
+    });
+    let (_, _, justified) = text
+        .iter()
+        .find(|(value, _, _)| value == "Congestion Detected")
+        .expect("diagnosis label");
+    assert!(
+        !justified,
+        "wrapped diagnosis text must not stretch inter-character spacing"
+    );
+}
+
+#[test]
+fn sparkline_preserves_missing_samples_and_their_positions() {
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 20.0));
+    let points = scaled_points(rect, &[Some(10.0), None, Some(20.0)]);
+    assert_eq!(
+        points,
+        vec![
+            Some(Pos2::new(0.0, 20.0)),
+            None,
+            Some(Pos2::new(100.0, 0.0))
+        ]
+    );
+    assert!(scaled_points(rect, &[None, None]).is_empty());
+    assert_eq!(
+        scaled_points(rect, &[Some(10.0)]),
+        vec![Some(Pos2::new(0.0, 20.0))]
+    );
+}
+
+#[test]
+fn latency_chart_keeps_a_common_time_scale_across_missing_samples() {
+    use netdiag_app::trend::TrendPoint;
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 100.0));
+    let points = [
+        TrendPoint {
+            elapsed_s: 5.0,
+            value_ms: Some(20.0),
+        },
+        TrendPoint {
+            elapsed_s: 10.0,
+            value_ms: None,
+        },
+        TrendPoint {
+            elapsed_s: 20.0,
+            value_ms: Some(40.0),
+        },
+    ];
+    let segments = recorded_trend_segments(&points)
+        .map(|segment| scaled_trend_points(rect, segment, 20.0, 100.0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        segments,
+        vec![vec![Pos2::new(25.0, 80.0)], vec![Pos2::new(100.0, 60.0)]]
+    );
+}
+
 #[test]
 fn failed_history_clear_preserves_loaded_timeline_and_selection() {
     let mut timeline = vec!["run-1"];
